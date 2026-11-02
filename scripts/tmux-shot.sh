@@ -18,10 +18,9 @@ name=$(basename "$file" .md)
 out=/tmp/mdview-shots
 mkdir -p "$out"
 sock=mdview-shot-$$
+emacs_bin=${EMACS_BIN:-emacs}   # set EMACS_BIN to use another Emacs binary
 tmux -L "$sock" new-session -d -s shot -x "$cols" -y "$rows" \
-  "TERM=xterm-256color $EMACS_BIN emacs -nw -Q -L '$here' --eval \"(progn (load-theme '$emtheme t) (require 'mdview) (setq mdview-auto-refit nil) (mdview-file \\\"$file\\\"))\"" 2>/dev/null || \
-tmux -L "$sock" new-session -d -s shot -x "$cols" -y "$rows" \
-  "TERM=xterm-256color emacs -nw -Q -L '$here' --eval \"(progn (load-theme '$emtheme t) (require 'mdview) (setq mdview-auto-refit nil) (mdview-file \\\"$file\\\"))\""
+  "TERM=xterm-256color $emacs_bin -nw -Q -L '$here' --eval \"(progn (load-theme '$emtheme t) (require 'mdview) (setq mdview-auto-refit nil) (mdview-file \\\"$file\\\"))\""
 sleep 4
 tmux -L "$sock" capture-pane -t shot -p -e -S 0 -E "$((rows-1))" > "$out/$name-$theme.ansi"
 tmux -L "$sock" capture-pane -t shot -p > "$out/$name-$theme.screen.txt"

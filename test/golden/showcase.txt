@@ -1,0 +1,230 @@
+▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+▎                                                                              ▊
+▎                              Showcase Document                               ▊
+▎                                                                              ▊
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+This fixture exercises every construct the viewer should render. It opens with a
+plain paragraph that is long enough to wrap at a typical terminal width, so that
+word wrapping, emphasis, strong emphasis, both, inline code, strikethrough and a
+link to Frogmouth all appear in running text. Autolinks like                    
+https://www.gnu.org/software/emacs/ and bare URLs such as https://example.com   
+are also here.                                                                  
+                                                                                
+▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+▎                                                                              ▊
+▎                             Second-level heading                             ▊
+▎                                                                              ▊
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+A paragraph after an H2. Entities: & < > © — and escapes: *not emphasis*, # not 
+a heading. Hard line break follows (two trailing spaces)                        
+and this is on the next line. A backslash break                                 
+also works.                                                                     
+                                                                                
+Third-level heading                                                             
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔                                                             
+                                                                                
+Fourth-level heading                                                            
+                                                                                
+Fifth-level heading                                                             
+                                                                                
+Sixth-level heading                                                             
+                                                                                
+▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+▎                                                                              ▊
+▎                              Setext Heading One                              ▊
+▎                                                                              ▊
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+▎                                                                              ▊
+▎                              Setext Heading Two                              ▊
+▎                                                                              ▊
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+                                                                                
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                                                                                
+▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+▎                                                                              ▊
+▎                                    Lists                                     ▊
+▎                                                                              ▊
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+● First bullet item                                                             
+● Second bullet item with a long line that should wrap neatly under the text of 
+  the item rather than under the bullet marker, which is the typical thing.     
+  ▪ Nested bullet, level two                                                    
+  ▪ Another nested bullet                                                       
+    ‣ Level three bullet                                                        
+      • Level four bullet                                                       
+        ⭑ Level five bullet                                                     
+● Third bullet with code and bold                                               
+                                                                                
+ 1. Ordered item one                                                            
+                                                                                
+ 2. Ordered item two                                                            
+                                                                                
+     1. Nested ordered item                                                     
+     2. Another nested ordered item                                             
+                                                                                
+ 3. Ordered item three                                                          
+                                                                                
+ 4. Starting at ten                                                             
+                                                                                
+ 5. Eleven                                                                      
+                                                                                
+ 6. Twelve                                                                      
+                                                                                
+☐ An unchecked task                                                             
+☑ A checked task                                                                
+☐ Another task with a link                                                      
+                                                                                
+● Loose list item one                                                           
+                                                                                
+● Loose list item two, separated by blank lines, with a second paragraph:       
+                                                                                
+  Second paragraph inside the loose item.                                       
+                                                                                
+                                                                                
+    echo "code inside a list item"                                              
+                                                                                
+                                                                                
+▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+▎                                                                              ▊
+▎                                 Block quotes                                 ▊
+▎                                                                              ▊
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+                                                                                
+▌ A simple block quote with enough text to wrap around onto a second line so    
+▌ that the left border is drawn on every line of the quote.                     
+                                                                                
+▌ Nested quotes:                                                                
+▌                                                                               
+▌   ▌ Inner quote, second level.                                                
+▌   ▌                                                                           
+▌   ▌   ▌ Third level.                                                          
+▌                                                                               
+▌ Back to the first level with a list:                                          
+▌                                                                               
+▌ ● quoted bullet one                                                           
+▌ ● quoted bullet two                                                           
+                                                                                
+▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+▎                                                                              ▊
+▎                                     Code                                     ▊
+▎                                                                              ▊
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+Indented code block:                                                            
+                                                                                
+                                                                                
+  def indented():                                                               
+  │   return "four spaces"                                                      
+                                                                                
+                                                                                
+Fenced with a language:                                                         
+                                                                                
+                                                                                
+  import sys                                                                    
+  from dataclasses import dataclass                                             
+                                                                                
+                                                                                
+  @dataclass                                                                    
+  class Point:                                                                  
+  │   """A point in the plane."""                                               
+  │   x: float                                                                  
+  │   y: float                                                                  
+  │                                                                             
+  │   def norm(self) -> float:                                                  
+  │   │   # Euclidean norm                                                      
+  │   │   return (self.x ** 2 + self.y ** 2) ** 0.5                             
+                                                                                
+                                                                                
+  if __name__ == "__main__":                                                    
+  │   print(Point(3, 4).norm(), file=sys.stderr)                                
+                                                                                
+                                                                                
+                                                                                
+  (defun greet (name)                                                           
+    "Say hello to NAME."                                                        
+    (interactive "sName: ")                                                     
+    (message "Hello, %s!" name))                                                
+                                                                                
+                                                                                
+                                                                                
+  Tilde fence with no language and a very long line that should not be wrapped: 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789
+                                                                                
+                                                                                
+▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+▎                                                                              ▊
+▎                                    Tables                                    ▊
+▎                                                                              ▊
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+                                                                                
+▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+▎                                                                              ▊
+▎ Column A                                      Column B              Column C ▊
+▎ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ▊
+▎ left                                           center                  right ▊
+▎ code                                            bold                  italic ▊
+▎ a longer cell value                               x                 12345.67 ▊
+▎                                                                              ▊
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+                                                                                
+▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+▎                                                                              ▊
+▎ Feature                                Supported                             ▊
+▎ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ▊
+▎ Images                                 yes                                   ▊
+▎ Tables                                 yes                                   ▊
+▎ Footnotes                              partially                             ▊
+▎                                                                              ▊
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+                                                                                
+Table with inline link and wrapped content:                                     
+                                                                                
+▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+▎                                                                              ▊
+▎ Name      Description                                                        ▊
+▎ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ▊
+▎ Frogmouth A Markdown browser for the terminal, built with Textual. It        ▊
+▎           renders tables, code and more.                                     ▊
+▎ Emacs     An extensible, customizable, free/libre text editor, and more.     ▊
+▎                                                                              ▊
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+                                                                                
+▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+▎                                                                              ▊
+▎                                    Images                                    ▊
+▎                                                                              ▊
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+🖼 Sample image                                                                  
+                                                                                
+Inline image in a paragraph: 🖼 tiny followed by text.                           
+                                                                                
+🖼 Missing image                                                                 
+                                                                                
+🖼 Linked image                                                                  
+                                                                                
+▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+▎                                                                              ▊
+▎                                HTML and misc                                 ▊
+▎                                                                              ▊
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+Raw HTML block                                                                  
+                                                                                
+Inline Ctrl+C html and a                                                        
+break.                                                                          
+                                                                                
+Footnote reference[1] and another[2].                                           
+                                                                                
+Reference-style link and 🖼 ref image.                                           
+                                                                                
+Term with a very long unbreakable token:                                        
+Pneumonoultramicroscopicsilicovolcanoconiosis_Pneumonoultramicroscopicsilicovolc
+anoconiosis_Pneumonoultramicroscopicsilicovolcanoconiosis                       
+                                                                                
+                                                                                
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                                                                                
+Final paragraph. The end.                                                       
+                                                                                
+────────────────────────────────────────────────────────────────────────────────
+[1] The first footnote.                                                         
+[2] A named footnote with markup.                                               

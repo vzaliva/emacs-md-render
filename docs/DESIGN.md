@@ -142,6 +142,12 @@ brackets, no links inside links); autolinks `<http://…>` and `<mail@…>`;
 raw inline HTML tags kept as `html-inline`; hard breaks (two spaces or
 backslash before newline); soft breaks.
 
+The GFM bare-URL/e-mail autolinks are controlled by
+`mdview-inline-extended-autolinks` (default t); with them enabled four
+CommonMark examples that show bare URLs as plain text necessarily fail
+(cmark-gfm behaves the same), and the entity table omits the rarer HTML5
+names (one example).  Everything else in the specification passes.
+
 Conformance is measured by `make commonmark`: `test/commonmark/run-spec.el`
 loads `spec.json` (CommonMark 0.31.2), parses each example, serializes the
 AST to HTML with a small serializer (`test/commonmark/mdview-html.el`) that
@@ -267,9 +273,9 @@ at column 2).  `mdview-box-frame-style` = `wide` (default) | `none`
   blue in both themes, i.e. #DDE8F3), **centered** within W.  Inline
   markup inside headings is rendered (code, emphasis, links).
 - **H2**: box, background `panel` (#24292F dark / #DCE3E8 light), same 5
-  rows, text bold, **left-aligned** at column 2 (faithful: Textual's
-  `text-align: center` is not what Frogmouth shows; the reference has it
-  flush left).
+  rows, text bold, **centered** like H1 (faithful: Textual's `MarkdownH2`
+  has `text-align: center` and the reference grid shows the H2 text
+  centered; an earlier revision of this document claimed otherwise).
 - **H3**: bold text on `surface` background (dark #1E1E1E, which equals the
   app background, so effectively no background), followed by a rule row of
   `▔` exactly as wide as the text, face fg `foreground` (#EDEDED dark /
@@ -331,9 +337,12 @@ padding: 0 1`:
   space; continuation lines and nested blocks indent by the marker width
   (2).
 - Ordered: numbers right-aligned to the widest number in the list,
-  followed by `. ` (or `) ` if that delimiter was used), same face;
-  numbering starts at `:start` (improvement: Frogmouth restarts at 1).
-  Content indents by the marker width.
+  followed by `. ` (or `) ` if that delimiter was used), with one leading
+  column (faithful: Textual right-justifies `N. ` to the widest marker
+  plus one space, so a short list reads ` 1. `, ` 2. ` and its content
+  starts at column 4), same face; numbering starts at `:start`
+  (improvement: Frogmouth restarts at 1).  Content indents by the marker
+  width.
 - Task items: the bullet is replaced by `☐` (unchecked, face
   `mdview-task-unchecked`, muted) or `☑` (checked, face
   `mdview-task-checked`, `success`) — improvement; Frogmouth prints `[ ]`.
@@ -342,9 +351,12 @@ padding: 0 1`:
   blocks inside an item.  Code blocks and quotes inside items keep their
   margins (reference: the `echo` fence inside the loose item has a blank
   line before it).
-- A list directly after a paragraph inside a quote or item: no blank
-  line between them (paragraph bottom margin 1 vs list top 0 gives 1 in
-  normal flow; this is fine — only the tight-item case drops it).
+- A list directly after a paragraph inside a quote: Frogmouth shows no
+  blank line between them (Textual gives only *top-level* paragraphs a
+  bottom margin: `Markdown > MarkdownParagraph { margin: 0 0 1 0 }`).  We
+  keep the paragraph's bottom margin inside quotes, so one blank line
+  separates them — an accepted difference that keeps paragraphs inside
+  quotes separated; only the tight-item case drops it.
 
 ### Code blocks
 
@@ -364,10 +376,13 @@ padding=(1, 2))` in a full-width block:
   and the 2-column left padding) has the background; lines are padded to
   W but never wrapped (`truncate-lines`), so long lines simply run past W
   without background — acceptable.
-- Indent guides: within the leading whitespace of a line, columns 0, 4, 8,
-  … that are strictly less than the indentation get `│` in
-  `mdview-code-indent-guide` (fg #4A5A63); `mdview-code-indent-guide-width`
-  default 4; tabs count as 4.
+- Indent guides: within the leading whitespace of a line, one `│` in
+  `mdview-code-indent-guide` (fg #4A5A63) at the start of every *complete*
+  indent unit of `mdview-code-indent-guide-width` (default 4) columns —
+  Rich's rule, so a 2-space indent gets no guide (the reference's Emacs
+  Lisp block has none) and a 6-space indent gets one; tabs count as
+  `mdview-code-tab-width` (default 4).  Blank lines inside an indented
+  region carry the guides of the next non-blank line, as Rich does.
 - Syntax highlighting via the major mode for the language (see §8);
   unknown language or highlighting failure → plain #EEFFFF text.
 - Indented code blocks render identically, without a language.
@@ -524,8 +539,10 @@ Faces may appear as lists or anonymous plists; handle `(face1 face2)`,
 ```
 
 - Display only when `(display-graphic-p)` and `(image-type-available-p)`
-  for the file's type (detect via `image-type-from-file-name` /
-  `image-type-from-data`); otherwise insert the placeholder.
+  for the file's type (detect via `image-supported-file-p` /
+  `image-type-from-file-header` / `image-type-from-data`;
+  `image-type-from-file-name` is obsolete since Emacs 29.1); otherwise
+  insert the placeholder.
 - Local paths resolve against `base-dir` (the Markdown file's directory,
   or `default-directory`); `file://` URLs are local.  Absolute paths and
   `~` work.
@@ -652,9 +669,10 @@ capture) in both `modus-vivendi` and `modus-operandi`.
   `make render-faces` (text with `{face}` markers), `make render-ansi`
   (24-bit ANSI), `make shot FILE=…` (real text-mode Emacs in tmux →
   `/tmp/mdview-shots/*.png` via Rich + rsvg-convert).  For GUI image
-  checks without screenshots, `scripts/gui-check.el` (to be written)
-  renders a fixture in a graphical Emacs started in the background and
-  writes a report of every `display` image property and its size.
+  checks without screenshots, `scripts/gui-check.el` renders a fixture in
+  a graphical Emacs started in the background, waits up to 10 s for
+  remote images, and writes a report of every `display` image property
+  and its size plus the first 60 rendered lines.
 
 ## 14. Reference materials
 

@@ -11,6 +11,12 @@
 (require 'mdview)
 (require 'color)
 
+(defconst mdview-dev-root
+  (file-name-directory
+   (directory-file-name
+    (file-name-directory (or load-file-name buffer-file-name default-directory))))
+  "The repository root, computed when this file is loaded from scripts/.")
+
 (defun mdview-dev-render-to-string (file width)
   "Render FILE at WIDTH columns and return the propertized buffer text."
   (let ((doc (with-temp-buffer
@@ -103,10 +109,7 @@ With WITH-FACES non-nil, insert {face} markers where the face changes."
 
 (defun mdview-dev-update-golden ()
   "Regenerate test/golden/*.txt from test/fixtures/*.md at width 80."
-  (let* ((root (file-name-directory (directory-file-name
-                                     (file-name-directory
-                                      (or load-file-name buffer-file-name
-                                          default-directory)))))
+  (let* ((root mdview-dev-root)
          (fixtures (directory-files (expand-file-name "test/fixtures" root) t "\\.md\\'")))
     (dolist (f fixtures)
       (let ((out (expand-file-name

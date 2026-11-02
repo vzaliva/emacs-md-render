@@ -14,9 +14,23 @@ and press it again to go back.  File management, bookmarks, history panes
 and the other application features of Frogmouth are deliberately left to
 Emacs itself.
 
-> **Status:** under active development.  See [docs/DESIGN.md](docs/DESIGN.md)
-> for the architecture and the style specification, and `AGENTS.md` for
-> contributor conventions.
+## Status
+
+The package is functional and tested but not yet released.  What works
+today: a from-scratch CommonMark 0.31 parser with the GFM extensions
+(tables, strikethrough, task lists, footnotes, bare-URL autolinks; 647 of
+the 652 CommonMark spec examples pass, see `make commonmark`), the full
+Frogmouth layout (boxed H1/H2, H3 rule, bullets, ordered and task lists,
+nested quotes with bars, code panels with Material highlighting and indent
+guides, panel tables with Rich-style column expansion, wrapping and
+alignment), footnotes, images (inline in graphical Emacs, local and
+asynchronous remote, placeholders in text mode), and the `mdview-mode`
+commands: toggle with position sync, links and anchors, headings and
+imenu, history, image toggling, auto-refit on resize and refresh on save.
+The golden renderings in `test/golden/` are compared line by line with
+Frogmouth's own output in `test/reference/`.  See
+[docs/DESIGN.md](docs/DESIGN.md) for the architecture and the style
+specification, and `AGENTS.md` for contributor conventions.
 
 ## Goals
 
@@ -82,14 +96,16 @@ Keys in the rendered view (`mdview-mode`):
 | `q` | Quit the view (back to the source buffer if you came from one) |
 | `g` | Re-render from the (possibly edited) source |
 | `TAB` / `S-TAB` | Next / previous link |
-| `RET` | Follow link at point: anchors scroll, Markdown files open in `mdview`, other files in Emacs, URLs in the browser; images open externally |
+| `RET`, `mouse-1`, `mouse-2` | Follow the link at point: anchors scroll to the heading, Markdown files open in the same view (with history), other local files open in Emacs, URLs in the browser; footnote references jump to their definition and back; local images open in Emacs, remote ones in the browser |
 | `n` / `p` | Next / previous heading |
 | `t` | Table of contents (via `imenu`) |
 | `l` / `r` | Back / forward in the view history (when following links between files) |
 | `i` | Toggle inline images |
 | `e` | Visit the source at the corresponding line |
 | `w` | Copy the link URL at point |
-| `SPC` / `DEL` | Scroll |
+| `SPC` / `DEL` / `S-SPC` | Scroll down / up |
+| `<` / `>` | Beginning / end of the document |
+| `C-c C-v` | Back to the source (same as `mdview-toggle`) |
 
 The view re-flows automatically when the window width changes
 (`mdview-auto-refit`), and re-renders when the source buffer is saved
@@ -99,18 +115,57 @@ The view re-flows automatically when the window width changes
 
 `M-x customize-group RET mdview RET`.  The most useful options:
 
+View and layout:
+
 - `mdview-max-width` (default 100): maximum text width in columns; `nil`
   uses the full window.
-- `mdview-margin` (default 4): left/right margin, as in Frogmouth.
-- `mdview-display-images`, `mdview-display-remote-images`,
-  `mdview-image-max-height`: image behaviour.
-- `mdview-bullets`: bullet glyphs per nesting level
-  (`●`, `▪`, `‣`, `•`, `⭑` by default, like Frogmouth).
+- `mdview-margin` (default 4): left/right margin, as in Frogmouth;
+  `mdview-center-content` (default `nil`) centres the content in wider
+  windows.
+- `mdview-display-action` (default `pop-to-buffer-same-window`): how the
+  view buffer is shown.
+- `mdview-auto-refit` / `mdview-refit-delay` (default `t` / 0.2 s): re-flow
+  when the window width changes; `mdview-refresh-on-save` (default `t`):
+  re-render when the source buffer is saved.
+- `mdview-markdown-extensions`: file extensions that links open in `mdview`.
+- `mdview-box-frame-style` (`wide` or `none`): the inset frame of the H1/H2
+  boxes and tables.
+- `mdview-glyphs` / `mdview-ascii-glyphs` / `mdview-use-ascii-glyphs`: the
+  bullets (`●`, `▪`, `‣`, `•`, `⭑` like Frogmouth), bars, rules and check
+  boxes, with an ASCII profile selected automatically (`auto`) when the
+  terminal cannot display them.
+- `mdview-html-renderer` (`strip` or `shr`): how raw HTML blocks are shown.
+- `mdview-table-expand` (default `t`): expand tables to the full width.
+
+Images:
+
+- `mdview-display-images`, `mdview-display-remote-images` (default `t`).
+- `mdview-image-max-height` (default 0.6 of the frame height, or pixels),
+  `mdview-image-max-width` (default `nil`), `mdview-image-timeout`
+  (default 10 s for remote fetches), `mdview-image-captions` (default
+  `nil`: show the alt text below block images),
+  `mdview-image-placeholder-format` (`nil` = `🖼 ALT`).
+
+Code blocks:
+
 - `mdview-code-lang-modes`: map fenced-code language names to major modes.
 - `mdview-code-material-theme`: use Frogmouth's Material code palette
-  (`t`), or keep your theme's `font-lock` faces (`nil`).
-- Faces: everything is a face in the `mdview` group (`mdview-h1`,
-  `mdview-quote`, `mdview-table`, `mdview-code-block`, …).
+  (`t`), or keep your theme's `font-lock` faces (`nil`);
+  `mdview-code-face-alist` is the mapping.
+- `mdview-code-indent-guides`, `mdview-code-indent-guide-width` (default
+  4), `mdview-code-tab-width` (default 4), `mdview-code-highlight-max-chars`
+  (default 100000: larger blocks are shown plain).
+
+Parser:
+
+- `mdview-inline-extended-autolinks` (default `t`): turn bare URLs,
+  `www.` domains and e-mail addresses into links (GFM).
+- `mdview-parse-front-matter` (default `t`): skip a YAML front-matter
+  block; `mdview-parse-max-depth` (default 200): nesting limit.
+
+Faces: everything is a face in the `mdview` group (`mdview-h1`, `mdview-h2`,
+`mdview-quote`, `mdview-bullet`, `mdview-link`, `mdview-table`,
+`mdview-code-block`, the `mdview-code-*` token faces, …).
 
 ## Development
 
@@ -118,6 +173,8 @@ The view re-flows automatically when the window width changes
 make check      # byte-compile with warnings as errors, then run all tests
 make test       # ERT tests only
 make render FILE=test/fixtures/showcase.md WIDTH=100   # dump a rendering as text
+make render-faces FILE=... WIDTH=...        # the same with {face} markers
+make golden     # regenerate test/golden/*.txt (review the diff first)
 make shot  FILE=test/fixtures/showcase.md   # text-mode Emacs screenshot via tmux
 make commonmark # CommonMark spec conformance report
 ```
