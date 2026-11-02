@@ -15,7 +15,8 @@
 ;; 12): the `mdview' customization group, every face that is not owned by
 ;; a specific module, the glyph tables with their ASCII fallback, and the
 ;; buffer-local derivation of theme-dependent colours (block quote
-;; backgrounds and the box frame colour) from the actual `default' face.
+;; backgrounds, the box frame colour and the heading and table panels)
+;; from the actual `default' face.
 ;; Everything here is safe under `emacs -Q --batch': when no colour
 ;; information is available the derivation is a silent no-op and the
 ;; static face specs apply.
@@ -37,7 +38,10 @@
 ;;   code background   #263238          code text #EEFFFF
 ;;   inline code       #939393 / #6E6E6E
 ;;
-;; (dark / light where they differ).
+;; (dark / light where they differ).  They are what you get in batch mode
+;; and on terminals whose colours cannot be read; on a display that can
+;; report the `default' face colours the panel colour is derived from the
+;; theme instead (`mdview-panel-blend').
 
 ;;; Code:
 
@@ -261,6 +265,22 @@ thin inset; `mdview-faces-remap' sets it buffer-locally from the real
                  (const :tag "No frame" none))
   :group 'mdview)
 
+(defcustom mdview-panel-blend 0.09
+  "How strongly the heading and table panels stand out from the theme.
+The background of level-2 headings and of tables is derived from your
+theme's `default' face instead of using Frogmouth's fixed blue-grey: it
+is the page background moved this fraction of the way towards the text
+colour, so the panels take their hue from the theme.  Useful values lie
+between a few percent, the quiet step of the original, and about 0.3.
+The colour is then adjusted so that the panel stays visible and the text
+on it readable even for themes with very little or very much contrast.
+Nil keeps the fixed colours of the `mdview-h2' and `mdview-table' faces,
+which you can then customize.  Takes effect when a view is next
+rendered or the theme changes."
+  :type '(choice (const :tag "Fixed Frogmouth colours" nil)
+                 (number :tag "Fraction from background to text colour"))
+  :group 'mdview)
+
 (defcustom mdview-use-ascii-glyphs 'auto
   "Whether to draw with `mdview-ascii-glyphs' instead of `mdview-glyphs'.
 t always uses ASCII, nil always uses the Unicode glyphs, and `auto'
@@ -417,6 +437,166 @@ Components are clamped and rounded to the nearest of 256 levels (unlike
 Both colours are lists (R G B) of floats in 0..1; return such a list."
   (seq-mapn (lambda (a b) (+ a (* fraction (- b a)))) rgb target))
 
+;;;; Panel colour
+
+;; The panel behind level-2 headings and tables is derived from the two
+;; colours every theme defines, the `default' background and foreground,
+;; so that it suits any theme, not only the ones tried.  The step from
+;; the background towards the foreground is taken in CIE Lab, where equal
+;; steps look equal on every hue, and is then held between a floor (the
+;; panel must be visible) and a ceiling (the text must stay readable on
+;; it).
+
+(defconst mdview-faces--panel-min-distance 4.0
+  "Smallest CIE76 distance between the page and a derived panel colour.
+Flat colours closer than about 2.3 cannot be told apart; 4 reads as a
+deliberate but quiet step on an ordinary display.")
+
+(defconst mdview-faces--panel-contrast-limit 4.5
+  "Contrast ratio of text on a panel that is always readable enough.")
+
+(defconst mdview-faces--panel-contrast-keep 0.85
+  "Fraction of the page's own text contrast that a panel must keep.
+It lowers the requirement for themes whose text contrast is below
+`mdview-faces--panel-contrast-limit' to begin with.")
+
+(defun mdview-faces--luminance (rgb)
+  "Return the WCAG relative luminance of RGB, a list (R G B) in 0..1."
+  (let ((lin (mapcar (lambda (c)
+                       (if (<= c 0.04045)
+                           (/ c 12.92)
+                         (expt (/ (+ c 0.055) 1.055) 2.4)))
+                     rgb)))
+    (+ (* 0.2126 (nth 0 lin)) (* 0.7152 (nth 1 lin)) (* 0.0722 (nth 2 lin)))))
+
+(defun mdview-faces-contrast (a b)
+  "Return the WCAG contrast ratio, from 1 to 21, of the colours A and B.
+Both are lists (R G B) of floats in 0..1."
+  (let ((la (mdview-faces--luminance a))
+        (lb (mdview-faces--luminance b)))
+    (/ (+ (max la lb) 0.05) (+ (min la lb) 0.05))))
+
+(defun mdview-faces--lab (rgb)
+  "Return RGB, a list (R G B) in 0..1, as a CIE Lab list (L A B)."
+  (apply #'color-srgb-to-lab rgb))
+
+(defun mdview-faces--from-lab (lab)
+  "Return the CIE Lab list LAB as (R G B) on the 8-bit grid, clipped to sRGB."
+  (mapcar (lambda (v) (/ (round (* 255 (max 0.0 (min 1.0 v)))) 255.0))
+          (apply #'color-lab-to-srgb lab)))
+
+(defun mdview-faces--lab-distance (a b)
+  "Return the Euclidean (CIE76) distance between the Lab lists A and B."
+  (sqrt (apply #'+ (seq-mapn (lambda (x y) (expt (- x y) 2)) a b))))
+
+(defun mdview-faces-panel (rgb foreground fraction)
+  "Return the panel colour for the page background RGB as #RRGGBB.
+RGB and FOREGROUND, the text colour, are lists (R G B) of floats in
+0..1.  The panel lies FRACTION of the way from RGB towards FOREGROUND in
+CIE Lab, but never closer to RGB than `mdview-faces--panel-min-distance'
+and never so close to FOREGROUND that text on it falls below the
+contrast set by `mdview-faces--panel-contrast-limit' and
+`mdview-faces--panel-contrast-keep'.  When no such colour exists, as
+when the text is nearly the colour of the page, the panel is moved the
+other way, away from the text.  A nil FOREGROUND stands for white on a
+dark background and black on a light one."
+  (let* ((dark (mdview-faces-dark-p rgb))
+         (text (or foreground (if dark '(1.0 1.0 1.0) '(0.0 0.0 0.0))))
+         (bg-lab (mdview-faces--lab rgb))
+         (text-lab (mdview-faces--lab text))
+         (gap (mdview-faces--lab-distance bg-lab text-lab))
+         (need (min mdview-faces--panel-contrast-limit
+                    (* mdview-faces--panel-contrast-keep
+                       (mdview-faces-contrast rgb text))))
+         (at (lambda (k)
+               (mdview-faces--from-lab
+                (seq-mapn (lambda (a b) (+ a (* k (- b a)))) bg-lab text-lab))))
+         (readable (lambda (k)
+                     (>= (mdview-faces-contrast (funcall at k) text) need)))
+         ;; Largest fraction at which the text is still readable.
+         (kmax (if (funcall readable 1.0)
+                   1.0
+                 (let ((lo 0.0) (hi 1.0))
+                   (dotimes (_ 14)
+                     (let ((mid (/ (+ lo hi) 2)))
+                       (if (funcall readable mid) (setq lo mid) (setq hi mid))))
+                   lo)))
+         ;; Smallest fraction at which the panel is visible.
+         (kmin (if (> gap 0.0) (/ mdview-faces--panel-min-distance gap) 2.0))
+         (fraction (max 0.0 (min 1.0 fraction))))
+    (mdview-faces-rgb-to-hex
+     (if (<= kmin kmax)
+         (funcall at (max kmin (min kmax fraction)))
+       ;; Visible and readable cannot both hold towards the text, so move
+       ;; away from it, which only improves the contrast.
+       (let* ((direction (cond ((> (car text-lab) (car bg-lab)) -1.0)
+                               ((< (car text-lab) (car bg-lab)) 1.0)
+                               (dark 1.0)
+                               (t -1.0)))
+              (shift (max mdview-faces--panel-min-distance (* 50.0 fraction)))
+              (shifted (lambda (sign)
+                         (mdview-faces--from-lab
+                          (list (+ (car bg-lab) (* sign direction shift))
+                                (nth 1 bg-lab) (nth 2 bg-lab)))))
+              (visible (lambda (color)
+                         (>= (mdview-faces--lab-distance
+                              (mdview-faces--lab color) bg-lab)
+                             (* 0.75 mdview-faces--panel-min-distance)))))
+         ;; Away from the text first; failing that (the page is at the edge
+         ;; of the gamut that way) towards it, as the theme is then
+         ;; unreadable anyway; as a last resort the readable limit.
+         (cond ((funcall visible (funcall shifted 1.0)) (funcall shifted 1.0))
+               ((funcall visible (funcall shifted -1.0)) (funcall shifted -1.0))
+               (t (funcall at kmax))))))))
+
+(declare-function tty-color-approximate "term/tty-colors" (rgb &optional frame))
+
+(defconst mdview-faces--panel-max-drift 8.0
+  "Largest CIE76 distance between a panel colour and what a terminal draws.
+A 256-colour palette is coarse in its colour cube; beyond this the
+rounding turns a quiet panel into a loud one.")
+
+(defun mdview-faces--panel-drawable-p (page panel)
+  "Return non-nil when this display draws the colour PANEL well against PAGE.
+Both are #RRGGBB strings.  Graphical and true-colour displays draw any
+colour as it is.  A 256-colour terminal rounds colours to its palette;
+PANEL is drawable when the entry Emacs picks for it differs from the one
+for PAGE and lies within `mdview-faces--panel-max-drift' of PANEL.  The
+entry is what `tty-color-approximate' returns for a list of 16-bit
+components: (NAME INDEX R G B), with R, G and B again in 0..65535.  A
+terminal with fewer colours has no subtle steps to offer."
+  (cond
+   ((or noninteractive (display-graphic-p) (>= (display-color-cells) 65536)) t)
+   ((>= (display-color-cells) 256)
+    (let* ((sixteen-bit (lambda (hex)
+                          (mapcar (lambda (v) (round (* 65535 v)))
+                                  (mdview-faces-color-rgb hex))))
+           (page-entry (tty-color-approximate (funcall sixteen-bit page)))
+           (panel-entry (tty-color-approximate (funcall sixteen-bit panel))))
+      (and (not (equal page-entry panel-entry))
+           (< (mdview-faces--lab-distance
+               (mdview-faces--lab
+                (mapcar (lambda (v) (/ v 65535.0)) (nthcdr 2 panel-entry)))
+               (mdview-faces--lab (mdview-faces-color-rgb panel)))
+              mdview-faces--panel-max-drift))))
+   (t nil)))
+
+(defun mdview-faces--display-panel (rgb foreground fraction)
+  "Return the panel colour for the page RGB as this display draws it, or nil.
+Like `mdview-faces-panel' (RGB, FOREGROUND and FRACTION mean the same
+there), but the result must be drawable (`mdview-faces--panel-drawable-p'):
+when the display draws it like the page, or far from what was intended,
+FRACTION is raised in steps of 0.05, up to 0.3, until it is.  Nil means
+no step helps."
+  (let ((page (mdview-faces-rgb-to-hex rgb))
+        (found nil))
+    (while (and (not found) (<= fraction 0.3))
+      (let ((candidate (mdview-faces-panel rgb foreground fraction)))
+        (if (mdview-faces--panel-drawable-p page candidate)
+            (setq found candidate)
+          (setq fraction (+ fraction 0.05)))))
+    found))
+
 (defun mdview-faces-boost (rgb level)
   "Return the block quote background for nesting LEVEL over background RGB.
 Each level blends 4 % towards white on a dark background or towards black
@@ -433,6 +613,12 @@ on a light one, like Textual's $boost layered LEVEL times.  Return a
 Nil means the colour is unavailable (batch mode, monochrome terminal)."
   (ignore-errors
     (mdview-faces-color-rgb (face-background 'default nil t))))
+
+(defun mdview-faces-default-foreground ()
+  "Return the `default' face foreground as an (R G B) list, or nil.
+Nil means the colour is unavailable (batch mode, monochrome terminal)."
+  (ignore-errors
+    (mdview-faces-color-rgb (face-foreground 'default nil t))))
 
 (defvar-local mdview-faces--remap-cookies nil
   "Cookies returned by `face-remap-add-relative' in this buffer.")
@@ -454,9 +640,14 @@ open views follow the new `default' background without a re-render."
 (defun mdview-faces-remap ()
   "Install the theme-derived faces buffer-locally.
 Computes the `mdview-quote', `mdview-quote-2' and `mdview-quote-3'
-backgrounds with `mdview-faces-boost' and the `mdview-box-frame'
-foreground (equal to the buffer background) from the `default' face, and
-installs them with `face-remap-add-relative'.  Any earlier remapping by
+backgrounds with `mdview-faces-boost', the `mdview-box-frame'
+foreground (equal to the buffer background) and, unless
+`mdview-panel-blend' is nil, the `mdview-h2' and `mdview-table'
+backgrounds (`mdview-faces--display-panel', which uses
+`mdview-faces-panel') from the `default' face, and
+installs them with `face-remap-add-relative'.  A background the display
+cannot draw faithfully (a 256-colour terminal rounds to its palette)
+is left to the face's own static colour.  Any earlier remapping by
 this function is removed first.  When the default background cannot be
 determined (as in batch mode) nothing is changed and no error is
 signalled.  The buffer is remembered so that `mdview-faces-theme-changed'
@@ -468,15 +659,26 @@ remapping cookies."
   (add-hook 'disable-theme-functions #'mdview-faces-theme-changed)
   (let ((rgb (mdview-faces-default-background)))
     (when rgb
-      (let ((level 0))
+      (let ((level 0)
+            (page (mdview-faces-rgb-to-hex rgb)))
         (dolist (face '(mdview-quote mdview-quote-2 mdview-quote-3))
           (setq level (1+ level))
-          (push (face-remap-add-relative
-                 face :background (mdview-faces-boost rgb level))
-                mdview-faces--remap-cookies)))
+          (let ((quote-color (mdview-faces-boost rgb level)))
+            (when (mdview-faces--panel-drawable-p page quote-color)
+              (push (face-remap-add-relative face :background quote-color)
+                    mdview-faces--remap-cookies)))))
       (push (face-remap-add-relative
              'mdview-box-frame :foreground (mdview-faces-rgb-to-hex rgb))
-            mdview-faces--remap-cookies)))
+            mdview-faces--remap-cookies)
+      (when (numberp mdview-panel-blend)
+        ;; Without a colour of its own on this display the panel keeps the
+        ;; static Frogmouth colour.
+        (let ((panel (mdview-faces--display-panel
+                      rgb (mdview-faces-default-foreground) mdview-panel-blend)))
+          (when panel
+            (dolist (face '(mdview-h2 mdview-table))
+              (push (face-remap-add-relative face :background panel)
+                    mdview-faces--remap-cookies)))))))
   mdview-faces--remap-cookies)
 
 (defun mdview-faces-unremap ()

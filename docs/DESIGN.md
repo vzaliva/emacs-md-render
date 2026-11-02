@@ -288,7 +288,8 @@ at column 2).  `mdview-box-frame-style` = `wide` (default) | `none`
   blank, text, blank, frame.  Text bold, colour `text` (87 % white on
   blue in both themes, i.e. #DDE8F3), **centered** within W.  Inline
   markup inside headings is rendered (code, emphasis, links).
-- **H2**: box, background `panel` (#24292F dark / #DCE3E8 light), same 5
+- **H2**: box, background `panel` (#24292F dark / #DCE3E8 light; improvement:
+  derived from the theme, see §11), same 5
   rows, text bold, **centered** like H1 (faithful: Textual's `MarkdownH2`
   has `text-align: center` and the reference grid shows the H2 text
   centered; an earlier revision of this document claimed otherwise).
@@ -752,7 +753,7 @@ Textual default design, resolved:
 | text | #E1E1E1 | #202020 | default text — inherits `default` |
 | text-muted | #A5A5A5 | #666666 | H6, captions |
 | foreground | #EDEDED | #101010 | H3 rule |
-| panel | #24292F | #DCE3E8 | H2 box, table box |
+| panel | #24292F | #DCE3E8 | H2 box, table box; fixed fallback, derived from the theme where possible (improvement, below) |
 | boost | +4 % white | +4 % black | quote background (derived) |
 | primary | #004578 | #004578 | thematic break |
 | primary-lighten-1 | #23568B | #23568B | table header rule |
@@ -769,16 +770,60 @@ Further faces: `mdview-alert-note`, `-tip`, `-important`, `-warning`,
 
 Define every face with `defface` using `((((background dark)) …)
 (((background light)) …))` specs; `mdview-faces-remap` installs the
-derived faces (`mdview-quote` levels, `mdview-box-frame`) buffer-locally
+derived faces (`mdview-quote` levels, `mdview-box-frame`, and the `panel`
+colour of `mdview-h2` and `mdview-table`) buffer-locally
 with `face-remap-add-relative`, computing from `(face-background 'default
 nil t)` with `color-name-to-rgb` blending; fall back to the static spec
-when colours are unavailable (`--batch`, `-nw` without truecolor).  The
+when colours are unavailable (`--batch`, a terminal that does not report
+its colours) or cannot be drawn faithfully (below).  The
 derived faces are refreshed in every remapped buffer from
 `enable-theme-functions` / `disable-theme-functions`
 (`mdview-faces-theme-changed`), so a `load-theme` after rendering does
-not leave stale quote and frame colours.  In a 256-colour terminal Emacs
-approximates colours automatically; nothing special is required, but
-faces must not rely on `:extend`.
+not leave stale quote, frame and panel colours.  Faces must not rely on
+`:extend`.
+
+### Theme-derived panel (improvement)
+
+Frogmouth's `panel` is a fixed blue-grey that clashes with themes whose
+page has a hue of its own (a neutral slab on Solarized's teal or cream).
+The panel is therefore derived from the two colours every theme defines,
+the `default` background and foreground, and not from any list of themes:
+
+1. Work in CIE Lab, where equal steps look equal on every hue.  The panel
+   lies a fraction (`mdview-panel-blend`, default 0.09, which matches the
+   offset of Textual's own panel from its page: 6–9 % of the way to the
+   text colour) of the way from the background to the foreground, so it
+   is lighter on a dark page, darker on a light one, and keeps the hue of
+   the theme.  Palettes already contain this colour: the result is close
+   to Solarized's base02/base2, Nord's nord1, Catppuccin's surface0 and
+   Gruvbox's bg1.
+2. A floor: the panel is at least 4 CIE76 units from the page, so a
+   theme with little contrast still shows it.
+3. A ceiling: text on the panel keeps `min (4.5, 0.85 ×)` the contrast it
+   has on the page (WCAG ratio), so a large fraction never makes the text
+   unreadable.
+4. When floor and ceiling conflict (text nearly the page colour) the
+   panel moves away from the text instead, which only helps.
+
+Faces such as `hl-line`, `region` or `header-line` were measured as
+sources and rejected: no theme face gave a usable panel on more than
+about 70 % of 27 popular themes, and they mean different things in
+different themes.  The derivation is exercised by tests over a grid of
+colour pairs, not by a list of themes; an offline sweep of 46,656
+background/text pairs found none invisible, none unreadable and none
+invalid.
+
+On a 256-colour terminal Emacs rounds every colour to its palette, which
+can collapse the panel into the page or turn it into a loud hue.  A
+derived colour (panel or quote level) is therefore used only when the
+palette entry Emacs picks for it differs from the page's and lies within
+8 CIE76 units of the colour derived; the panel retries a stronger step
+(up to 0.3) before giving up, and any colour that cannot be drawn
+faithfully keeps its static Frogmouth colour, as does everything on a
+terminal with fewer colours.  When the default colours are unknown
+(bare `emacs -nw` on a terminal that does not report its background;
+`frame-background-mode` fixes that) the static colours apply as well.
+`mdview-panel-blend` set to nil always keeps the static colours.
 
 ## 12. Text-mode (emacs -nw) requirements
 

@@ -153,6 +153,14 @@ View and layout:
   graphical frames whose font does not draw it one column wide.
 - `mdview-html-renderer` (`strip` or `shr`): how raw HTML blocks are shown.
 - `mdview-table-expand` (default `t`): expand tables to the full width.
+- `mdview-panel-blend` (default 0.09): how strongly the level-2 heading
+  and table panels stand out from your theme.  The panel is your theme's
+  background moved this fraction of the way towards its text colour, so it
+  suits any theme, light or dark, instead of Frogmouth's fixed blue-grey;
+  the colour is adjusted so that the panel stays visible and the text on
+  it readable even for themes with little or much contrast.  Useful values
+  run from a few percent to about 0.3; `nil` keeps the fixed colours of the
+  `mdview-h2` and `mdview-table` faces.
 - `mdview-min-content-width` (default 10): quotes and list items nested so
   deep that fewer columns would remain are rendered flat in their parent
   instead of wrapping a few characters per line.
@@ -198,8 +206,14 @@ Faces: everything is a face in the `mdview` group (`mdview-h1`, `mdview-h2`,
 `mdview-quote`, `mdview-bullet`, `mdview-link`, `mdview-table`,
 `mdview-code-block`, the `mdview-code-*` token faces, `mdview-alert-note`
 / `-tip` / `-important` / `-warning` / `-caution`, `mdview-summary`, …).
-The quote backgrounds and box frames are derived from your theme's
-`default` face and follow `load-theme` / `disable-theme` automatically.
+The quote backgrounds, the box frames and the level-2 heading and table
+panels are derived from your theme's `default` face and follow
+`load-theme` / `disable-theme` automatically.  Where Emacs cannot report
+the colours (a terminal that does not tell Emacs its background, or one
+with fewer than 256 colours) or cannot draw a derived colour faithfully (a
+256-colour terminal rounds to its palette), the fixed Frogmouth colours
+are used instead; `frame-background-mode` tells Emacs whether such a
+terminal is light or dark.
 
 ## Development
 
