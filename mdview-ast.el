@@ -98,6 +98,46 @@ safe."
 
 ;;;; Slugs
 
+;;;; Source positions
+
+(defun mdview-ast-pos-at (index &optional object)
+  "Return the source offset of the character at INDEX of OBJECT, or nil.
+OBJECT is a string or a buffer (default: the current buffer).  The text
+property `mdview-pos' marks every character copied from the Markdown
+source: its value is the offset of the first character of the run the
+character belongs to, a run being a stretch of characters with the same
+value (docs/DESIGN.md section 3).  The character's own offset is the
+value plus its distance from the start of the run.  Return nil when the
+character carries no `mdview-pos'."
+  (let* ((object (or object (current-buffer)))
+         (limit (if (stringp object) (length object)
+                  (with-current-buffer object (point-max))))
+         (floor (if (stringp object) 0
+                  (with-current-buffer object (point-min)))))
+    (when (and (>= index floor) (< index limit))
+      (let ((value (get-text-property index 'mdview-pos object)))
+        (when value
+          (let ((start (or (previous-single-property-change
+                            (1+ index) 'mdview-pos object)
+                           floor)))
+            (+ value (- index start))))))))
+
+(defun mdview-ast-substring (string from &optional to)
+  "Return the substring of STRING from FROM to TO with exact positions.
+Like `substring', except that when FROM falls inside a run of the text
+property `mdview-pos' (see `mdview-ast-pos-at') the run's start in the
+result gets the offset of the character at FROM, so that the offsets of
+the result's characters stay right."
+  (let ((new (substring string from to)))
+    (when (> (length new) 0)
+      (let ((offset (mdview-ast-pos-at from string)))
+        (when offset
+          (put-text-property 0 (or (next-single-property-change
+                                    0 'mdview-pos new)
+                                   (length new))
+                             'mdview-pos offset new))))
+    new))
+
 (defun mdview-slug (string)
   "Return the GitHub-style anchor slug of heading text STRING.
 The text is downcased; every character that is not a letter, a digit, a

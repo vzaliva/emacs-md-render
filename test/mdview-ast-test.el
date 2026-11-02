@@ -280,5 +280,64 @@ CR, so a `&#13;' would otherwise put a raw ^M into the rendered buffer."
     (should (eq (get-text-property 0 'face out) 'bold))
     (should (eq (get-text-property 5 'face out) 'italic))))
 
+;;;; Source positions
+
+(ert-deftest mdview-ast-pos-at-strings ()
+  ;; Two runs, the second after an unmapped character; a face change
+  ;; inside a run does not split it.
+  (let ((s (concat (propertize "abc" 'mdview-pos 10)
+                   "-"
+                   (propertize "defg" 'mdview-pos 20))))
+    (add-face-text-property 5 7 'bold nil s)
+    (should (= (mdview-ast-pos-at 0 s) 10))
+    (should (= (mdview-ast-pos-at 2 s) 12))
+    (should-not (mdview-ast-pos-at 3 s))
+    (should (= (mdview-ast-pos-at 4 s) 20))
+    (should (= (mdview-ast-pos-at 7 s) 23))
+    (should-not (mdview-ast-pos-at 8 s))
+    (should-not (mdview-ast-pos-at -1 s))
+    (should-not (mdview-ast-pos-at 0 ""))))
+
+(ert-deftest mdview-ast-pos-at-buffers ()
+  (with-temp-buffer
+    (insert "xx" (propertize "hello" 'mdview-pos 100) "\n"
+            (propertize "world" 'mdview-pos 106))
+    (should-not (mdview-ast-pos-at 1))
+    (should (= (mdview-ast-pos-at 3) 100))
+    (should (= (mdview-ast-pos-at 7) 104))
+    (should-not (mdview-ast-pos-at 8))
+    (should (= (mdview-ast-pos-at 9) 106))
+    (should (= (mdview-ast-pos-at 13 (current-buffer)) 110))
+    (should-not (mdview-ast-pos-at 14))
+    ;; Adjacent runs are told apart by their values alone.
+    (goto-char 9)
+    (insert (propertize "!" 'mdview-pos 105))
+    (should (= (mdview-ast-pos-at 9) 105))
+    (should (= (mdview-ast-pos-at 10) 106))
+    (narrow-to-region 3 8)
+    (should (= (mdview-ast-pos-at 4) 101))
+    (should-not (mdview-ast-pos-at 2))))
+
+(ert-deftest mdview-ast-substring-rebases ()
+  (let* ((s (concat (propertize "hello world" 'mdview-pos 50)
+                    " " (propertize "again" 'mdview-pos 70)))
+         (tail (mdview-ast-substring s 6))
+         (mid (mdview-ast-substring s 2 9))
+         (whole (mdview-ast-substring s 0)))
+    (should (equal tail "world again"))
+    (should (= (mdview-ast-pos-at 0 tail) 56))
+    (should (= (mdview-ast-pos-at 4 tail) 60))
+    (should-not (mdview-ast-pos-at 5 tail))
+    (should (= (mdview-ast-pos-at 6 tail) 70))
+    (should (= (mdview-ast-pos-at 0 mid) 52))
+    (should (= (mdview-ast-pos-at 6 mid) 58))
+    (should (= (mdview-ast-pos-at 0 whole) 50))
+    (should (= (mdview-ast-pos-at 12 whole) 70))
+    ;; The original is untouched, and a cut in unmapped text is plain.
+    (should (= (mdview-ast-pos-at 6 s) 56))
+    (should (equal (mdview-ast-substring s 11 12) " "))
+    (should-not (mdview-ast-pos-at 0 (mdview-ast-substring s 11 12)))
+    (should (equal (mdview-ast-substring s 3 3) ""))))
+
 (provide 'mdview-ast-test)
 ;;; mdview-ast-test.el ends here
