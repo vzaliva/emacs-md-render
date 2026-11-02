@@ -100,8 +100,8 @@ files are visited with `find-file-other-window'."
 (defcustom mdview-initial-view 'edit
   "How a Markdown file is shown when it is visited.
 `edit' shows the Markdown source, as Emacs always does; `view' turns on
-`mdview-mode' so that the file opens rendered (\\[mdview-toggle] or `e'
-switches to the source).  A file counts as Markdown when its major mode
+`mdview-mode' so that the file opens rendered (\\[mdview-toggle] switches
+to the source).  A file counts as Markdown when its major mode
 derives from one of `mdview-markdown-modes'."
   :type '(choice (const :tag "Markdown source (edit)" edit)
                  (const :tag "Rendered (view)" view))
@@ -237,7 +237,6 @@ See `mdview--apply-view-settings' for the values used while rendered.")
     (define-key map (kbd "l") #'mdview-history-back)
     (define-key map (kbd "r") #'mdview-history-forward)
     (define-key map (kbd "i") #'mdview-toggle-images)
-    (define-key map (kbd "e") #'mdview-edit)
     (define-key map (kbd "w") #'mdview-copy-link)
     (define-key map (kbd "SPC") #'scroll-up-command)
     (define-key map (kbd "DEL") #'scroll-down-command)
@@ -1469,13 +1468,6 @@ row; toggling twice without moving returns to the exact old position."
   (interactive)
   (mdview--check-view)
   (mdview--render-into (current-buffer) nil t))
-
-(defun mdview-edit ()
-  "Show the Markdown source of this rendered buffer, for editing.
-Point goes to the line of the block at point."
-  (interactive)
-  (mdview--check-view)
-  (mdview-mode -1))
 
 (defun mdview-next-link ()
   "Move point to the next link, wrapping around to the first one."

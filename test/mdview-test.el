@@ -192,13 +192,14 @@ window, and BODY runs with it current; it is killed afterwards."
                      ("RET" . mdview-follow-link) ("n" . mdview-next-heading)
                      ("p" . mdview-previous-heading) ("t" . mdview-toc)
                      ("l" . mdview-history-back) ("r" . mdview-history-forward)
-                     ("i" . mdview-toggle-images) ("e" . mdview-edit)
+                     ("i" . mdview-toggle-images)
                      ("w" . mdview-copy-link) ("SPC" . scroll-up-command)
                      ("DEL" . scroll-down-command) ("S-SPC" . scroll-down-command)
                      ("<" . beginning-of-buffer) (">" . end-of-buffer)
                      ("C-c C-v" . mdview-toggle)))
     (should (eq (lookup-key mdview-mode-map (kbd (car binding))) (cdr binding))))
   (should-not (lookup-key mdview-mode-map (kbd "q")))
+  (should-not (lookup-key mdview-mode-map (kbd "e")))
   (should-not (command-remapping 'read-only-mode nil (list mdview-mode-map)))
   (should (eq (lookup-key mdview-mode-map [mouse-1]) #'mdview-mouse-follow-link))
   (should (eq (lookup-key mdview-mode-map [mouse-2]) #'mdview-mouse-follow-link)))
@@ -535,13 +536,13 @@ window, and BODY runs with it current; it is killed afterwards."
           (should (= renders 3))
           (should (= mdview--last-width 30)))))))
 
-(ert-deftest mdview-test-edit-and-view-only-commands ()
+(ert-deftest mdview-test-view-only-commands ()
   (mdview-test-with-source (source "Text\n")
     (with-current-buffer source
       (mdview-mode 1)
-      (mdview-edit)
+      (mdview-toggle)
       (should-not mdview-mode)
-      (dolist (command '(mdview-refresh mdview-toggle-images mdview-edit
+      (dolist (command '(mdview-refresh mdview-toggle-images
                          mdview-history-back mdview-history-forward))
         (let ((err (should-error (funcall command) :type 'user-error)))
           (should (string-match-p "Not a rendered buffer" (cadr err)))))
