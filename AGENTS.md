@@ -55,8 +55,10 @@ test/fixtures/        Markdown inputs (showcase.md exercises everything)
 test/golden/          expected plain-text renderings at width 80
 test/reference/       Frogmouth's own rendering of the fixtures (truth for the look)
 test/commonmark/      spec runner, HTML serializer, pass-count baseline
-scripts/              dev tooling: dump.el, tmux-shot.sh, ansi-to-png.sh, frogmouth-reference.sh
+scripts/              dev tooling: dump.el, tmux-shot.sh (+ shot-colors.el), ansi-to-png.sh,
+                      screenshots.sh, frogmouth-reference.sh
 docs/DESIGN.md        architecture, AST contract, style specification
+docs/screenshots/     the README gallery (regenerate with `make screenshots`)
 ```
 
 ## How to work
@@ -68,6 +70,9 @@ make lint                                   # checkdoc; exits non-zero on any fi
 make render FILE=test/fixtures/showcase.md WIDTH=100 | less   # look at your output
 make render-faces FILE=... WIDTH=...        # with {face} annotations
 make shot FILE=test/fixtures/showcase.md    # real text-mode Emacs capture -> /tmp/mdview-shots/*.png
+                                            # (SHOT_TERM=xterm-direct for 24-bit colour, SHOT_SETUP=file.el
+                                            # to load a third-party theme; needs tmux, uv, rsvg-convert)
+make screenshots                            # regenerate docs/screenshots/*.png for the README gallery
 make commonmark                             # spec conformance report
 diff <(make -s render WIDTH=98) test/reference/showcase.frogmouth.txt   # compare layout with Frogmouth
 ```

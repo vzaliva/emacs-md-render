@@ -8,7 +8,7 @@ TESTS := $(wildcard test/*-test.el)
 FILE  ?= test/fixtures/showcase.md
 WIDTH ?= 100
 
-.PHONY: all check compile test lint golden render render-faces render-ansi shot commonmark clean clean-elc
+.PHONY: all check compile test lint golden render render-faces render-ansi shot screenshots commonmark clean clean-elc
 
 all: check
 
@@ -43,6 +43,11 @@ render-ansi:
 # Text-mode Emacs screenshot via a private tmux server -> /tmp/mdview-shots/
 shot:
 	scripts/tmux-shot.sh "$(FILE)" $(WIDTH)
+
+# Regenerate the README gallery, docs/screenshots/*.png (see the script for
+# the environment it reads, e.g. SOLARIZED_DIR).
+screenshots:
+	scripts/screenshots.sh
 
 # CommonMark spec conformance (downloads spec.json on first run).
 commonmark: test/commonmark/spec.json

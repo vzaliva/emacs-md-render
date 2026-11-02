@@ -14,6 +14,32 @@ and press it again to go back.  File management, bookmarks, history panes
 and the other application features of Frogmouth are deliberately left to
 Emacs itself.
 
+## Screenshots
+
+Text-mode Emacs (`emacs -nw`) showing `test/fixtures/showcase.md` in the
+Solarized dark and light themes and in Emacs's own `modus-vivendi` and
+`modus-operandi`.  The heading and table panels, block quotes and frames
+take their colours from whichever theme you use.
+
+<table>
+<tr>
+<td>
+<img width="100%" alt="mdview in Solarized dark: headings" src="docs/screenshots/solarized-dark.png">
+</td>
+<td>
+<img width="100%" alt="mdview in Solarized light: tables" src="docs/screenshots/solarized-light.png">
+</td>
+</tr>
+<tr>
+<td>
+<img width="100%" alt="mdview in modus-vivendi: code blocks" src="docs/screenshots/modus-vivendi.png">
+</td>
+<td>
+<img width="100%" alt="mdview in modus-operandi: block quotes and lists" src="docs/screenshots/modus-operandi.png">
+</td>
+</tr>
+</table>
+
 ## Status
 
 The package is functional and tested but not yet released.  What works
@@ -226,8 +252,16 @@ make render FILE=test/fixtures/showcase.md WIDTH=100   # dump a rendering as tex
 make render-faces FILE=... WIDTH=...        # the same with {face} markers
 make golden     # regenerate test/golden/*.txt (review the diff first)
 make shot  FILE=test/fixtures/showcase.md   # text-mode Emacs screenshot via tmux
+make screenshots # regenerate the README gallery in docs/screenshots/
 make commonmark # CommonMark spec conformance report
 ```
+
+`make shot` and `make screenshots` need tmux, `uv` and `rsvg-convert`
+(`librsvg2-bin` on Debian and Ubuntu).  `scripts/tmux-shot.sh` takes
+`SHOT_TERM` (for example `xterm-direct` for 24-bit colour) and `SHOT_SETUP`
+(a Lisp file loaded before the theme, to put a third-party theme on
+`custom-theme-load-path`); the Solarized shots of the gallery need
+`SOLARIZED_DIR` set to the directory of the `solarized-theme` package.
 
 To check image display in a graphical Emacs without screenshots, run
 `scripts/gui-check.el` in the background with absolute paths (see the
