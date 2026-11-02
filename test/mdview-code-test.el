@@ -48,6 +48,23 @@
   (goto-char (point-min))
   (insert "oops "))
 
+(define-derived-mode mdview-code-test-special-mode special-mode "FakeSpecial"
+  "A `special-mode' descendant, like `tar-mode', defined only for the tests.")
+
+(define-derived-mode mdview-code-test-orphan-mode nil "Orphan"
+  "A major mode with no parent, defined only for the tests.")
+
+(define-derived-mode mdview-code-test-conf-mode conf-unix-mode "FakeConf"
+  "A `conf-mode' descendant defined only for the tests.")
+
+(defvar mdview-code-test-setup-count 0
+  "How often `mdview-code-test-counting-mode' was set up.")
+
+(define-derived-mode mdview-code-test-counting-mode prog-mode "Counting"
+  "A major mode that counts its own set-ups and highlights \"counted\"."
+  (setq mdview-code-test-setup-count (1+ mdview-code-test-setup-count))
+  (setq-local font-lock-defaults '((("counted" . font-lock-keyword-face)))))
+
 (defface mdview-code-test-inherit
   '((t :inherit font-lock-type-face))
   "Test face inheriting from a font-lock face."
@@ -271,6 +288,44 @@ comment and a string.")
     (should-not (mdview-code-resolve-mode "normal"))
     (should-not (mdview-code-resolve-mode "view"))))
 
+(ert-deftest mdview-code-resolve-rejects-special-and-orphan-modes ()
+  "Guessed modes must derive from prog-mode, text-mode or conf-mode.
+`tar-mode' and friends signal on arbitrary text; a table entry may still
+name any mode explicitly."
+  (mdview-code-test-plain-env
+    (dolist (name '("tar" "tabulated-list" "help" "special"
+                    "mdview-code-test-special" "mdview-code-test-orphan"))
+      (should-not (mdview-code-resolve-mode name)))
+    (should (eq (mdview-code-resolve-mode "mdview-code-test-conf")
+                'mdview-code-test-conf-mode))
+    (should (eq (mdview-code-resolve-mode "conf-unix") 'conf-unix-mode))
+    (should (eq (mdview-code-resolve-mode "awk") 'awk-mode))
+    (should (eq (mdview-code-resolve-mode "nroff") 'nroff-mode))
+    (should (mdview-code--text-mode-p 'text-mode))
+    (should (mdview-code--text-mode-p 'prog-mode))
+    (should (mdview-code--text-mode-p 'conf-mode))
+    (should (mdview-code--text-mode-p 'emacs-lisp-mode))
+    (should-not (mdview-code--text-mode-p 'fundamental-mode))
+    (should-not (mdview-code--text-mode-p 'special-mode))
+    (should-not (mdview-code--text-mode-p nil))
+    ;; Listed explicitly, a mode of any lineage is accepted.
+    (let ((mdview-code-lang-modes '(("orphan" . mdview-code-test-orphan-mode))))
+      (should (eq (mdview-code-resolve-mode "orphan")
+                  'mdview-code-test-orphan-mode)))))
+
+(ert-deftest mdview-code-fontify-tar-block-is-plain-and-silent ()
+  "A fence labelled tar renders as plain text without any message."
+  (let ((messages nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args)
+                 (when fmt (push (apply #'format fmt args) messages))
+                 nil)))
+      (mdview-code-test-plain-env
+        (should (mdview-code-test-plain-p (mdview-code-fontify "some text" "tar")
+                                          "some text"))
+        (should (mdview-code-test-plain-p (mdview-code-fontify "x" "help") "x"))))
+    (should (null messages))))
+
 (ert-deftest mdview-code-resolve-prefers-ready-treesit-mode ()
   "LANG-ts-mode wins when its grammar is ready, else LANG-mode."
   (cl-letf (((symbol-function 'mdview-code--treesit-ready-p)
@@ -430,22 +485,122 @@ comment and a string.")
       (should (eq (mdview-code-test-face-at result "# ç") 'mdview-code-comment)))))
 
 (ert-deftest mdview-code-fontify-broken-mode-is-plain ()
-  "A mode that signals during setup yields plain text, without an error."
+  "A mode that signals during setup yields plain text, silently by default.
+With `mdview-code-debug' the failure is reported; the broken mode's
+scratch buffer is discarded either way."
   (let ((mdview-code-lang-modes '(("broken" . mdview-code-test-broken-mode)))
-        (code "some code"))
+        (code "some code")
+        (messages nil))
     (mdview-code-test-plain-env
       (should (eq (mdview-code-resolve-mode "broken") 'mdview-code-test-broken-mode))
-      ;; The failure is logged with `message'; keep the test output quiet.
-      (let ((inhibit-message t))
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (when fmt (push (apply #'format fmt args) messages))
+                   nil)))
         (should (mdview-code-test-plain-p (mdview-code-fontify code "broken")
-                                          code))))))
+                                          code))
+        (should (null messages))
+        (let ((mdview-code-debug t))
+          (should (mdview-code-test-plain-p (mdview-code-fontify code "broken")
+                                            code)))
+        (should (= (length messages) 1))
+        (should (string-prefix-p "mdview-code: highlighting failed"
+                                 (car messages))))
+      (should-not (get-buffer " *mdview-code:mdview-code-test-broken-mode*")))))
 
 (ert-deftest mdview-code-fontify-mutating-mode-is-plain ()
-  "A mode that changes the buffer text is ignored."
+  "A mode that changes the buffer text is ignored and its scratch buffer dropped."
   (let ((mdview-code-lang-modes '(("mutating" . mdview-code-test-mutating-mode)))
         (code "some code"))
     (mdview-code-test-plain-env
+      (should (mdview-code-test-plain-p (mdview-code-fontify code "mutating") code))
+      (should-not (get-buffer " *mdview-code:mdview-code-test-mutating-mode*"))
+      ;; Every call fails afresh: nothing is memoized for it.
       (should (mdview-code-test-plain-p (mdview-code-fontify code "mutating") code)))))
+
+(ert-deftest mdview-code-fontify-reuses-scratch-buffer-per-mode ()
+  "The major mode is set up once per mode; later blocks reuse its buffer."
+  (let ((mdview-code-lang-modes '(("counting" . mdview-code-test-counting-mode)))
+        (name " *mdview-code:mdview-code-test-counting-mode*"))
+    (mdview-code-test-plain-env
+      (mdview-code-clear-cache)
+      (setq mdview-code-test-setup-count 0)
+      (let ((first (mdview-code-fontify "counted x" "counting"))
+            (second (mdview-code-fontify "y counted" "counting"))
+            (third (mdview-code-fontify "" "counting")))
+        (should (= mdview-code-test-setup-count 1))
+        (should (eq (mdview-code-test-face-at first "counted") 'mdview-code-keyword))
+        ;; The second block is fontified too (font-lock state is reset).
+        (should (eq (mdview-code-test-face-at second "counted") 'mdview-code-keyword))
+        (should-not (mdview-code-test-face-at second "y"))
+        (should (equal third "")))
+      (should (buffer-live-p (get-buffer name)))
+      (should (= (length (seq-filter (lambda (b) (equal (buffer-name b) name))
+                                     (buffer-list)))
+                 1))
+      (should (string-prefix-p " " name))
+      (with-current-buffer name
+        (should (eq major-mode 'mdview-code-test-counting-mode))
+        (should-not font-lock-mode))
+      (mdview-code-clear-cache)
+      (should-not (get-buffer name)))))
+
+(ert-deftest mdview-code-fontify-memoized ()
+  "Identical blocks are fontified once; callers get fresh copies."
+  (let ((calls 0)
+        (orig (symbol-function 'mdview-code--fontify-with-mode)))
+    (mdview-code-test-plain-env
+      (mdview-code-clear-cache)
+      (cl-letf (((symbol-function 'mdview-code--fontify-with-mode)
+                 (lambda (code mode) (cl-incf calls) (funcall orig code mode))))
+        (let ((a (mdview-code-fontify mdview-code-test-elisp "elisp"))
+              (b (mdview-code-fontify mdview-code-test-elisp "elisp")))
+          (should (= calls 1))
+          (should (equal-including-properties a b))
+          (should-not (eq a b))
+          (should (eq (mdview-code-test-face-at b "defun") 'mdview-code-keyword))
+          ;; "el" resolves to the same mode: the entry is shared.
+          (mdview-code-fontify mdview-code-test-elisp "el")
+          (should (= calls 1))
+          ;; Options are part of the key.
+          (let ((mdview-code-material-theme nil))
+            (should (eq (mdview-code-test-face-at
+                         (mdview-code-fontify mdview-code-test-elisp "elisp")
+                         "defun")
+                        'font-lock-keyword-face)))
+          (should (= calls 2))
+          (let ((mdview-code-face-alist '((font-lock-keyword-face . mdview-code-error))))
+            (should (eq (mdview-code-test-face-at
+                         (mdview-code-fontify mdview-code-test-elisp "elisp")
+                         "defun")
+                        'mdview-code-error)))
+          (should (= calls 3))
+          ;; Altering a returned string does not poison the memo.
+          (put-text-property 0 5 'face 'bold a)
+          (should (equal-including-properties
+                   (mdview-code-fontify mdview-code-test-elisp "elisp") b))
+          (should (= calls 3))
+          ;; Other code is fontified, and the memo can be emptied.
+          (mdview-code-fontify "(bar)" "elisp")
+          (should (= calls 4))
+          (mdview-code-clear-cache)
+          (should (zerop (hash-table-count mdview-code--cache)))
+          (mdview-code-fontify mdview-code-test-elisp "elisp")
+          (should (= calls 5)))))))
+
+(ert-deftest mdview-code-fontify-memo-is-bounded ()
+  "The memo is emptied when the code it holds would exceed its limit."
+  (mdview-code-test-plain-env
+    (mdview-code-clear-cache)
+    (cl-letf (((symbol-value 'mdview-code--cache-max-chars) 30))
+      (mdview-code-fontify "(a)" "elisp")
+      (mdview-code-fontify "(bb)" "elisp")
+      (should (= (hash-table-count mdview-code--cache) 2))
+      (should (= mdview-code--cache-chars 7))
+      (mdview-code-fontify (make-string 25 ?x) "elisp")
+      (should (= (hash-table-count mdview-code--cache) 1))
+      (should (= mdview-code--cache-chars 25)))
+    (mdview-code-clear-cache)))
 
 (ert-deftest mdview-code-fontify-non-string-code ()
   "Non-string CODE is treated as empty rather than signalling."

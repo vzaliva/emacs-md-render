@@ -1,0 +1,55 @@
+▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+▎                                                                              ▊
+▎                                    Extras                                    ▊
+▎                                                                              ▊
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+GitHub alerts, centered HTML, details and keyboard keys.                        
+                                                                                
+▌ ◉ Note                                                                        
+▌ Useful information that users should know, even when skimming.                
+                                                                                
+▌ ✦ Tip                                                                         
+▌ Helpful advice for doing things better or more easily.                        
+                                                                                
+▌ ❢ Important                                                                   
+▌ Key information users need to know to achieve their goal.                     
+                                                                                
+▌ ⚠ Warning                                                                     
+▌ Urgent info that needs immediate user attention to avoid problems.            
+                                                                                
+▌ ⊘ Caution                                                                     
+▌ Advises about risks or negative outcomes of certain actions.                  
+                                                                                
+▌ ◉ Note                                                                        
+▌ Lower-case markers work too, and the body may have several lines that wrap at 
+▌ the quote width like any other block quote.                                   
+▌                                                                               
+▌ ● with a list                                                                 
+▌ ● inside it                                                                   
+                                                                                
+                                 Centered title                                 
+                             A second centered line                             
+                                                                                
+▸ Click to expand                                                               
+                                                                                
+Hidden content that mdview shows expanded, with code in it.                     
+                                                                                
+Press Ctrl+C to copy and Ctrl+V to paste.                                       
+                                                                                
+🖼 An image whose alternative text is deliberately far longer than eighty columns
+so that the placeholder has to wrap over several lines                          
+                                                                                
+🖼 A linked badge with a very long alternative text that also exceeds the width  
+of the golden rendering by a margin                                             
+                                                                                
+A paragraph with an inline 🖼 badge placeholder that should move as a whole to   
+the next line when it does not fit at the end.                                  
+                                                                                
+                                🖼 centered image                                
+                                                                                
+▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+▎                                                                              ▊
+▎                                 HTML heading                                 ▊
+▎                                                                              ▊
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+Text after an HTML heading.                                                     

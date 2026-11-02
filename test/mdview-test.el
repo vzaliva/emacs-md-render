@@ -249,9 +249,11 @@ the view current; the view is killed afterwards."
          (source (find-file-noselect file)))
     (unwind-protect
         (let ((view (mdview source)))
-          (should (memq #'mdview--after-save
-                        (buffer-local-value 'after-save-hook source)))
+          ;; The hook is global and filtered by source, so a mode change
+          ;; in the source (`kill-all-local-variables') cannot lose it.
+          (should (memq #'mdview--after-save (default-value 'after-save-hook)))
           (with-current-buffer source
+            (text-mode)
             (goto-char (point-max))
             (insert "\nGamma\n")
             (let ((inhibit-message t))
@@ -268,14 +270,22 @@ the view current; the view is killed afterwards."
       (mdview-test--cleanup source)
       (delete-directory dir t))))
 
-(ert-deftest mdview-test-kill-view-removes-save-hook ()
-  (mdview-test-with-source (source "Text\n")
-    (let ((view (with-current-buffer source (mdview))))
-      (should (memq #'mdview--after-save
-                    (buffer-local-value 'after-save-hook source)))
-      (kill-buffer view)
-      (should-not (memq #'mdview--after-save
-                        (buffer-local-value 'after-save-hook source))))))
+(ert-deftest mdview-test-save-without-view-is-harmless ()
+  (let* ((dir (make-temp-file "mdview-test" t))
+         (file (mdview-test--write-file dir "doc.md" "Alpha\n"))
+         (source (find-file-noselect file)))
+    (unwind-protect
+        (let ((view (mdview source)))
+          (kill-buffer view)
+          (should (memq #'mdview--after-save (default-value 'after-save-hook)))
+          (with-current-buffer source
+            (goto-char (point-max))
+            (insert "Beta\n")
+            (let ((inhibit-message t))
+              (save-buffer)))
+          (should-not (seq-filter #'mdview--view-p (buffer-list))))
+      (mdview-test--cleanup source)
+      (delete-directory dir t))))
 
 ;;;; Quitting
 
@@ -540,8 +550,6 @@ the view current; the view is killed afterwards."
               (should (= mdview--history-index 0))
               (should (eq mdview--source-buffer source))
               (should (equal (buffer-name) "*mdview: test.md*"))
-              (should (memq #'mdview--after-save
-                            (buffer-local-value 'after-save-hook source)))
               (should-error (mdview-history-back) :type 'user-error)
               (mdview-history-forward)
               (should (string-match-p "Linked document" (buffer-string)))
@@ -607,21 +615,40 @@ the view current; the view is killed afterwards."
 
 (ert-deftest mdview-test-toc ()
   (mdview-test-with-fake-view
-      (view (concat (mdview-test--heading "First" 1 "first") "\n\n"
-                    (mdview-test--heading "Second" 2 "second") "\n"))
-    (let ((second (cdr (assoc "Second" (mdview--imenu-create-index)))))
-      ;; `imenu' selects the window of `last-nonmenu-event' (nil in batch).
+      (view (concat (mdview-test--heading "First one" 1 "first-one") "\n\n"
+                    "body\n\n"
+                    (mdview-test--heading "Second one" 2 "second-one") "\n"))
+    (let ((second (cdr (assoc "Second one" (mdview--imenu-create-index))))
+          (prompts nil)
+          (candidates nil)
+          (defaults nil))
       (set-window-buffer (selected-window) view)
       (cl-letf (((symbol-function 'completing-read)
-                 (lambda (&rest _) "Second")))
+                 (lambda (prompt collection &rest args)
+                   (push prompt prompts)
+                   (push (mapcar #'car collection) candidates)
+                   (push (nth 4 args) defaults)
+                   "Second one")))
         (goto-char (point-min))
         (mdview-toc)
         (should (= (point) second))
-        ;; When `imenu' itself fails, the completion fallback is used.
+        ;; Heading names are offered verbatim (no imenu dots for spaces),
+        ;; the prompt says what is asked for, and the heading at point is
+        ;; the default.
+        (should (equal (car candidates) '("First one" "Second one")))
+        (should (string-prefix-p "Heading" (car prompts)))
+        (should (equal (car defaults) "First one"))
+        (should (string-match-p "First one" (car prompts)))
+        (mdview-toc)
+        (should (equal (car defaults) "Second one"))
+        ;; With the popup menu requested, `imenu' is used; when it fails,
+        ;; the completion fallback is.
         (goto-char (point-min))
         (cl-letf (((symbol-function 'imenu)
-                   (lambda (&rest _) (error "No imenu"))))
-          (mdview-toc))
+                   (lambda (&rest _) (error "No imenu")))
+                  ((symbol-function 'display-popup-menus-p) (lambda (&rest _) t)))
+          (let ((imenu-use-popup-menu 'always))
+            (mdview-toc)))
         (should (= (point) second))))))
 
 (ert-deftest mdview-test-toc-without-headings ()
@@ -680,20 +707,421 @@ the view current; the view is killed afterwards."
 ;;;; Integration
 
 (ert-deftest mdview-test-install-keybinding ()
-  (let ((map (make-sparse-keymap)))
+  ;; Self-contained: `features', `after-load-alist' and `md-mode-map' are
+  ;; dynamically bound, so a real md-mode loaded in an interactive session
+  ;; is neither unregistered nor rebound, and nothing leaks afterwards.
+  (let ((map (make-sparse-keymap))
+        (was-bound (boundp 'md-mode-map))
+        (old-map (and (boundp 'md-mode-map) md-mode-map))
+        (was-provided (featurep 'md-mode)))
+    (cl-letf (((symbol-value 'features) (remq 'md-mode features))
+              ((symbol-value 'after-load-alist) (copy-alist after-load-alist)))
+      (let ((md-mode-map map))
+        (should-not (featurep 'md-mode))
+        (mdview-install-keybinding "C-c C-v")
+        (should-not (eq (lookup-key map (kbd "C-c C-v")) #'mdview-toggle))
+        (provide 'md-mode)
+        (should (eq (lookup-key map (kbd "C-c C-v")) #'mdview-toggle))
+        ;; Vectors work too, and a loaded feature is bound immediately.
+        (mdview-install-keybinding [f9])
+        (should (eq (lookup-key map [f9]) #'mdview-toggle))))
+    (should (eq (featurep 'md-mode) was-provided))
+    (should (eq (boundp 'md-mode-map) was-bound))
+    (when was-bound
+      (should (eq md-mode-map old-map))
+      (should-not (eq (lookup-key old-map [f9]) #'mdview-toggle)))))
+
+;;;; Review findings: robustness, performance and UX of the view
+
+(ert-deftest mdview-test-undo-disabled-in-views ()
+  ;; A read-only view gains nothing from undo; each render would otherwise
+  ;; retain the whole previous rendering on `buffer-undo-list'.
+  (mdview-test-with-source (source "One\n\nTwo\n")
+    (let ((view (with-current-buffer source (mdview))))
+      (with-current-buffer view
+        (should (eq buffer-undo-list t))
+        (mdview-refresh)
+        (should (eq buffer-undo-list t))))))
+
+(ert-deftest mdview-test-render-reuses-parsed-document ()
+  ;; Refitting and toggling images re-render an unchanged source without
+  ;; parsing it again; an edit invalidates the cache.
+  (mdview-test-with-source (source "Alpha\n\nBeta\n")
+    (let ((view (with-current-buffer source (mdview)))
+          (parses 0))
+      (cl-letf* ((parse (symbol-function 'mdview-parse-string))
+                 ((symbol-function 'mdview-parse-string)
+                  (lambda (&rest args) (cl-incf parses) (apply parse args))))
+        (with-current-buffer view
+          (let ((inhibit-message t))
+            (mdview-toggle-images)
+            (mdview-refresh))
+          (should (= parses 0))
+          (with-current-buffer source
+            (goto-char (point-max))
+            (insert "\nGamma\n"))
+          (mdview-refresh)
+          (should (= parses 1))
+          (should (string-match-p "Gamma" (buffer-string)))
+          (mdview-refresh)
+          (should (= parses 1)))))))
+
+(ert-deftest mdview-test-render-reparses-changed-file ()
+  (let* ((dir (make-temp-file "mdview-test" t))
+         (file (mdview-test--write-file dir "doc.md" "Before\n")))
+    (unwind-protect
+        (let ((view (mdview-file file)))
+          (with-current-buffer view
+            (should (string-match-p "Before" (buffer-string)))
+            ;; Same size, later modification time: the cache must notice.
+            (sleep-for 0.05)
+            (with-temp-file file (insert "After!\n"))
+            (set-file-times file)
+            (mdview-refresh)
+            (should (string-match-p "After!" (buffer-string)))
+            (should-not (string-match-p "Before" (buffer-string)))))
+      (mdview-test--cleanup)
+      (delete-directory dir t))))
+
+(ert-deftest mdview-test-render-raises-gc-threshold ()
+  (mdview-test-with-source (source "Text\n")
+    (let ((view (with-current-buffer source (mdview)))
+          (seen nil))
+      (cl-letf (((symbol-function 'mdview-render-document)
+                 (lambda (&rest _) (setq seen gc-cons-threshold) (insert "x\n"))))
+        (with-current-buffer view (mdview-refresh)))
+      (should (>= seen mdview--render-gc-threshold))
+      (should (< gc-cons-threshold mdview--render-gc-threshold)))))
+
+(ert-deftest mdview-test-refresh-keeps-window-start ()
+  ;; Re-rendering must not collapse the window start to the beginning
+  ;; and let redisplay recenter around point.
+  (mdview-test-with-source
+      (source (mapconcat (lambda (i) (format "Paragraph %d\n" i))
+                         (number-sequence 1 40) "\n"))
+    (let* ((view (with-current-buffer source (mdview)))
+           (window (selected-window)))
+      (should (eq (window-buffer window) view))
+      (with-current-buffer view
+        (let* ((blocks (mdview--block-starts))
+               (top (cdr (nth 20 blocks)))
+               (target (cdr (nth 23 blocks))))
+          (set-window-start window top)
+          (goto-char target)
+          (set-window-point window target)
+          (mdview-refresh)
+          (should (= (window-start window) top))
+          (should (= (point) target))
+          ;; After an edit the window starts at the block rendered from
+          ;; the same source line, exactly like point does.
+          (let ((line (mdview--source-line-at top)))
+            (with-current-buffer source
+              (goto-char (point-min))
+              (insert "Inserted\n\n"))
+            (mdview-refresh)
+            (should (= (mdview--source-line-at (window-start window)) line))
+            (should (= (window-start window)
+                       (mdview--source-line-position line)))))))))
+
+(ert-deftest mdview-test-file-rejects-directory ()
+  (let ((dir (make-temp-file "mdview-test" t))
+        (views (seq-filter #'mdview--view-p (buffer-list)))
+        (window-buffer (window-buffer (selected-window))))
     (unwind-protect
         (progn
-          (setq features (delq 'md-mode features))
-          (setq md-mode-map map)
-          (mdview-install-keybinding "C-c C-v")
-          (should-not (eq (lookup-key map (kbd "C-c C-v")) #'mdview-toggle))
-          (provide 'md-mode)
-          (should (eq (lookup-key map (kbd "C-c C-v")) #'mdview-toggle))
-          ;; Vectors work too, and a loaded feature is bound immediately.
-          (mdview-install-keybinding [f9])
-          (should (eq (lookup-key map [f9]) #'mdview-toggle)))
-      (setq features (delq 'md-mode features))
-      (makunbound 'md-mode-map))))
+          (should-error (mdview-file dir) :type 'user-error)
+          (should-error (mdview-file (file-name-as-directory dir)) :type 'user-error)
+          (should (equal (seq-filter #'mdview--view-p (buffer-list)) views))
+          (should (eq (window-buffer (selected-window)) window-buffer))
+          (should-not (get-buffer "*mdview: *")))
+      (delete-directory dir t))))
+
+(ert-deftest mdview-test-source-name-never-empty ()
+  (should (equal (mdview--source-name nil "/tmp/dir/") "dir"))
+  (should (equal (mdview--source-name nil "/tmp/dir/a.md") "a.md"))
+  (should (equal (mdview--source-name nil "/") "?"))
+  (should (equal (mdview--source-name nil nil) "?")))
+
+(ert-deftest mdview-test-failed-first-render-leaves-no-view ()
+  (mdview-test-with-source (source "Text\n")
+    (let ((views (seq-filter #'mdview--view-p (buffer-list)))
+          (window-buffer (window-buffer (selected-window))))
+      (cl-letf (((symbol-function 'mdview-render-document)
+                 (lambda (&rest _) (error "Renderer broke"))))
+        (should-error (with-current-buffer source (mdview))))
+      (should (equal (seq-filter #'mdview--view-p (buffer-list)) views))
+      (should (eq (window-buffer (selected-window)) window-buffer))
+      ;; An existing view survives a failed refresh.
+      (let ((view (with-current-buffer source (mdview))))
+        (cl-letf (((symbol-function 'mdview--source-text)
+                   (lambda () (error "Source unavailable"))))
+          (with-current-buffer source
+            (goto-char (point-max))
+            (insert "more\n"))
+          (should-error (with-current-buffer source (mdview))))
+        (should (buffer-live-p view))))))
+
+(ert-deftest mdview-test-refit-reports-errors-once ()
+  (mdview-test-with-source (source "Text\n")
+    (let ((view (with-current-buffer source (mdview)))
+          (messages nil))
+      (kill-buffer source)
+      (with-current-buffer view
+        (setq mdview--source-file "/nonexistent/gone.md")
+        (cl-letf (((symbol-function 'window-margins) (lambda (&rest _) '(nil)))
+                  ((symbol-function 'window-body-width) (lambda (&rest _) 40))
+                  ((symbol-function 'message)
+                   (lambda (format &rest args)
+                     (push (apply #'format format args) messages))))
+          (let ((mdview-margin 4) (mdview-max-width 100))
+            ;; The idle timer's function must not signal.
+            (should-not (mdview--refit view))
+            (should (= (length messages) 1))
+            (should (string-match-p "no longer exists" (car messages)))
+            ;; The same width is not retried on the next resize.
+            (should-not (mdview--refit view))
+            (should (= (length messages) 1))))))))
+
+(ert-deftest mdview-test-refit-interrupted-reschedules ()
+  (mdview-test-with-source (source "Text\n")
+    (let ((view (with-current-buffer source (mdview)))
+          (rendered nil))
+      (with-current-buffer view
+        (let ((width mdview--last-width))
+          (cl-letf (((symbol-function 'window-margins) (lambda (&rest _) '(nil)))
+                    ((symbol-function 'window-body-width) (lambda (&rest _) 40))
+                    ((symbol-function 'mdview--render-into)
+                     (lambda (&rest _)
+                       (setq rendered t)
+                       ;; Simulate input arriving while rendering.
+                       (throw throw-on-input t))))
+            (let ((mdview-margin 4) (mdview-max-width 100))
+              (should-not (mdview--refit view))
+              (should rendered)
+              (should (timerp mdview--refit-timer))
+              (should (= width mdview--last-width))
+              (mdview--cancel-refit))))))))
+
+(ert-deftest mdview-test-images-updated-schedules-rerender ()
+  ;; Remote images arriving after the rendering re-render the view once
+  ;; Emacs is idle, so that paragraphs re-flow around inline images;
+  ;; several arrivals share one rendering and non-views are ignored.
+  (mdview-test-with-source (source "Text ![b](https://example.invalid/b.png)\n")
+    (let ((view (with-current-buffer source (mdview)))
+          (renders 0))
+      (should (memq #'mdview--on-images-updated mdview-image-update-functions))
+      (cl-letf (((symbol-function 'mdview--render-into)
+                 (lambda (&rest _) (cl-incf renders))))
+        (with-current-buffer view
+          (run-hook-with-args 'mdview-image-update-functions view)
+          (let ((first mdview--image-update-timer))
+            (should (timerp first))
+            (run-hook-with-args 'mdview-image-update-functions view)
+            (should (timerp mdview--image-update-timer))
+            (should-not (memq first timer-idle-list)))
+          (should (= renders 0))
+          (mdview--rerender-for-images view)
+          (should (= renders 1))
+          (should (null mdview--image-update-timer))
+          ;; With images switched off there is nothing to re-flow.
+          (setq mdview--images-enabled nil)
+          (mdview--on-images-updated view)
+          (mdview--rerender-for-images view)
+          (should (= renders 1)))
+        (with-temp-buffer
+          (run-hook-with-args 'mdview-image-update-functions (current-buffer))
+          (should (null mdview--image-update-timer)))
+        (should (= renders 1))))))
+
+(ert-deftest mdview-test-images-updated-interrupted-reschedules ()
+  (mdview-test-with-source (source "Text\n")
+    (let ((view (with-current-buffer source (mdview)))
+          (rendered nil))
+      (with-current-buffer view
+        (cl-letf (((symbol-function 'mdview--render-into)
+                   (lambda (&rest _)
+                     (setq rendered t)
+                     (throw throw-on-input t))))
+          (mdview--rerender-for-images view)
+          (should rendered)
+          (should (timerp mdview--image-update-timer))
+          (let ((timer mdview--image-update-timer))
+            (kill-buffer view)
+            (should-not (memq timer timer-idle-list))))))))
+
+(ert-deftest mdview-test-deeply-nested-emphasis-renders ()
+  ;; Thousands of nested emphasis delimiters once exhausted the Lisp
+  ;; stack in the parser's post-passes; `mdview' must simply show text.
+  (mdview-test-with-source (source (concat (make-string 5900 ?*) "deep"
+                                           (make-string 5900 ?*) "\n"))
+    (let ((view (with-current-buffer source (mdview))))
+      (with-current-buffer view
+        (should (string-match-p "deep" (buffer-string)))))))
+
+(ert-deftest mdview-test-view-only-commands-outside-view ()
+  (with-temp-buffer
+    (insert "# Not a view\n")
+    (dolist (command '(mdview-refresh mdview-toggle-images mdview-visit-source
+                       mdview-history-back mdview-history-forward))
+      (let ((err (should-error (funcall command) :type 'user-error)))
+        (should (string-match-p "Not in an mdview buffer" (cadr err)))))
+    (should (equal (buffer-string) "# Not a view\n"))))
+
+(ert-deftest mdview-test-copy-link-resolves-local-files ()
+  (mdview-test-with-fake-view
+      (view (concat (mdview-test--link "doc" "sub/b.md#details") "\n"
+                    (mdview-test--link "web" "https://example.com/x") "\n"
+                    (mdview-test--link "anchor" "#top") "\n"))
+    (setq mdview--base-dir "/tmp/base/")
+    (let ((inhibit-message t))
+      (goto-char (point-min))
+      (mdview-copy-link)
+      (should (equal (current-kill 0) "/tmp/base/sub/b.md#details"))
+      (mdview-copy-link t)
+      (should (equal (current-kill 0) "sub/b.md#details"))
+      (forward-line 1)
+      (mdview-copy-link)
+      (should (equal (current-kill 0) "https://example.com/x"))
+      (forward-line 1)
+      (mdview-copy-link)
+      (should (equal (current-kill 0) "#top")))))
+
+(ert-deftest mdview-test-follow-linked-image ()
+  ;; An image wrapped in a link carries the link's URL; RET must follow
+  ;; the link (anchor, Markdown file, ...) rather than open "the image".
+  (let* ((dir (make-temp-file "mdview-test" t))
+         (linked (mdview-test--write-file dir "b.md" "Document B\n")))
+    (unwind-protect
+        (mdview-test-with-fake-view
+            (view (concat (propertize "[badge]" 'mdview-link "b.md"
+                                      'face 'mdview-image-placeholder)
+                          "\n"
+                          (propertize "[badge]" 'mdview-link "#target"
+                                      'face 'mdview-image-placeholder)
+                          "\n"
+                          (propertize "[badge]" 'mdview-link "badge.png"
+                                      'face 'mdview-image-placeholder)
+                          "\n"
+                          (propertize "[badge]" 'mdview-link "https://example.com/"
+                                      'mdview-image-url "badge.png"
+                                      'face 'mdview-image-placeholder)
+                          "\n\n"
+                          (mdview-test--heading "Target" 2 "target") "\n"))
+          (setq mdview--base-dir (file-name-as-directory dir))
+          (let ((opened nil) (browsed nil)
+                (heading (save-excursion
+                           (goto-char (point-min))
+                           (prop-match-beginning
+                            (text-property-search-forward
+                             'mdview-heading-id "target" t)))))
+            (cl-letf (((symbol-function 'mdview-image-open)
+                       (lambda (url &optional _) (push url opened)))
+                      ((symbol-function 'browse-url)
+                       (lambda (url &rest _) (push url browsed)))
+                      ((symbol-function 'find-file)
+                       (lambda (&rest _) (error "find-file must not be called"))))
+              (set-window-buffer (selected-window) view)
+              (goto-char (point-min))
+              (forward-line 1)
+              (mdview-follow-link)             ; anchor
+              (should (= (point) heading))
+              (goto-char (point-min))
+              (forward-line 2)
+              (mdview-follow-link)             ; plain image
+              (should (equal opened '("badge.png")))
+              (goto-char (point-min))
+              (forward-line 3)
+              (mdview-follow-link)             ; linked image, own URL recorded
+              (should (equal browsed '("https://example.com/")))
+              (should (equal opened '("badge.png")))
+              (goto-char (point-min))
+              (mdview-follow-link))            ; Markdown file: rendered here
+            (should (string-match-p "Document B" (buffer-string)))
+            (should (equal mdview--source-file linked))
+            (should (= (length mdview--history) 1))))
+      (delete-directory dir t))))
+
+(ert-deftest mdview-test-image-link-p ()
+  (mdview-test-with-fake-view
+      (view (concat (propertize "a" 'mdview-link "pic.png")
+                    (propertize "b" 'mdview-link "https://x.example/" 'mdview-image-url "pic.png")
+                    (propertize "c" 'mdview-link "pic.png" 'display '(image :type png :file "/base/pic.png"))
+                    (propertize "d" 'mdview-link "other.md" 'display '(image :type png :file "/base/pic.png"))
+                    "\n"))
+    (setq mdview--base-dir "/base/")
+    (should (mdview--image-link-p 1 "pic.png"))
+    (should-not (mdview--image-link-p 2 "https://x.example/"))
+    (should (mdview--image-link-p 3 "pic.png"))
+    (should-not (mdview--image-link-p 4 "other.md"))
+    (should-not (mdview--image-link-p 1 "#anchor"))
+    (should-not (mdview--image-link-p 1 "notes.md"))
+    (should (mdview--image-link-p 1 "https://example.com/pic.png"))))
+
+(ert-deftest mdview-test-toggle-reuses-navigated-view ()
+  ;; After following a link to another file and quitting, toggling from
+  ;; the original source comes back to the same view (and its history)
+  ;; instead of creating a second one.
+  (let* ((dir (make-temp-file "mdview-test" t))
+         (linked (mdview-test--write-file dir "linked.md" "Linked document\n")))
+    (unwind-protect
+        (mdview-test-with-source (source "Original\n")
+          (let ((view (with-current-buffer source (mdview))))
+            (with-current-buffer view
+              (let ((inhibit-read-only t))
+                (goto-char (point-max))
+                (insert (mdview-test--link "next" linked)))
+              (goto-char (1- (point-max)))
+              (mdview-follow-link)
+              (should (equal (buffer-name) "*mdview: linked.md*"))
+              (should (null mdview--source-buffer))
+              ;; q from the navigated view returns to where we came from.
+              (mdview-quit))
+            (should (eq (window-buffer (selected-window)) source))
+            (let ((again (with-current-buffer source (mdview))))
+              (should (eq again view))
+              (should (= (length (seq-filter #'mdview--view-p (buffer-list))) 1))
+              (with-current-buffer again
+                (should (equal (buffer-name) "*mdview: test.md*"))
+                (should (eq mdview--source-buffer source))
+                ;; The earlier history is still reachable.
+                (should (equal (mapcar #'car mdview--history)
+                               (list source linked source)))))))
+      (delete-directory dir t))))
+
+(ert-deftest mdview-test-find-view-prefers-current-source ()
+  (mdview-test-with-fake-view (view "a\n")
+    (let ((other (generate-new-buffer "*mdview: other*")))
+      (unwind-protect
+          (progn
+            (with-current-buffer other
+              (mdview-mode)
+              (setq mdview--source-file "/tmp/x/current.md"
+                    mdview--history (list (cons "/tmp/x/old.md" 1)
+                                          (cons "/tmp/x/current.md" 1))))
+            (setq mdview--source-file "/tmp/x/old.md"
+                  mdview--history (list (cons "/tmp/x/old.md" 1)))
+            (should (eq (mdview--find-view nil "/tmp/x/old.md") view))
+            (should (eq (mdview--find-view nil "/tmp/x/current.md") other))
+            (should-not (mdview--find-view nil "/tmp/x/none.md")))
+        (kill-buffer other)))))
+
+(ert-deftest mdview-test-toggle-selects-visible-view ()
+  ;; Source in one window, its view in another: toggling from the source
+  ;; selects the view's window instead of covering the source with a copy.
+  (mdview-test-with-source (source "Text\n")
+    (let ((view (with-current-buffer source (mdview))))
+      (delete-other-windows)
+      (let ((view-window (selected-window))
+            (source-window (split-window)))
+        (unwind-protect
+            (progn
+              (set-window-buffer source-window source)
+              (select-window source-window)
+              (should (eq (with-current-buffer source (mdview)) view))
+              (should (eq (selected-window) view-window))
+              (should (eq (window-buffer source-window) source))
+              (should (eq (window-buffer view-window) view)))
+          (delete-other-windows))))))
 
 (provide 'mdview-test)
 ;;; mdview-test.el ends here

@@ -23,7 +23,11 @@ one-key toggle from `markdown-mode`/`gfm-mode`/`md-mode`.
 
 Non-goals: editing in the rendered view, file browsing, bookmarks/history
 panes, remote document fetching, math rendering, Mermaid/PlantUML diagrams,
-HTML rendering beyond simple tag stripping and `<img>` extraction.
+HTML rendering beyond the tag-stripping rules of §6 ("HTML blocks") and
+`<img>` extraction.  TeX math (`$x$`, `$$x$$`) and emoji shortcodes
+(`:tada:`) are left as the literal text, exactly as Frogmouth shows them
+(Textual's Markdown widget runs markdown-it without the math and emoji
+plugins).
 
 ## 2. Package layout
 
@@ -38,7 +42,7 @@ with `byte-compile-error-on-warn` on Emacs 29 and 30.
 | `mdview-ast.el` | AST node constructors/accessors, slugs, shared helpers | — |
 | `mdview-inline.el` | Inline parser: string + refmap → inline nodes | ast |
 | `mdview-parse.el` | Block parser: buffer/string → `document` AST (calls inline) | ast, inline |
-| `mdview-faces.el` | Faces, palette, adaptive colour derivation | — |
+| `mdview-faces.el` | Faces, palette, glyph profiles, adaptive colour derivation | ast (the `mdview` group) |
 | `mdview-code.el` | Fenced/indented code: major-mode fontification, Material face mapping, indent guides | faces |
 | `mdview-image.el` | Image loading (local/remote, async), scaling, placeholders, cache | faces |
 | `mdview-table.el` | Table layout: column widths, cell wrapping, alignment → lines | faces, render helpers |
@@ -78,7 +82,7 @@ Block node types and their properties:
 | `paragraph` | `:line` | inlines |
 | `blockquote` | `:line` | blocks |
 | `list` | `:ordered` bool, `:start` int (ordered only), `:tight` bool, `:marker` char (`?-` `?*` `?+` `?.` `?\)`), `:line` | `item` nodes |
-| `item` | `:task` nil / `checked` / `unchecked`, `:line` | blocks |
+| `item` | `:task` nil / `checked` / `unchecked` (a `[ ]`/`[x]` marker counts even when nothing follows it on the line, as on GitHub), `:line` | blocks |
 | `code-block` | `:lang` first word of info string or nil, `:info` full info string or nil, `:fenced` bool, `:line` | one string (no trailing newline) |
 | `html-block` | `:line` | one string (raw HTML) |
 | `thematic-break` | `:line` | — |
@@ -133,7 +137,10 @@ colons, escaped pipes, inline content in cells, missing/extra cells.
 
 Inline: backslash escapes; HTML entities and numeric character references
 (use `mdview-ast.el`'s table of the common named entities plus a numeric
-decoder — the full HTML5 list is not required); code spans (backtick run
+decoder — the full HTML5 list is not required; references to control
+characters — C0 other than tab and newline, DEL, C1 — and to Unicode
+noncharacters decode to U+FFFD as in markdown-it, so an entity can never
+put a control character into the buffer); code spans (backtick run
 matching, space stripping); emphasis and strong with the CommonMark
 delimiter-run algorithm (left/right flanking, `*` vs `_` intraword rules,
 multiple-of-3 rule); links and images (inline, reference full/collapsed/
@@ -164,7 +171,12 @@ pass or come very close.  Raw HTML sections may be weaker.
 Robustness: the parser must never signal on any input (fuzz with random
 slices of the fixtures), must be linear-ish in practice (a 1 MB file
 parses in well under 2 s on a laptop), and must not use regexps prone to
-catastrophic backtracking on long lines.
+catastrophic backtracking on long lines.  Nesting is capped so that every
+pass and the renderer stay within `max-lisp-eval-depth`:
+`mdview-parse-max-depth` (default 200) limits container blocks and
+`mdview-inline-max-depth` (default 100) limits inline nodes — a paragraph
+nested deeper than that degrades to its raw text, like markdown-it's
+`maxNesting` (Frogmouth's own limit).
 
 ## 5. Layout model
 
@@ -218,7 +230,7 @@ blank lines at the top of the document; exactly one newline ends it.
 | heading 4, 5, 6 | 1 | 1 | |
 | paragraph | 0 | 1 | bottom 0 inside a tight list item |
 | blockquote | 1 | 1 | nested quote: top 1, left margin 2 |
-| list (top level) | 0 | 1 | nested list: 0/0 |
+| list (top level) | 0 | 1 | nested list: top 0; bottom 0 in a tight item, 1 in a loose item (improvement over Textual's `MarkdownList MarkdownList { margin: 0 }`, which glues the following block to the nested list) |
 | code block | 1 | 1 | |
 | table | 1 | 1 | |
 | thematic break | 0 | 1 | always preceded by one blank padding line (part of the block) |
@@ -233,12 +245,16 @@ Between items of a loose list: 1 blank line; tight list: none
 `(mdview-wrap STRING WIDTH)` → list of propertized lines.  Greedy
 word-wrap on spaces; a token longer than `width` is broken at `width`
 (Frogmouth breaks mid-word, see "Pneumonoultra…" in the reference).
-`hard-break` forces a new line; `soft-break` is a single space.  Leading
-and trailing spaces of each output line are trimmed.  Inline images that
-are displayed as real images count as a token of width
-`ceil(pixel-width / frame-char-width)`; in text mode their placeholder text
-counts as ordinary text.  Text properties survive wrapping (slice with
-`substring`, never rebuild strings from `char`s).
+`hard-break` forces a new line; `soft-break` is a single space; a tab
+counts as one space.  Leading and trailing spaces of each output line are
+trimmed.  Inline images that are displayed as real images count as a
+token of width `ceil(pixel-width / frame-char-width)` (text property
+`mdview-columns`); their placeholders carry the text property
+`mdview-nobreak` and are kept whole: a span marked that way moves to the
+next line as a unit and is only broken at its inner spaces when it is
+wider than `width` by itself.  Trimming never removes an `mdview-columns`
+image atom.  Text properties survive wrapping (slice with `substring`,
+never rebuild strings from `char`s).
 
 ## 6. Block styles (what it must look like)
 
@@ -315,9 +331,34 @@ padding: 0 1`:
   towards white (dark theme) or black (light theme); level n applies the
   blend n times.  Derived at render time from the actual `default` face
   and face-remapped buffer-locally, so it harmonizes with any theme.
-- Nested quote: top margin 1, left margin 2 inside the parent's content.
+- Nested quote: top margin 1, left margin 2 inside the parent's content
+  (improvement: Frogmouth draws `▌ ▌ Inner` because Textual's
+  `MarkdownBlockQuote > BlockQuote` rule never matches; the 2-column
+  margin shows the parent's background between the bars so nesting
+  levels read clearly).
 - Lists, code blocks and tables inside quotes render with the reduced
   width; code blocks keep their own background.
+- Nesting floor: a quote or list item nested so deep that fewer than
+  `mdview-min-content-width` (default 10) columns would remain is
+  rendered flat inside the enclosing container (its bar / marker is
+  dropped and the text uses the enclosing width); a top-level container
+  always nests.  This keeps every line exactly W wide on adversarial
+  input instead of wrapping one character per line.
+
+### Alerts (improvement)
+
+A block quote whose first line is `[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`,
+`[!WARNING]` or `[!CAUTION]` alone on its line (case-insensitive) is a
+GitHub alert: the marker is dropped, the bar is painted in
+`mdview-alert-note` / `-tip` / `-important` / `-warning` / `-caution`
+(GitHub's colours #0969DA / #1A7F37 / #8250DF / #9A6700 / #CF222E in the
+light theme, #4493F8 / #3FB950 / #AB7DF8 / #D29922 / #F85149 in the dark
+one), and the body is preceded by a bold title row `GLYPH Title` in the
+same face (glyph keys `alert-note` `◉`, `alert-tip` `✦`,
+`alert-important` `❢`, `alert-warning` `⚠`, `alert-caution` `⊘`; ASCII
+`(i)` `(*)` `(!!)` `(!)` `(x)`).  The body follows with the usual quote
+layout and `mdview-quote` background.  Frogmouth shows the marker as
+plain quoted text.
 
 ### Lists
 
@@ -346,6 +387,9 @@ padding: 0 1`:
 - Task items: the bullet is replaced by `☐` (unchecked, face
   `mdview-task-unchecked`, muted) or `☑` (checked, face
   `mdview-task-checked`, `success`) — improvement; Frogmouth prints `[ ]`.
+- All markers of one list are padded to the widest marker so that its
+  items share one content column (this only matters when markers differ
+  in width, e.g. the ASCII profile's `[ ]`/`[x]` next to `*`).
 - Tight lists: no blank lines between items; paragraphs inside items have
   no bottom margin.  Loose lists: one blank line between items and between
   blocks inside an item.  Code blocks and quotes inside items keep their
@@ -385,9 +429,8 @@ padding=(1, 2))` in a full-width block:
   region carry the guides of the next non-blank line, as Rich does.
 - Syntax highlighting via the major mode for the language (see §8);
   unknown language or highlighting failure → plain #EEFFFF text.
-- Indented code blocks render identically, without a language.
-- Optional: `mdview-code-show-language` (default nil) draws the language
-  name right-aligned in the top padding row in muted colour.
+- Indented code blocks render identically, without a language.  (No
+  language name is drawn; Frogmouth/Rich do not show one either.)
 
 ### Tables
 
@@ -431,12 +474,28 @@ Rich `Table(expand=True, box=SIMPLE_HEAVY, padding=0, collapse_padding=True)`:
 ### HTML blocks
 
 `mdview-html-renderer`: `strip` (default) renders the text content with
-tags removed as a paragraph, except that `<img src=… alt=…>` elements
-become image nodes (and when the enclosing element has `align="center"`
-the image is centered), `<br>` is a hard break, `<hr>` a thematic break,
-and comments / `<script>` / `<style>` contents are dropped.  `shr` uses
-`shr-insert-document` on `libxml-parse-html-region` when available.  Inline
-HTML (`html-inline`) in paragraphs is handled by the same stripping rules.
+tags removed as paragraphs, with these rules:
+
+- `<img src=… alt=…>` elements become image nodes; `<img>` elements at
+  most 2 px wide or high, or whose file name contains `spacer`, vanish.
+- Block-level tags (`p`, `div`, `li`, `ul`, `ol`, `tr`, `table`, `h1`–`h6`,
+  `blockquote`, `pre`, `details`, `summary`, …) end the current
+  paragraph; `td`/`th` only add a space.  `<h1>`…`<h6>` become headings
+  (with a slug id, so anchors work).
+- Inside an element with `align="center"` (`<div>`, `<p>`, `<h1>`…) every
+  paragraph is centered line by line, not only images; an `<img>` followed
+  by `<br>` is still a block image, centered when inside such an element.
+- `<br>` is a hard break (a block-final `<br>` adds nothing), `<hr>` a
+  thematic break; comments, `<script>` and `<style>` contents are dropped.
+- `<details>` content stays expanded; `<summary>` renders as the `summary`
+  glyph (`▸`, ASCII `>`) plus its text in `mdview-summary` (bold).
+- `<kbd>` text gets `mdview-inline-code`, in HTML blocks and inline.
+- A paragraph that strips to nothing (e.g. `<a name="x"></a>`) is skipped
+  together with its margins.
+
+`shr` uses `shr-insert-document` on `libxml-parse-html-region` when
+available.  Inline HTML (`html-inline`) in paragraphs is handled by the
+same stripping rules.
 
 ### Images (see §7 for loading)
 
@@ -450,7 +509,16 @@ token.  Whenever an image is not displayed (text mode, `mdview-display-
 images` nil, remote disabled, load failure, inside tables) the placeholder
 is `🖼 ALT` (or `🖼 basename-of-url` when alt is empty) in `mdview-link`
 styling; `mdview-image-placeholder-format` controls it.  Placeholders and
-images carry `mdview-link` (the image URL) so `RET` opens them.
+images carry `mdview-link` (the image URL) so `RET` opens them.  Labels
+(placeholders and the text under displayed images) collapse all
+whitespace in the alt text, hard breaks included, to single spaces so a
+label never spans lines.  A block-image placeholder wider than W is
+wrapped like a paragraph (link properties on every line, centered when
+the image is centered); a placeholder awaiting a remote image stays on
+one line, truncated with `…`, so the image can replace it.  Inline
+placeholders are unbreakable tokens (`mdview-nobreak`, §5.3).  The
+`image` glyph is replaced by `mdview-image-glyph-fallback` (`▣`) on
+displays that cannot draw it one column wide (§12).
 
 ### Footnotes (improvement)
 
@@ -494,13 +562,20 @@ can use `text-property-search-forward` and the text stays copyable.
    `lean`/`lean4` → `lean4-mode` if available, `coq` → `coq-mode` if
    available, `ocaml`, `rust`, `go`, `haskell`, `latex`/`tex`, `makefile`,
    `diff`, `dockerfile`, `sql`, …), then `LANG-ts-mode` if that mode's
-   grammar is available (`treesit-ready-p`), then `LANG-mode` if `fboundp`.
-   Never autoload-trigger a download or prompt.
-2. In a temporary buffer: insert code, set the mode with
-   `delay-mode-hooks` and all hooks suppressed, `font-lock-ensure`, wrap in
-   `condition-case` + `with-demoted-errors`; on any error return plain
-   text.  Skip highlighting entirely above
-   `mdview-code-highlight-max-chars` (default 100 000).
+   grammar is available (`treesit-ready-p`), then `LANG-mode` if it is a
+   major mode derived from `prog-mode`, `text-mode` or `conf-mode` (so a
+   fence labelled `tar` or `help` is not fontified by `tar-mode`;
+   table entries may name any mode).  Never autoload-trigger a download
+   or prompt.
+2. In a hidden scratch buffer kept per major mode across blocks (the
+   mode is set up once with `delay-mode-hooks` and all hooks suppressed,
+   `font-lock-ensure` runs per block; the buffer is discarded when the
+   mode signals or alters the text): insert code, fontify, copy out.
+   Results are memoized in a bounded cache keyed by mode, code and the
+   theme options (`mdview-code-clear-cache` empties it).  Any failure
+   yields plain text silently (`mdview-code-debug` reports it).  Skip
+   highlighting entirely above `mdview-code-highlight-max-chars`
+   (default 100 000).
 3. When `mdview-code-material-theme` is t (default), replace faces: walk
    the `face` property and map each standard `font-lock-*-face` to the
    corresponding `mdview-code-*` face with Material colours; unknown
@@ -553,52 +628,110 @@ Faces may appear as lists or anonymous plists; handle `(face1 face2)`,
   for SVG pass `:width` when the intrinsic size is unavailable.
 - Remote (`http(s)`) images: when `mdview-display-remote-images` (default
   t), insert the placeholder immediately and fetch asynchronously with
-  `url-retrieve` (`url-queue-retrieve`), replacing the placeholder — found
-  via a marker/overlay stored on it — when data arrives, if the buffer is
-  still live and the placeholder still present.  Cache decoded data per
-  URL in a session hash table (`mdview-image-cache`), limit concurrent
-  fetches, time out after `mdview-image-timeout` (default 10 s), and treat
-  any error as "keep the placeholder".  Never block the UI.
+  `url-retrieve` through the module's own queue (at most
+  `mdview-image-max-parallel`, default 6, fetches at a time;
+  `mdview-image-timeout`, default 10 s, is counted from the start of each
+  fetch and enforced by the module's watchdog, independent of
+  `url-queue-timeout`), replacing the placeholder — found via a
+  marker/overlay stored on it — when data arrives, if the buffer is still
+  live and the placeholder still present.  The replacement keeps the
+  line's width (the column difference is taken from or added to the
+  line's trailing padding), and the abnormal hook
+  `mdview-image-update-functions` is then run with the view buffer so
+  the viewer can re-render and re-wrap paragraphs around inline images.
+  Cache the raw data per URL in a session hash table
+  (`mdview-image-cache`).  A fetch that fails, times out or returns
+  undisplayable data leaves the placeholder, removes its
+  `mdview-image-pending` property and appends " (unavailable)" to its
+  `help-echo`.  Never block the UI.
 - `mdview-toggle-images` re-renders with display inverted.
 - Image text carries `help-echo` (alt / url), `mdview-link` URL, and
   `keymap` so `RET` opens the image (`mdview-open-image`: local → `find-
-  file`, remote → `browse-url`).
+  file`, remote → `browse-url`).  It must also carry the image's own URL
+  as `mdview-image-url` (listed in `mdview-image--own-properties`): the
+  renderer overwrites `mdview-link` with the link's URL for an image
+  wrapped in a link, and `mdview-follow-link` compares the two to decide
+  between opening the image and following the link (§10).  Pending
+  placeholders already record it on their overlay.
 
 ## 10. Commands, modes, integration (`mdview.el`)
 
 - `mdview-mode`: derived from `special-mode`; `truncate-lines t`,
-  `buffer-read-only t`, `cursor-type` as default (users navigate), imenu
-  index from heading properties, `left-margin-width`/`right-margin-width`
-  = `mdview-margin` (default 4) with `mdview-center-content` (default nil)
+  `buffer-read-only t`, undo disabled (`buffer-disable-undo`: every render
+  rewrites the whole buffer and the records would only retain the previous
+  rendering), `cursor-type` as default (users navigate), imenu index from
+  heading properties, `left-margin-width`/`right-margin-width` =
+  `mdview-margin` (default 4) with `mdview-center-content` (default nil)
   enlarging the left margin to center the content when the window is wider
   than `mdview-max-width` + margins.
 - Buffer-local state: source buffer, source file, base dir, last render
-  width, history (list of `(file-or-buffer . point)`), images-enabled flag.
+  width, history (list of `(file-or-buffer . point)`), images-enabled
+  flag, the origin (window and buffer the view replaced, for `q`), and the
+  parsed document with the key of the source text it came from.
 - Commands: `mdview` (render current buffer → `*mdview: NAME*`, display with
-  `mdview-display-action`, default same window), `mdview-file`,
-  `mdview-toggle`, `mdview-refresh` (`g`), `mdview-quit` (`q`: `quit-window`,
-  or switch back to the source buffer if the view was opened from it in
-  the same window), `mdview-next-link`/`mdview-previous-link` (`TAB`/`S-
+  `mdview-display-action`, default same window; when the view is already
+  visible in a window of the frame, that window is selected instead so a
+  side-by-side source/view layout survives toggling), `mdview-file`
+  (rejects directories with a `user-error`; a failed first render kills the
+  new view and restores the windows instead of leaving an empty view),
+  `mdview-toggle`, `mdview-refresh` (`g`), `mdview-quit` (`q`: switch the
+  window back to the buffer the view replaced when it was opened — the
+  original source even after links to other documents were followed —
+  else `quit-window`), `mdview-next-link`/`mdview-previous-link` (`TAB`/`S-
   TAB`), `mdview-follow-link` (`RET`, also `mouse-1`/`mouse-2`),
   `mdview-next-heading`/`mdview-previous-heading` (`n`/`p`),
-  `mdview-toc` (`t`, `imenu`), `mdview-history-back`/`-forward` (`l`/`r`),
-  `mdview-toggle-images` (`i`), `mdview-visit-source` (`e`),
-  `mdview-copy-link` (`w`), `SPC`/`DEL`/`S-SPC` scroll.  `C-c C-v` in the
-  view runs `mdview-toggle` too.
+  `mdview-toc` (`t`: completion over the heading names with the heading
+  at point as default; `imenu`'s popup menu only when
+  `imenu-use-popup-menu` is `always`), `mdview-history-back`/`-forward`
+  (`l`/`r`), `mdview-toggle-images` (`i`), `mdview-visit-source` (`e`),
+  `mdview-copy-link` (`w`: local links are copied as the absolute file name
+  they resolve to, anchor kept; `C-u w` copies the URL as written),
+  `SPC`/`DEL`/`S-SPC` scroll.  `C-c C-v` in the view runs `mdview-toggle`
+  too.  View-only commands signal "Not in an mdview buffer" elsewhere.
+- One view per source: `mdview` reuses the view whose current source is
+  the buffer/file, or failing that a view that showed it earlier in its
+  history (and followed a link away), so toggling again after `q` from a
+  navigated view returns to the same view and its history.
 - Link following: `#anchor` → heading with that `mdview-heading-id`
   (also try the slug of the raw anchor); `path.md[#anchor]` relative to
   base dir → render that file in the *same* view buffer (push history);
   other local files → `find-file-other-window`; `http(s)`/`mailto` →
-  `browse-url`; images → `mdview-open-image`.
+  `browse-url`; images → `mdview-image-open`.  An image wrapped in a link
+  carries the link's URL in `mdview-link`; `RET` on it follows that URL
+  like a text link (the image's own URL is recognised through
+  `mdview-image-url` — text property or pending-placeholder overlay — or
+  the `:file` of the displayed image).
 - Source sync: `mdview-toggle` from the source places point in the view at
   the first rendered block whose `mdview-source-line` ≥ the source line;
   `mdview-visit-source` and `mdview-toggle` from the view do the reverse
   using the nearest preceding `mdview-source-line`.
+- Re-rendering (`g`, refit, save, `i`): the parsed document is cached
+  per view with a key of the source text (`buffer-chars-modified-tick` of
+  a live source buffer, else modification time and size of the file) and
+  reused while the key matches, so only a changed source is parsed again.
+  `gc-cons-threshold` is raised to 64 MB (`gc-cons-percentage` to 0.5)
+  for the duration: the renderer allocates ~70 MB per MB of input and the
+  default threshold makes garbage collection dominate the render time of
+  large documents.  Point stays on the block of the same source line, and
+  every window showing the view keeps the block that was at its top
+  (`set-window-start` to the block's new position plus the recorded line
+  offset) instead of being recentred around point.  Remote images that
+  arrive after the rendering trigger one more render from
+  `mdview-image-update-functions` (debounced by `mdview-refit-delay`,
+  run under `while-no-input` like a refit, skipped when images are off in
+  the view) so that paragraphs re-flow around inline images at their
+  real width; the image bytes come from the cache, so this is immediate.
 - Refit: `mdview-auto-refit` (default t) re-renders via a 0.2 s idle timer
   from `window-size-change-functions` when the effective width changed,
-  preserving the current source line.  `mdview-refresh-on-save` (default t)
-  re-renders when the source buffer is saved (hook installed in the source
-  buffer; removed when the view is killed).
+  preserving the current source line.  The refit render runs inside
+  `while-no-input`; when the user types it is abandoned and rescheduled
+  for the next idle period, and a render error is reported once with
+  `message` (the width is recorded so the same failure is not retried on
+  every resize).  `mdview-refresh-on-save` (default t) re-renders the
+  views of a saved buffer from the *global* `after-save-hook` (installed by
+  `mdview-mode`, filtered by `mdview--views-of`); a buffer-local hook
+  would be lost when the source changes major mode
+  (`kill-all-local-variables`).
 - Width: `W = min(window-body-width − 2·margin − 1, mdview-max-width or ∞)`,
   at least 20.
 - Integration: `mdview-install-keybinding KEY` binds KEY to `mdview-toggle`
@@ -630,14 +763,22 @@ Textual default design, resolved:
 | code text | #EEFFFF | #EEFFFF | code blocks |
 | inline code | #939393 | #6E6E6E | bold |
 
+Further faces: `mdview-alert-note`, `-tip`, `-important`, `-warning`,
+`-caution` (bar, icon and title of GitHub alerts, §6) and
+`mdview-summary` (`<details>` summary lines, bold).
+
 Define every face with `defface` using `((((background dark)) …)
 (((background light)) …))` specs; `mdview-faces-remap` installs the
 derived faces (`mdview-quote` levels, `mdview-box-frame`) buffer-locally
 with `face-remap-add-relative`, computing from `(face-background 'default
 nil t)` with `color-name-to-rgb` blending; fall back to the static spec
-when colours are unavailable (`--batch`, `-nw` without truecolor).  In a
-256-colour terminal Emacs approximates colours automatically; nothing
-special is required, but faces must not rely on `:extend`.
+when colours are unavailable (`--batch`, `-nw` without truecolor).  The
+derived faces are refreshed in every remapped buffer from
+`enable-theme-functions` / `disable-theme-functions`
+(`mdview-faces-theme-changed`), so a `load-theme` after rendering does
+not leave stale quote and frame colours.  In a 256-colour terminal Emacs
+approximates colours automatically; nothing special is required, but
+faces must not rely on `:extend`.
 
 ## 12. Text-mode (emacs -nw) requirements
 
@@ -645,8 +786,15 @@ Everything must render without a graphical display: no image display,
 placeholders instead; all glyphs are single-width in `char-width` terms
 (the five bullets, `▌ ▎ ▊ ▁ ▔ ━ ─ │ ☐ ☑`), and `mdview-ascii-glyphs` is
 used automatically when `(char-displayable-p ?●)` is nil (`*`, `-`, `+`,
-`|`, `-`, `=`, `[ ]`, `[x]`).  Verify with `make shot` (tmux-based
-capture) in both `modus-vivendi` and `modus-operandi`.
+`|`, `-`, `=`, `[ ]`, `[x]`).  The image marker `🖼` lies outside the
+Basic Multilingual Plane and most terminals draw it two cells wide while
+`string-width` counts one, so on a text terminal `mdview-glyph` returns
+`mdview-image-glyph-fallback` (`▣`) for the `image` key; on a graphical
+frame the same happens when the font does not draw the glyph exactly
+`frame-char-width` pixels wide (`mdview-faces-glyph-fits-p`,
+`string-pixel-width` based).  Batch output keeps `🖼`.  Verify with
+`make shot` (tmux-based capture) in both `modus-vivendi` and
+`modus-operandi`.
 
 ## 13. Testing and tooling
 
@@ -661,23 +809,42 @@ capture) in both `modus-vivendi` and `modus-operandi`.
 - Golden tests: `test/mdview-golden-test.el` renders every
   `test/fixtures/*.md` at width 80 in batch (images → placeholders) and
   compares the plain text to `test/golden/<name>.txt`; `make golden`
-  regenerates.  Golden files are reviewed by eye against
-  `test/reference/showcase.frogmouth.txt` (the Frogmouth grid at width 100
-  content / 110 terminal).
+  regenerates.  `showcase.md` exercises the Frogmouth look, `minimal.md`
+  the smallest document, `extras.md` the improvements beyond Frogmouth
+  (GitHub alerts, centered HTML, `<details>`/`<summary>`, `<kbd>`, HTML
+  headings, wrapped block-image placeholders, unbreakable inline
+  placeholders).  Golden files are reviewed by eye against
+  `test/reference/showcase.frogmouth.txt` (the Frogmouth grid at width 98
+  content / 110 terminal: the 4-column margins and the app frame take 10
+  columns, and the `Viewer`'s `scrollbar-gutter: stable` reserves 2 more,
+  so compare with `make render WIDTH=98`).
 - CommonMark conformance: §4.
 - Visual checks: `make render FILE=… WIDTH=…` (plain text),
   `make render-faces` (text with `{face}` markers), `make render-ansi`
   (24-bit ANSI), `make shot FILE=…` (real text-mode Emacs in tmux →
   `/tmp/mdview-shots/*.png` via Rich + rsvg-convert).  For GUI image
   checks without screenshots, `scripts/gui-check.el` renders a fixture in
-  a graphical Emacs started in the background, waits up to 10 s for
-  remote images, and writes a report of every `display` image property
-  and its size plus the first 60 rendered lines.
+  a graphical Emacs started in the background, gives remote images up to
+  10 s to arrive, and writes a report of every `display` image property
+  and its size plus the first 60 rendered lines.  Start it with absolute
+  `-L`/`-l`/file arguments (the GUI build may be launched through a
+  wrapper that ignores the shell's working directory) and in the
+  background, then poll for the report.  The script is driven by timers
+  (`mdview-gui-check` returns at once; render, polling and report run
+  from the command loop): the asynchronous fetches, their watchdog
+  timers and the debounced re-render after images arrive all need the
+  command loop, and a blocking `accept-process-output`/`sit-for` loop
+  inside `--eval` never lets Emacs become idle (`url-queue`, which the
+  image module used earlier, would never even have started its
+  retrievals).  The same applies to any script that measures the
+  asynchronous image path.
 
 ## 14. Reference materials
 
 - `test/reference/showcase.frogmouth.txt` — Frogmouth's exact character
-  grid for `test/fixtures/showcase.md` at 110 columns (content width 100).
+  grid for `test/fixtures/showcase.md` at 110 columns (content width 98:
+  110 − 2·4 margins − 2 app frame − 2 scrollbar gutter; the H1 box is 98
+  `▁` wide and the thematic rule 98 `━`).
 - `test/reference/showcase-{dark,light}.svg` — Frogmouth screenshots;
   convert with `rsvg-convert` and crop with `scripts/crop-png.py` to view.
 - Textual 0.43 `textual/widgets/_markdown.py` (DEFAULT_CSS per block) and
@@ -704,13 +871,23 @@ capture) in both `modus-vivendi` and `modus-operandi`.
 
 ;; mdview-faces.el
 (mdview-faces-remap)                       ; install derived faces buffer-locally; safe in batch
+(mdview-faces-theme-changed &rest _)       ; re-run the remap in every remapped buffer (theme hooks)
 (mdview-glyph KEY)                         ; KEY ∈ bullet-1..5, quote-bar, box-top, box-bottom, box-left,
                                            ; box-right, rule, thin-rule, guide, task-checked, task-unchecked,
-                                           ; table-rule, h3-rule, image  → string (ASCII profile when needed)
+                                           ; table-rule, h3-rule, image, summary, alert-note, alert-tip,
+                                           ; alert-important, alert-warning, alert-caution
+                                           ; → string (ASCII profile / image fallback when needed)
+(mdview-faces-resolve-glyphs)              ; → the glyph profile; the renderer binds it to
+                                           ; `mdview-faces--profile' for a whole document
+(mdview-faces-glyph-fits-p GLYPH)          ; does the display draw GLYPH string-width columns wide?
+;; options: mdview-glyphs, mdview-ascii-glyphs, mdview-use-ascii-glyphs, mdview-box-frame-style,
+;;          mdview-image-glyph-fallback
 
 ;; mdview-code.el
 (mdview-code-fontify CODE LANG)            ; → propertized string, no trailing newline, no background yet
 (mdview-code-indent-guides LINE)           ; → LINE with guide glyphs substituted in leading whitespace
+(mdview-code-clear-cache)                  ; forget memoized fontifications (command)
+;; option mdview-code-debug: report fontification failures instead of silently falling back
 
 ;; mdview-image.el
 (mdview-image-displayable-p URL &optional BASE-DIR)   ; nil in batch / text mode
@@ -718,7 +895,11 @@ capture) in both `modus-vivendi` and `modus-operandi`.
                                            ; inserts image or placeholder at point, returns (COLUMNS . KIND)
                                            ; KIND ∈ image, placeholder, pending
 (mdview-image-placeholder URL ALT)         ; → propertized placeholder string
+(mdview-image-cancel-pending &optional BUFFER KILL)   ; stop waiting for BUFFER's placeholders
 (mdview-image-clear-cache)
+mdview-image-update-functions              ; abnormal hook, called with the view buffer after a
+                                           ; placeholder was replaced (from the retrieval callback)
+;; options: mdview-image-timeout, mdview-image-max-parallel, mdview-image-max-height/-width, …
 
 ;; mdview-table.el
 (mdview-table-layout TABLE-NODE INNER-WIDTH RENDER-CELL-FN WRAP-FN &key expand)
@@ -731,10 +912,15 @@ capture) in both `modus-vivendi` and `modus-operandi`.
 (mdview-render-document DOC &key width base-dir)   ; insert at point in current buffer
 (mdview-render-inlines INLINES &optional CTX)      ; → propertized string (images → placeholder/inline)
 (mdview-wrap STRING WIDTH)                         ; → list of propertized lines
+;; options: mdview-html-renderer, mdview-min-content-width (nesting floor, §6)
+
+;; mdview-parse.el / mdview-inline.el options: mdview-parse-max-depth, mdview-inline-max-depth,
+;; mdview-parse-front-matter, mdview-inline-extended-autolinks
 ```
 
 Text properties the renderer must set: `mdview-source-line` (first line of
 each block), `mdview-heading-level` + `mdview-heading-id` (heading text),
 `mdview-link` (URL on links, images, placeholders), `mdview-link-title`,
-`mdview-footnote-ref` / `mdview-footnote-def` (index), `help-echo` and
-`mouse-face` on links.
+`mdview-image-url` (the image's own URL on images and placeholders, so a
+linked image can be told from a plain one), `mdview-footnote-ref` /
+`mdview-footnote-def` (index), `help-echo` and `mouse-face` on links.

@@ -1,12 +1,14 @@
 # Development tasks for mdview.  Requires GNU Emacs 29+ on PATH (or set EMACS).
 EMACS ?= emacs
-BATCH := $(EMACS) -Q --batch -L . -L test
+# `load-prefer-newer' so that an edited .el is never shadowed by a stale .elc
+# left over from `make compile'.
+BATCH := $(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L . -L test
 SRC   := $(wildcard mdview*.el)
 TESTS := $(wildcard test/*-test.el)
 FILE  ?= test/fixtures/showcase.md
 WIDTH ?= 100
 
-.PHONY: all check compile test lint golden render render-faces render-ansi shot commonmark clean
+.PHONY: all check compile test lint golden render render-faces render-ansi shot commonmark clean clean-elc
 
 all: check
 
@@ -18,8 +20,9 @@ compile: clean-elc
 test:
 	$(BATCH) $(foreach t,$(TESTS),-l $(t)) -f ert-run-tests-batch-and-exit
 
+# checkdoc over the sources; exits non-zero when anything is reported.
 lint:
-	$(BATCH) -l checkdoc --eval '(progn (setq checkdoc-arguments-in-order-flag nil) (dolist (f (list $(foreach f,$(SRC),"$(f)"))) (checkdoc-file f)))'
+	$(BATCH) -l scripts/lint.el -f mdview-dev-lint $(SRC)
 
 # Regenerate test/golden/*.txt from the fixtures (review the diff before committing).
 golden:

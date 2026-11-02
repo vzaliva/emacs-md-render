@@ -64,19 +64,35 @@ docs/DESIGN.md        architecture, AST contract, style specification
 ```sh
 make check                                  # compile + all tests (must pass before you finish)
 make test                                   # just ERT
+make lint                                   # checkdoc; exits non-zero on any finding
 make render FILE=test/fixtures/showcase.md WIDTH=100 | less   # look at your output
 make render-faces FILE=... WIDTH=...        # with {face} annotations
 make shot FILE=test/fixtures/showcase.md    # real text-mode Emacs capture -> /tmp/mdview-shots/*.png
 make commonmark                             # spec conformance report
-diff <(make -s render WIDTH=100) test/reference/showcase.frogmouth.txt   # compare layout with Frogmouth
+diff <(make -s render WIDTH=98) test/reference/showcase.frogmouth.txt   # compare layout with Frogmouth
+```
+
+For the graphical image path (no screenshots needed) run
+`scripts/gui-check.el` in a background GUI Emacs with ABSOLUTE paths —
+the GUI build may be started through a wrapper that ignores the shell's
+working directory — and poll for its report:
+
+```sh
+emacs -Q -L "$PWD" -l "$PWD/scripts/gui-check.el" \
+  --eval "(mdview-gui-check \"$PWD/test/fixtures/showcase.md\" \"/tmp/mdview-gui-report.txt\")" &
 ```
 
 Compare your rendering with `test/reference/showcase.frogmouth.txt`
-(Frogmouth at 110 columns = 100 content columns plus 4-column margins and
-the app frame).  Blank-line counts, box rows, bullet glyphs and
+(Frogmouth at 110 columns = 98 content columns: the 4-column margins and
+the app frame take 10 columns and the viewer's `scrollbar-gutter: stable`
+reserves 2 more, so use `WIDTH=98` — at 100 the tables and wrapping show
+spurious differences).  Blank-line counts, box rows, bullet glyphs and
 indentation should match line for line except where the spec marks an
 improvement.  To *see* colours, run `make shot` and view the PNG, or
 `make render-ansi | less -R`.
+
+The `make` targets load the sources with `load-prefer-newer`, so a stale
+`.elc` left by `make compile` never shadows an edited `.el`.
 
 Emacs on the development machine is GNU Emacs 30.2 (NS build, native
 compilation, SVG/PNG/JPEG/WEBP/GIF image support, tree-sitter).  Test on

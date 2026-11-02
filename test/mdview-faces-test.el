@@ -13,6 +13,7 @@
 
 (require 'ert)
 (require 'cl-lib)
+(require 'subr-x)                       ; `string-pixel-width' must not autoload under `cl-letf'
 (require 'mdview-faces)
 
 (defconst mdview-faces-test-faces
@@ -22,13 +23,16 @@
     mdview-bullet mdview-task-checked mdview-task-unchecked mdview-rule
     mdview-box-frame mdview-muted mdview-footnote-ref mdview-table
     mdview-table-header mdview-table-rule mdview-code-block
-    mdview-code-indent-guide mdview-image-placeholder mdview-image-caption)
+    mdview-code-indent-guide mdview-image-placeholder mdview-image-caption
+    mdview-summary mdview-alert-note mdview-alert-tip mdview-alert-important
+    mdview-alert-warning mdview-alert-caution)
   "Every face that mdview-faces.el must define.")
 
 (defconst mdview-faces-test-glyph-keys
   '(bullet-1 bullet-2 bullet-3 bullet-4 bullet-5 quote-bar box-top box-bottom
     box-left box-right rule thin-rule guide task-checked task-unchecked
-    table-rule h3-rule image)
+    table-rule h3-rule image summary alert-note alert-tip alert-important
+    alert-warning alert-caution)
   "Every key the glyph tables must contain.")
 
 ;;;; Faces and options
@@ -92,7 +96,7 @@
 
 (ert-deftest mdview-glyph-unicode-defaults ()
   "In batch mode `auto' selects the Unicode profile."
-  (should noninteractive)
+  (skip-unless noninteractive)
   (should (equal (mdview-glyph 'bullet-1) "●"))
   (should (equal (mdview-glyph 'bullet-2) "▪"))
   (should (equal (mdview-glyph 'bullet-3) "‣"))
@@ -110,7 +114,9 @@
   (should (equal (mdview-glyph 'task-unchecked) "☐"))
   (should (equal (mdview-glyph 'table-rule) "━"))
   (should (equal (mdview-glyph 'h3-rule) "▔"))
-  (should (equal (mdview-glyph 'image) "🖼")))
+  (should (equal (mdview-glyph 'image) "🖼"))
+  (should (equal (mdview-glyph 'summary) "▸"))
+  (should (equal (mdview-glyph 'alert-warning) "⚠")))
 
 (ert-deftest mdview-glyph-ascii-profile ()
   (let ((mdview-use-ascii-glyphs t))
@@ -137,10 +143,73 @@
     (should (equal (mdview-glyph 'quote-bar) "▌"))))
 
 (ert-deftest mdview-glyph-single-column ()
-  "Frame, rule, bullet and bar glyphs are one column wide."
+  "Frame, rule, bullet, bar, summary and alert glyphs are one column wide."
   (dolist (key (cl-set-difference mdview-faces-test-glyph-keys
                                   '(task-checked task-unchecked image)))
-    (should (= (string-width (mdview-glyph key)) 1))))
+    (should (= (string-width (mdview-glyph key)) 1)))
+  ;; The image fallback must be a single-column BMP symbol.
+  (should (= (string-width mdview-image-glyph-fallback) 1))
+  (should (< (aref mdview-image-glyph-fallback 0) #x10000)))
+
+(ert-deftest mdview-glyph-fits-p-batch ()
+  "In batch mode every glyph is assumed to fit, so the emoji stays."
+  (skip-unless noninteractive)
+  (should (mdview-faces-glyph-fits-p "🖼"))
+  (should (mdview-faces-glyph-fits-p "▣"))
+  (should-not (mdview-faces--image-glyph-override))
+  (should (equal (mdview-faces-resolve-glyphs) '(nil . nil))))
+
+(ert-deftest mdview-glyph-image-fallback-on-text-terminal ()
+  "On a text terminal a non-BMP image glyph is replaced by the fallback."
+  (cl-letf (((symbol-value 'noninteractive) nil)
+            ((symbol-function 'display-graphic-p) (lambda (&rest _) nil))
+            ((symbol-function 'char-displayable-p) (lambda (&rest _) t)))
+    (should-not (mdview-faces-glyph-fits-p "🖼"))
+    (should (mdview-faces-glyph-fits-p "▣"))
+    (should (mdview-faces-glyph-fits-p "[img]"))
+    (should (equal (mdview-faces--image-glyph-override) mdview-image-glyph-fallback))
+    (should (equal (mdview-glyph 'image) mdview-image-glyph-fallback))
+    (should (equal (mdview-faces-resolve-glyphs)
+                   (cons nil mdview-image-glyph-fallback)))
+    ;; A user-chosen BMP glyph is kept.
+    (let ((mdview-glyphs (cons '(image . "◫") mdview-glyphs)))
+      (should (equal (mdview-glyph 'image) "◫")))
+    ;; The ASCII profile has its own marker and needs no fallback.
+    (let ((mdview-use-ascii-glyphs t))
+      (should (equal (mdview-glyph 'image) "[img]"))
+      (should (equal (mdview-faces-resolve-glyphs) '(t . nil))))))
+
+(ert-deftest mdview-glyph-image-fallback-on-graphic-display ()
+  "On a graphical frame the glyph must be drawn exactly one column wide."
+  (let ((pixels 10))
+    (cl-letf (((symbol-value 'noninteractive) nil)
+              ((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+              ((symbol-function 'char-displayable-p) (lambda (&rest _) t))
+              ((symbol-function 'frame-char-width) (lambda (&rest _) 7))
+              ((symbol-function 'string-pixel-width) (lambda (&rest _) pixels)))
+      (should-not (mdview-faces-glyph-fits-p "🖼"))
+      (should (equal (mdview-glyph 'image) mdview-image-glyph-fallback))
+      (setq pixels 7)
+      (should (mdview-faces-glyph-fits-p "🖼"))
+      (should (equal (mdview-glyph 'image) "🖼")))))
+
+(ert-deftest mdview-glyph-uses-bound-profile ()
+  "A resolved profile in `mdview-faces--profile' is used without probing."
+  (let ((probes 0))
+    (cl-letf (((symbol-function 'mdview-faces-ascii-p)
+               (lambda () (setq probes (1+ probes)) nil)))
+      (let ((mdview-faces--profile '(t . nil)))
+        (should (equal (mdview-glyph 'bullet-1) "*"))
+        (should (equal (mdview-glyph 'image) "[img]")))
+      (let ((mdview-faces--profile '(nil . "▣")))
+        (should (equal (mdview-glyph 'bullet-1) "●"))
+        (should (equal (mdview-glyph 'image) "▣")))
+      (let ((mdview-faces--profile '(nil . nil)))
+        (should (equal (mdview-glyph 'image) "🖼")))
+      (should (= probes 0))
+      (let ((mdview-faces--profile nil))
+        (mdview-glyph 'bullet-1)
+        (should (= probes 1))))))
 
 ;;;; Colour derivation
 
@@ -197,7 +266,7 @@
 
 (ert-deftest mdview-faces-remap-batch-noop ()
   "Without a known default background nothing is remapped and nothing errs."
-  (should noninteractive)
+  (skip-unless noninteractive)
   (should-not (mdview-faces-default-background))
   (with-temp-buffer
     (should-not (mdview-faces-remap))
@@ -238,6 +307,37 @@
       (should (member '(:background "#ebebeb")
                       (cdr (assq 'mdview-quote face-remapping-alist))))
       (mdview-faces-unremap))))
+
+(ert-deftest mdview-faces-remap-follows-theme-changes ()
+  "Enabling or disabling a theme recomputes the derived faces of every view."
+  (let ((background "#1E1E1E"))
+    (cl-letf (((symbol-function 'face-background)
+               (lambda (&rest _) background)))
+      (with-temp-buffer
+        (let ((view (current-buffer)))
+          (mdview-faces-remap)
+          (should mdview-faces--remapped)
+          (should (memq #'mdview-faces-theme-changed enable-theme-functions))
+          (should (memq #'mdview-faces-theme-changed disable-theme-functions))
+          (should (member '(:background "#272727")
+                          (cdr (assq 'mdview-quote face-remapping-alist))))
+          ;; The theme changes the default background: the hook refreshes.
+          (setq background "#F5F5F5")
+          (with-temp-buffer
+            (mdview-faces-theme-changed 'some-theme))
+          (should (member '(:background "#ebebeb")
+                          (cdr (assq 'mdview-quote
+                                     (buffer-local-value 'face-remapping-alist view)))))
+          (should (member '(:foreground "#f5f5f5")
+                          (cdr (assq 'mdview-box-frame
+                                     (buffer-local-value 'face-remapping-alist view)))))
+          (should (= (length mdview-faces--remap-cookies) 4))
+          ;; After unremapping the buffer is left alone.
+          (mdview-faces-unremap)
+          (should-not mdview-faces--remapped)
+          (setq background "#1E1E1E")
+          (mdview-faces-theme-changed 'some-theme)
+          (should-not face-remapping-alist))))))
 
 (ert-deftest mdview-faces-remap-is-buffer-local ()
   (with-temp-buffer

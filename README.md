@@ -23,10 +23,14 @@ the 652 CommonMark spec examples pass, see `make commonmark`), the full
 Frogmouth layout (boxed H1/H2, H3 rule, bullets, ordered and task lists,
 nested quotes with bars, code panels with Material highlighting and indent
 guides, panel tables with Rich-style column expansion, wrapping and
-alignment), footnotes, images (inline in graphical Emacs, local and
+alignment), footnotes, GitHub alerts (`> [!NOTE]` and friends), the HTML
+found in real READMEs (centered blocks, `<details>`/`<summary>`, `<kbd>`,
+HTML headings and images), images (inline in graphical Emacs, local and
 asynchronous remote, placeholders in text mode), and the `mdview-mode`
 commands: toggle with position sync, links and anchors, headings and
 imenu, history, image toggling, auto-refit on resize and refresh on save.
+The parser and renderer are fuzzed and bounded (nesting caps, linear
+time on adversarial input), so odd documents degrade instead of hanging.
 The golden renderings in `test/golden/` are compared line by line with
 Frogmouth's own output in `test/reference/`.  See
 [docs/DESIGN.md](docs/DESIGN.md) for the architecture and the style
@@ -93,16 +97,16 @@ Keys in the rendered view (`mdview-mode`):
 
 | Key | Action |
 |---|---|
-| `q` | Quit the view (back to the source buffer if you came from one) |
+| `q` | Quit the view (back to the buffer you came from, even after following links to other documents) |
 | `g` | Re-render from the (possibly edited) source |
 | `TAB` / `S-TAB` | Next / previous link |
-| `RET`, `mouse-1`, `mouse-2` | Follow the link at point: anchors scroll to the heading, Markdown files open in the same view (with history), other local files open in Emacs, URLs in the browser; footnote references jump to their definition and back; local images open in Emacs, remote ones in the browser |
+| `RET`, `mouse-1`, `mouse-2` | Follow the link at point: anchors scroll to the heading, Markdown files open in the same view (with history), other local files open in Emacs, URLs in the browser; footnote references jump to their definition and back; local images open in Emacs, remote ones in the browser; an image that is itself a link follows the link |
 | `n` / `p` | Next / previous heading |
-| `t` | Table of contents (via `imenu`) |
+| `t` | Table of contents: pick a heading with completion (the heading at point is the default) |
 | `l` / `r` | Back / forward in the view history (when following links between files) |
 | `i` | Toggle inline images |
 | `e` | Visit the source at the corresponding line |
-| `w` | Copy the link URL at point |
+| `w` | Copy the link at point: local files as the absolute file name they resolve to, URLs as written (`C-u w` always copies the raw link) |
 | `SPC` / `DEL` / `S-SPC` | Scroll down / up |
 | `<` / `>` | Beginning / end of the document |
 | `C-c C-v` | Back to the source (same as `mdview-toggle`) |
@@ -131,20 +135,30 @@ View and layout:
 - `mdview-box-frame-style` (`wide` or `none`): the inset frame of the H1/H2
   boxes and tables.
 - `mdview-glyphs` / `mdview-ascii-glyphs` / `mdview-use-ascii-glyphs`: the
-  bullets (`●`, `▪`, `‣`, `•`, `⭑` like Frogmouth), bars, rules and check
-  boxes, with an ASCII profile selected automatically (`auto`) when the
-  terminal cannot display them.
+  bullets (`●`, `▪`, `‣`, `•`, `⭑` like Frogmouth), bars, rules, check
+  boxes, the `summary` marker (`▸`) and the alert icons (`alert-note` ..
+  `alert-caution`), with an ASCII profile selected automatically (`auto`)
+  when the terminal cannot display them; `mdview-image-glyph-fallback`
+  (default `▣`) replaces the `🖼` image marker on text terminals and on
+  graphical frames whose font does not draw it one column wide.
 - `mdview-html-renderer` (`strip` or `shr`): how raw HTML blocks are shown.
 - `mdview-table-expand` (default `t`): expand tables to the full width.
+- `mdview-min-content-width` (default 10): quotes and list items nested so
+  deep that fewer columns would remain are rendered flat in their parent
+  instead of wrapping a few characters per line.
 
 Images:
 
 - `mdview-display-images`, `mdview-display-remote-images` (default `t`).
 - `mdview-image-max-height` (default 0.6 of the frame height, or pixels),
   `mdview-image-max-width` (default `nil`), `mdview-image-timeout`
-  (default 10 s for remote fetches), `mdview-image-captions` (default
-  `nil`: show the alt text below block images),
-  `mdview-image-placeholder-format` (`nil` = `🖼 ALT`).
+  (default 10 s per remote fetch), `mdview-image-max-parallel` (default
+  6 concurrent fetches), `mdview-image-captions` (default `nil`: show the
+  alt text below block images), `mdview-image-placeholder-format` (`nil`
+  = `🖼 ALT`).  Remote images are fetched asynchronously; when they
+  arrive the view re-flows around them once Emacs is idle, and a fetch
+  that fails leaves the placeholder marked "(unavailable)" in its
+  tooltip.
 
 Code blocks:
 
@@ -155,29 +169,45 @@ Code blocks:
 - `mdview-code-indent-guides`, `mdview-code-indent-guide-width` (default
   4), `mdview-code-tab-width` (default 4), `mdview-code-highlight-max-chars`
   (default 100000: larger blocks are shown plain).
+- Fontification results are memoized; `M-x mdview-code-clear-cache` forgets
+  them (e.g. after changing a major mode's faces), and `mdview-code-debug`
+  (default `nil`) reports modes that fail instead of silently showing
+  plain text.
 
 Parser:
 
 - `mdview-inline-extended-autolinks` (default `t`): turn bare URLs,
   `www.` domains and e-mail addresses into links (GFM).
 - `mdview-parse-front-matter` (default `t`): skip a YAML front-matter
-  block; `mdview-parse-max-depth` (default 200): nesting limit.
+  block; `mdview-parse-max-depth` (default 200): nesting limit for
+  container blocks; `mdview-inline-max-depth` (default 100): nesting
+  limit for inline markup, beyond which a paragraph is shown as plain
+  text.
 
 Faces: everything is a face in the `mdview` group (`mdview-h1`, `mdview-h2`,
 `mdview-quote`, `mdview-bullet`, `mdview-link`, `mdview-table`,
-`mdview-code-block`, the `mdview-code-*` token faces, …).
+`mdview-code-block`, the `mdview-code-*` token faces, `mdview-alert-note`
+/ `-tip` / `-important` / `-warning` / `-caution`, `mdview-summary`, …).
+The quote backgrounds and box frames are derived from your theme's
+`default` face and follow `load-theme` / `disable-theme` automatically.
 
 ## Development
 
 ```sh
 make check      # byte-compile with warnings as errors, then run all tests
 make test       # ERT tests only
+make lint       # checkdoc over the sources (fails on any finding)
 make render FILE=test/fixtures/showcase.md WIDTH=100   # dump a rendering as text
+                # (WIDTH=98 matches the content width of the Frogmouth reference)
 make render-faces FILE=... WIDTH=...        # the same with {face} markers
 make golden     # regenerate test/golden/*.txt (review the diff first)
 make shot  FILE=test/fixtures/showcase.md   # text-mode Emacs screenshot via tmux
 make commonmark # CommonMark spec conformance report
 ```
+
+To check image display in a graphical Emacs without screenshots, run
+`scripts/gui-check.el` in the background with absolute paths (see the
+usage comment in the file); it writes a report of every displayed image.
 
 See `AGENTS.md` for the contributor workflow and `docs/DESIGN.md` for the
 architecture, the AST contract shared by the parser and renderer, and the

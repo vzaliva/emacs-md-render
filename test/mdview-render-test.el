@@ -370,13 +370,14 @@
                                  (apply #'mdview-node 'item nil
                                         (mdview-render-test--para (format "L%d" level))
                                         (when inner (list inner)))))))
-    (should (equal (mdview-render-test--lines (mdview-render-test--doc inner) 16)
-                   (list (concat (mdview-glyph 'bullet-1) " L1            ")
-                         (concat "  " (mdview-glyph 'bullet-2) " L2          ")
-                         (concat "    " (mdview-glyph 'bullet-3) " L3        ")
-                         (concat "      " (mdview-glyph 'bullet-4) " L4      ")
-                         (concat "        " (mdview-glyph 'bullet-5) " L5    ")
-                         (concat "          " (mdview-glyph 'bullet-1) " L6  "))))))
+    ;; Width 24 leaves the sixth level 12 columns, above the nesting floor.
+    (should (equal (mdview-render-test--lines (mdview-render-test--doc inner) 24)
+                   (list (concat (mdview-glyph 'bullet-1) " L1                    ")
+                         (concat "  " (mdview-glyph 'bullet-2) " L2                  ")
+                         (concat "    " (mdview-glyph 'bullet-3) " L3                ")
+                         (concat "      " (mdview-glyph 'bullet-4) " L4              ")
+                         (concat "        " (mdview-glyph 'bullet-5) " L5            ")
+                         (concat "          " (mdview-glyph 'bullet-1) " L6          "))))))
 
 (ert-deftest mdview-render-bullet-face-and-wrap-indent ()
   (let* ((text (mdview-render-test--render
@@ -650,9 +651,16 @@
   (should (equal (mdview-render-test--lines
                   (mdview-render-test--doc
                    (mdview-node 'html-block nil
-                                "<div align=\"center\">\n  <b>Raw</b> &amp; <i>html</i>\n</div>\n<!-- gone --><script>x()</script><style>p{}</style>"))
+                                "<div>\n  <b>Raw</b> &amp; <i>html</i>\n</div>\n<!-- gone --><script>x()</script><style>p{}</style>"))
                   12)
-                 '("Raw & html  "))))
+                 '("Raw & html  ")))
+  ;; align="center" centers the text too (one spare column goes right).
+  (should (equal (mdview-render-test--lines
+                  (mdview-render-test--doc
+                   (mdview-node 'html-block nil
+                                "<div align=\"center\">\n  <b>Raw</b> &amp; <i>html</i>\n</div>"))
+                  13)
+                 '(" Raw & html  "))))
 
 (ert-deftest mdview-render-html-block-img-br-hr ()
   (let ((calls nil))
@@ -829,6 +837,399 @@
                   (mdview-render-test--lines doc width))))
     (should (> (length lines) 20))
     (should (mdview-render-test--all-widths lines width))))
+
+;;;; Robustness and width discipline (review findings)
+
+(ert-deftest mdview-render-deep-inline-nesting-does-not-exhaust-stack ()
+  "Thousands of nested emphasis nodes render without `excessive-lisp-nesting'."
+  (let ((node "a"))
+    (dotimes (i 3000)
+      (setq node (mdview-node (if (cl-evenp i) 'strong 'emphasis) nil node)))
+    (let* ((max-lisp-eval-depth 1600)
+           (text (mdview-render-test--render
+                  (mdview-render-test--doc (mdview-render-test--para node)
+                                           (mdview-node 'heading '(:level 1 :id "deep") node))
+                  20)))
+      (should (string-prefix-p "a" text))
+      (should (memq 'mdview-strong (mdview-render-test--faces text 0)))
+      (should (string-search "a" (substring text 20)))
+      ;; The rendering must not leave the global limit changed.
+      (should (= max-lisp-eval-depth 1600)))))
+
+(ert-deftest mdview-render-tabs-are-spaces ()
+  "Tabs in prose count as one column, so padding and centering stay exact."
+  (should (equal (mdview-wrap "a\tb c" 10) '("a b c")))
+  (let* ((bar (mdview-glyph 'quote-bar))
+         (text (mdview-render-test--render
+                (mdview-render-test--doc
+                 (mdview-node 'blockquote nil (mdview-render-test--para "ab\tc"))
+                 (mdview-render-test--heading 1 "a\tb")
+                 (mdview-render-test--list t "a\tb"))
+                20))
+         (lines (butlast (split-string (substring-no-properties text) "\n"))))
+    (should-not (string-search "\t" text))
+    (should (equal (nth 0 lines) (concat bar " ab c              ")))
+    (dolist (line lines)
+      (should (= (string-width line) 20))
+      (should (= (with-temp-buffer (insert line) (current-column)) 20)))))
+
+(ert-deftest mdview-render-block-image-placeholder-wraps ()
+  "A placeholder wider than the width wraps like a paragraph, link kept."
+  (let* ((glyph (mdview-glyph 'image))
+         (lines (mdview-render-test--lines
+                 (mdview-render-test--doc
+                  (mdview-render-test--para
+                   (mdview-node 'image '(:url "x.png" :alt "a very long alternative text wider than twenty"))))
+                 20)))
+    (should (equal lines (list (concat glyph " a very long       ")
+                               "alternative text    "
+                               "wider than twenty   "))))
+  ;; Inside a link and a quote: link properties and prefix on every line.
+  (let* ((bar (mdview-glyph 'quote-bar))
+         (text (mdview-render-test--render
+                (mdview-render-test--doc
+                 (mdview-node 'blockquote nil
+                              (mdview-render-test--para
+                               (mdview-node 'link '(:url "https://l")
+                                            (mdview-node 'image '(:url "x.png" :alt "alternative text that is much longer than the quote"))))))
+                20))
+         (lines (butlast (split-string (substring-no-properties text) "\n"))))
+    (should (> (length lines) 1))
+    (dolist (line lines)
+      (should (= (string-width line) 20))
+      (should (string-prefix-p (concat bar " ") line)))
+    (dotimes (n (length lines))
+      (let ((pos (+ (mdview-render-test--line-pos text n) 2)))
+        (should (equal (get-text-property pos 'mdview-link text) "https://l"))
+        (should (memq 'mdview-quote (mdview-render-test--faces text pos)))))))
+
+(ert-deftest mdview-render-block-image-placeholder-centered-wraps ()
+  (let* ((glyph (mdview-glyph 'image))
+         (lines (mdview-render-test--lines
+                 (mdview-render-test--doc
+                  (mdview-node 'paragraph '(:center t)
+                               (mdview-node 'image '(:url "x.png" :alt "one two three four five six"))))
+                 14)))
+    ;; Every line is centered within 14 columns.
+    (should (equal lines (list (concat "  " glyph " one two   ")
+                               "  three four  "
+                               "   five six   ")))))
+
+(ert-deftest mdview-render-block-image-pending-is-truncated ()
+  "A placeholder awaiting a remote image stays on one line, cut with an ellipsis."
+  (cl-letf (((symbol-function 'mdview-image-insert)
+             (cl-function
+              (lambda (_url alt &key inline &allow-other-keys)
+                (ignore inline)
+                (insert (propertize (concat "[" alt "]") 'mdview-image-pending 7))
+                (cons (+ 2 (length alt)) 'pending)))))
+    (let* ((text (mdview-render-test--render
+                  (mdview-render-test--doc
+                   (mdview-render-test--para
+                    (mdview-node 'image '(:url "https://r/i.png" :alt "a very long remote alt text"))))
+                  12))
+           (lines (butlast (split-string (substring-no-properties text) "\n"))))
+      (should (= (length lines) 1))
+      (should (= (string-width (car lines)) 12))
+      (should (string-suffix-p "…" (car lines)))
+      (should (eq (get-text-property 0 'mdview-image-pending text) 7))
+      (should (eq (get-text-property 10 'mdview-image-pending text) 7)))))
+
+(ert-deftest mdview-render-nesting-floor-keeps-width ()
+  "Containers nested too deep for `mdview-min-content-width' render flat."
+  (let ((bar (mdview-glyph 'quote-bar)))
+    (cl-flet ((quotes (n) (let ((node (mdview-render-test--para "deep")))
+                            (dotimes (_ n)
+                              (setq node (mdview-node 'blockquote nil node)))
+                            node))
+              (bullets (n) (let ((node (mdview-render-test--para "deep")))
+                             (dotimes (_ n)
+                               (setq node (mdview-node 'list '(:ordered nil :tight t :marker ?-)
+                                                       (mdview-node 'item nil node))))
+                             node)))
+      (dolist (width '(80 20))
+        (dolist (doc (list (mdview-render-test--doc (quotes 17))
+                           (mdview-render-test--doc (quotes 200))
+                           (mdview-render-test--doc (bullets 40))))
+          (let ((lines (mdview-render-test--lines doc width)))
+            (should (= (length lines) 1))
+            (should (= (string-width (car lines)) width))
+            (should (string-search "deep" (car lines))))))
+      ;; At width 20 the third quote level would leave 7 columns: it is flat
+      ;; inside the second level, which keeps its bar and background.
+      (let ((line (car (mdview-render-test--lines (mdview-render-test--doc (quotes 5)) 20))))
+        (should (equal line (concat bar "   " bar " deep          ")))
+        (should (= (cl-count (aref bar 0) line) 2)))
+      ;; Lowering the floor restores deeper nesting.
+      (let ((mdview-min-content-width 1))
+        (should (= (cl-count (aref bar 0)
+                             (car (mdview-render-test--lines (mdview-render-test--doc (quotes 3)) 20)))
+                   3)))
+      ;; A top-level container always nests, even at a tiny width.
+      (should (equal (mdview-render-test--lines (mdview-render-test--doc (quotes 1)) 6)
+                     (list (concat bar " dee ") (concat bar " p   ")))))))
+
+(ert-deftest mdview-render-github-alerts ()
+  (let* ((bar (mdview-glyph 'quote-bar))
+         (text (mdview-render-test--render
+                (mdview-render-test--doc
+                 (mdview-node 'blockquote '(:line 1)
+                              (mdview-node 'paragraph nil "[!TIP]" (mdview-node 'soft-break nil)
+                                           "Textual is async."))
+                 (mdview-node 'blockquote nil
+                              (mdview-node 'paragraph nil "[!note]  " (mdview-node 'hard-break nil)
+                                           "hard"))
+                 (mdview-node 'blockquote nil (mdview-node 'paragraph nil "[!WARNING]"))
+                 (mdview-node 'blockquote nil
+                              (mdview-node 'paragraph nil "[!IMPORTANT]\nsame string"))
+                 (mdview-node 'blockquote nil
+                              (mdview-node 'paragraph nil "[!CAUTION] same line"))
+                 (mdview-node 'blockquote nil (mdview-node 'paragraph nil "[!BOGUS]")))
+                24))
+         (lines (butlast (split-string (substring-no-properties text) "\n")))
+         (blank (make-string 24 ?\s)))
+    (cl-flet ((q (content)            ; a quote line at width 24: bar, text, pad, suffix
+                (concat bar " " content (make-string (- 21 (string-width content)) ?\s) " ")))
+      (should (equal lines
+                     (list (q (concat (mdview-glyph 'alert-tip) " Tip"))
+                           (q "Textual is async.") blank
+                           (q (concat (mdview-glyph 'alert-note) " Note"))
+                           (q "hard") blank
+                           (q (concat (mdview-glyph 'alert-warning) " Warning")) blank
+                           (q (concat (mdview-glyph 'alert-important) " Important"))
+                           (q "same string") blank
+                           (q "[!CAUTION] same line") blank
+                           (q "[!BOGUS]")))))
+    ;; Bar, icon and title carry the alert face; the body does not.
+    (should (equal (mdview-render-test--faces text 0) '(mdview-alert-tip mdview-quote)))
+    (should (equal (mdview-render-test--faces text 2) '(mdview-alert-tip mdview-quote)))
+    (should (equal (mdview-render-test--faces text 4)
+                   '(mdview-strong mdview-alert-tip mdview-quote)))
+    (let ((body (+ (mdview-render-test--line-pos text 1) 2)))
+      (should (equal (mdview-render-test--faces text body) '(mdview-quote))))
+    (should (eq (get-text-property 0 'mdview-source-line text) 1))
+    ;; An ordinary quote keeps the border face.
+    (should (equal (mdview-render-test--faces text (mdview-render-test--line-pos text 11))
+                   '(mdview-quote-border mdview-quote)))))
+
+(ert-deftest mdview-render-html-block-level-tags-separate-paragraphs ()
+  (should (equal (mdview-render-test--lines
+                  (mdview-render-test--doc
+                   (mdview-node 'html-block nil "<p>First.</p>\n<p>Second.</p>\n<div><b>Third</b></div><li>a</li><li>b</li>"))
+                  10)
+                 '("First.    " "          " "Second.   " "          " "Third     "
+                   "          " "a         " "          " "b         ")))
+  ;; Table cells only separate words.
+  (should (equal (mdview-render-test--lines
+                  (mdview-render-test--doc
+                   (mdview-node 'html-block nil "<table><tr><td>a</td><td>b</td></tr></table>"))
+                  5)
+                 '("a b  "))))
+
+(ert-deftest mdview-render-html-headings-become-headings ()
+  (let* ((text (mdview-render-test--render
+                (mdview-render-test--doc
+                 (mdview-node 'html-block '(:line 4) "<h2 align=\"center\">Project Title</h2>\n<h4>Sub heading</h4>"))
+                20))
+         (lines (butlast (split-string (substring-no-properties text) "\n"))))
+    (should (= (length lines) 7))
+    (should (equal (nth 0 lines) (mdview-render-test--glyph-row 'box-top 20)))
+    (should (equal (nth 2 lines) (concat (mdview-glyph 'box-left) "  Project Title   "
+                                         (mdview-glyph 'box-right))))
+    (should (equal (nth 6 lines) "Sub heading         "))
+    (let ((pos (+ (mdview-render-test--line-pos text 2) 4)))
+      (should (eq (get-text-property pos 'mdview-heading-level text) 2))
+      (should (equal (get-text-property pos 'mdview-heading-id text) "project-title")))
+    (should (equal (mdview-render-test--faces text (mdview-render-test--line-pos text 6))
+                   '(mdview-h4)))
+    (should (eq (get-text-property 0 'mdview-source-line text) 4))))
+
+(ert-deftest mdview-render-trailing-hard-break-adds-nothing ()
+  (should (equal (mdview-render-test--lines
+                  (mdview-render-test--doc
+                   (mdview-render-test--para "Trailing" (mdview-node 'html-inline nil "<br>"))
+                   (mdview-render-test--para "Next" (mdview-node 'hard-break nil)
+                                             (mdview-node 'hard-break nil))
+                   (mdview-node 'html-block nil "<br>")
+                   (mdview-node 'html-block nil "Mid<br><br>double."))
+                  10)
+                 (list "Trailing  " "          " "Next      " "          "
+                       "Mid       " "          " "double.   ")))
+  ;; A heading ending in a real break has no empty row.
+  (should (equal (mdview-render-test--lines
+                  (mdview-render-test--doc
+                   (mdview-node 'heading '(:level 4) "H4" (mdview-node 'hard-break nil)))
+                  6)
+                 '("H4    "))))
+
+(ert-deftest mdview-render-ascii-task-markers-share-content-column ()
+  (let ((mdview-use-ascii-glyphs t))
+    (should (equal (mdview-render-test--lines
+                    (mdview-render-test--doc
+                     (mdview-node 'list '(:ordered nil :tight t :marker ?-)
+                                  (mdview-node 'item '(:task unchecked) (mdview-render-test--para "task"))
+                                  (mdview-node 'item '(:task checked) (mdview-render-test--para "done"))
+                                  (mdview-node 'item nil (mdview-render-test--para "plain")
+                                               (mdview-node 'list '(:ordered nil :tight t :marker ?-)
+                                                            (mdview-node 'item nil (mdview-render-test--para "nested"))))))
+                    20)
+                   '("[ ] task            " "[x] done            " "*   plain           "
+                     "    - nested        ")))
+    ;; Ordered lists pad the plain numbers to the task-item marker.
+    (should (equal (mdview-render-test--lines
+                    (mdview-render-test--doc
+                     (mdview-node 'list '(:ordered t :start 1 :tight t :marker ?.)
+                                  (mdview-node 'item nil (mdview-render-test--para "one"))
+                                  (mdview-node 'item '(:task checked) (mdview-render-test--para "two"))))
+                    12)
+                   '(" 1.     one " " 2. [x] two "))))
+  ;; The Unicode profile is unchanged: all markers are two columns.
+  (should (equal (mdview-render-test--lines
+                  (mdview-render-test--doc
+                   (mdview-node 'list '(:ordered nil :tight t :marker ?-)
+                                (mdview-node 'item '(:task unchecked) (mdview-render-test--para "task"))
+                                (mdview-node 'item nil (mdview-render-test--para "plain"))))
+                  8)
+                 (list (concat (mdview-glyph 'task-unchecked) " task  ")
+                       (concat (mdview-glyph 'bullet-1) " plain ")))))
+
+(ert-deftest mdview-render-html-align-center-centers-text ()
+  (let ((glyph (mdview-glyph 'image)))
+    (should (equal (mdview-render-test--lines
+                    (mdview-render-test--doc
+                     (mdview-node 'html-block nil
+                                  (concat "<p align=\"center\"><i>Installing deps.</i></p>\n"
+                                          "<div align=\"center\"><img src=\"c.png\" alt=\"Awesome\"><br></div>\n"
+                                          "<p align=\"center\"><a href=\"x\"><img src=\"a.png\" alt=\"A\"></a> "
+                                          "<a href=\"y\"><img src=\"b.png\" alt=\"B\"></a></p>\n"
+                                          "<p>left</p>")))
+                    20)
+                   (list "  Installing deps.  "
+                         "                    "
+                         (concat "     " glyph " Awesome      ")
+                         "                    "
+                         (concat "      " glyph " A " glyph " B       ")
+                         "                    "
+                         "left                ")))))
+
+(ert-deftest mdview-render-empty-paragraph-is-skipped ()
+  "A paragraph that strips to nothing adds neither a line nor margins."
+  (should (equal (mdview-render-test--lines
+                  (mdview-render-test--doc
+                   (mdview-render-test--para "A")
+                   (mdview-render-test--para (mdview-node 'html-inline nil "<a name=\"x\">")
+                                             (mdview-node 'html-inline nil "</a>"))
+                   (mdview-render-test--para "   ")
+                   (mdview-render-test--para "After"))
+                  7)
+                 '("A      " "       " "After  ")))
+  ;; A container holding nothing visible still shows its marker line.
+  (should (equal (mdview-render-test--lines
+                  (mdview-render-test--doc
+                   (mdview-render-test--list
+                    t (mdview-node 'item nil
+                                   (mdview-render-test--para (mdview-node 'html-inline nil "<a name=\"x\">")))))
+                  5)
+                 (list (concat (mdview-glyph 'bullet-1) "    ")))))
+
+(ert-deftest mdview-render-details-summary-and-kbd ()
+  (let* ((text (mdview-render-test--render
+                (mdview-render-test--doc
+                 (mdview-node 'html-block nil "<details>\n<summary> Demo </summary>\ntext\n</details>")
+                 (mdview-render-test--para "Press " (mdview-node 'html-inline nil "<kbd>") "C-c"
+                                           (mdview-node 'html-inline nil "</kbd>") " now")
+                 (mdview-node 'html-block nil "<p>Press <kbd>M-x</kbd> then</p>"))
+                20))
+         (lines (butlast (split-string (substring-no-properties text) "\n"))))
+    (should (equal lines (list (concat (mdview-glyph 'summary) " Demo              ")
+                               "                    " "text                "
+                               "                    " "Press C-c now       "
+                               "                    " "Press M-x then      ")))
+    (should (equal (mdview-render-test--faces text 0) '(mdview-summary)))
+    (should (equal (mdview-render-test--faces text 3) '(mdview-summary)))
+    (should (null (get-text-property (mdview-render-test--line-pos text 2) 'face text)))
+    (let ((kbd (+ (mdview-render-test--line-pos text 4) 6)))
+      (should (null (get-text-property (1- kbd) 'face text)))
+      (should (equal (mdview-render-test--faces text kbd) '(mdview-inline-code)))
+      (should (equal (mdview-render-test--faces text (+ kbd 2)) '(mdview-inline-code)))
+      (should (null (get-text-property (+ kbd 3) 'face text))))
+    (let ((kbd (+ (mdview-render-test--line-pos text 6) 6)))
+      (should (equal (mdview-render-test--faces text kbd) '(mdview-inline-code)))
+      (should (null (get-text-property (+ kbd 3) 'face text))))))
+
+(ert-deftest mdview-render-spacer-images-vanish ()
+  (should (equal (mdview-render-test--render
+                  (mdview-render-test--doc
+                   (mdview-node 'html-block nil "<img src=\"https://img.spacergif.org/spacer.gif\" width=\"1\" height=\"64\"/>"))
+                  10)
+                 ""))
+  (should (equal (mdview-render-test--lines
+                  (mdview-render-test--doc
+                   (mdview-render-test--para
+                    "a" (mdview-node 'html-inline nil "<img src=\"x/spacer.gif\">")
+                    "b" (mdview-node 'html-inline nil "<img src=\"y.png\" height=\"2px\" alt=\"tiny\">")
+                    "c " (mdview-node 'html-inline nil "<img src=\"z.png\" width=\"100\" alt=\"real\">")))
+                  14)
+                 (list (concat "abc " (mdview-glyph 'image) " real    ")))))
+
+(ert-deftest mdview-render-nested-list-in-loose-item-separated-from-next-block ()
+  (let ((bullet (mdview-glyph 'bullet-1)) (sub (mdview-glyph 'bullet-2)))
+    (should (equal (mdview-render-test--lines
+                    (mdview-render-test--doc
+                     (mdview-node 'list '(:ordered nil :tight nil :marker ?-)
+                                  (mdview-node 'item nil
+                                               (mdview-render-test--para "one")
+                                               (mdview-render-test--list t "a" "b")
+                                               (mdview-render-test--para "after"))
+                                  (mdview-node 'item nil (mdview-render-test--para "two"))))
+                    20)
+                   (list (concat bullet " one               ") (make-string 20 ?\s)
+                         (concat "  " sub " a               ") (concat "  " sub " b               ")
+                         (make-string 20 ?\s) "  after             " (make-string 20 ?\s)
+                         (concat bullet " two               "))))
+    ;; Tight items keep nested lists glued to their neighbours.
+    (should (equal (mdview-render-test--lines
+                    (mdview-render-test--doc
+                     (mdview-node 'list '(:ordered nil :tight t :marker ?-)
+                                  (mdview-node 'item nil
+                                               (mdview-render-test--para "one")
+                                               (mdview-render-test--list t "a")
+                                               (mdview-render-test--para "after"))))
+                    20)
+                   (list (concat bullet " one               ") (concat "  " sub " a               ")
+                         "  after             ")))))
+
+(ert-deftest mdview-render-placeholder-is-not-split-across-lines ()
+  (let* ((glyph (mdview-glyph 'image))
+         (badge (lambda (alt) (mdview-node 'image (list :url "b.png" :alt alt)))))
+    ;; The placeholder moves to the next line as a whole ...
+    (should (equal (mdview-wrap (mdview-render-inlines
+                                 (list "word " (funcall badge "Guide to Markdown")))
+                                16)
+                   (list "word" (concat glyph " Guide to") "Markdown")))
+    (should (equal (mdview-wrap (mdview-render-inlines
+                                 (list (funcall badge "A badge") " " (funcall badge "B badge")))
+                                15)
+                   (list (concat glyph " A badge") (concat glyph " B badge"))))
+    ;; ... and stays whole when it fits.
+    (should (equal (mdview-wrap (mdview-render-inlines
+                                 (list "word " (funcall badge "Guide to Markdown")))
+                                30)
+                   (list (concat "word " glyph " Guide to Markdown"))))
+    (should (eq (get-text-property 0 'mdview-nobreak
+                                   (mdview-render-inlines (list (funcall badge "x"))))
+                t))))
+
+(ert-deftest mdview-render-resolves-glyph-profile-once ()
+  (let ((probes 0))
+    (cl-letf (((symbol-function 'mdview-faces-ascii-p)
+               (lambda () (setq probes (1+ probes)) nil)))
+      (mdview-render-test--render
+       (mdview-render-test--doc (mdview-render-test--list t "a" "b" "c")
+                                (mdview-node 'blockquote nil (mdview-render-test--para "q"))
+                                (mdview-node 'thematic-break nil))
+       20)
+      (should (= probes 1)))))
 
 (provide 'mdview-render-test)
 ;;; mdview-render-test.el ends here

@@ -8,12 +8,13 @@
 ;; ERT tests for mdview-image.el (docs/DESIGN.md §6 "Images", §9, §13).
 ;; Everything runs headless: the display is faked with `cl-letf' where a
 ;; test needs the "graphical" code paths and the network is never
-;; touched (`url-queue-retrieve' is stubbed and asserted on).
+;; touched (`url-retrieve' is stubbed and asserted on).
 
 ;;; Code:
 
 (require 'ert)
 (require 'cl-lib)
+(require 'timer)
 (require 'url-queue)
 (require 'mdview-image)
 
@@ -34,7 +35,7 @@
   "A remote URL used by the pending-image tests; never fetched.")
 
 (defvar mdview-image-test-calls nil
-  "Arguments of every stubbed `url-queue-retrieve' call, newest first.")
+  "Arguments of every stubbed `url-retrieve' call, newest first.")
 
 (defun mdview-image-test-png-bytes ()
   "Return the bytes of the sample PNG fixture as a unibyte string."
@@ -45,27 +46,39 @@
     (buffer-string)))
 
 (defun mdview-image-test-reset ()
-  "Forget all pending images, in-flight fetches and cached data."
+  "Forget all pending images, queued and running fetches and cached data."
   (maphash (lambda (_url timer) (when (timerp timer) (cancel-timer timer)))
            mdview-image--inflight)
   (clrhash mdview-image--inflight)
+  (maphash (lambda (_url buffer)
+             (when (buffer-live-p buffer) (kill-buffer buffer)))
+           mdview-image--running)
+  (clrhash mdview-image--running)
+  (setq mdview-image--waiting nil)
   (maphash (lambda (_id job)
              (let ((ov (mdview-image--job-overlay job)))
                (when (overlay-buffer ov) (delete-overlay ov))))
            mdview-image--pending)
   (clrhash mdview-image--pending)
-  (clrhash mdview-image-cache))
+  (clrhash mdview-image-cache)
+  (clrhash mdview-image--size-cache))
+
+(defun mdview-image-test-fake-retrieve (&rest args)
+  "Stand in for `url-retrieve': record ARGS and return a fresh buffer.
+The buffer plays the role of the retrieval buffer that `url-retrieve'
+returns; `mdview-image-test-respond' delivers the response in it."
+  (push args mdview-image-test-calls)
+  (generate-new-buffer " *mdview-image-test-fetch*" t))
 
 (defmacro mdview-image-test-with-graphics (&rest body)
   "Run BODY as if the display were graphical, with the network stubbed.
-`url-queue-retrieve' records its arguments in `mdview-image-test-calls'
-and does nothing; `frame-pixel-height' reports 1000 pixels.  All module
-state is reset before and after BODY."
+`url-retrieve' records its arguments in `mdview-image-test-calls' and
+returns an empty buffer without fetching anything; `frame-pixel-height'
+reports 1000 pixels.  All module state is reset before and after BODY."
   (declare (indent 0) (debug t))
   `(cl-letf (((symbol-function 'mdview-image--graphic-p) (lambda () t))
              ((symbol-function 'frame-pixel-height) (lambda (&optional _f) 1000))
-             ((symbol-function 'url-queue-retrieve)
-              (lambda (&rest args) (push args mdview-image-test-calls) nil)))
+             ((symbol-function 'url-retrieve) #'mdview-image-test-fake-retrieve))
      (setq mdview-image-test-calls nil)
      (mdview-image-test-reset)
      (unwind-protect
@@ -74,9 +87,12 @@ state is reset before and after BODY."
 
 (defun mdview-image-test-respond (url body &optional status)
   "Deliver BODY as the HTTP response for URL to the module's callback.
-STATUS is the HTTP status code (default 200).  Return non-nil when the
-response buffer was killed by the callback, as it must be."
-  (let ((buffer (generate-new-buffer " *mdview-image-test-response*")))
+STATUS is the HTTP status code (default 200).  The response lands in
+the buffer the stubbed `url-retrieve' returned for URL (a fresh one when
+there is none).  Return non-nil when the response buffer was killed by
+the callback, as it must be."
+  (let ((buffer (or (gethash url mdview-image--running)
+                    (generate-new-buffer " *mdview-image-test-response*"))))
     (with-current-buffer buffer
       (set-buffer-multibyte nil)
       (insert (format "HTTP/1.1 %d Whatever\r\nContent-Type: x\r\n\r\n"
@@ -85,6 +101,17 @@ response buffer was killed by the callback, as it must be."
       (setq-local url-http-response-status (or status 200))
       (mdview-image--on-retrieve nil url))
     (not (buffer-live-p buffer))))
+
+(defmacro mdview-image-test-with-fake-image (columns &rest body)
+  "Run BODY with image creation and measurement faked.
+Any bytes decode to a fake PNG spec and every image is COLUMNS wide, so
+the replacement of placeholders can be exercised without a display."
+  (declare (indent 1) (debug t))
+  `(cl-letf (((symbol-function 'mdview-image--from-data)
+              (lambda (&rest _) '(image :type png :data "fake")))
+             ((symbol-function 'mdview-image--columns)
+              (lambda (_image) ,columns)))
+     ,@body))
 
 ;;;; Options and faces
 
@@ -95,12 +122,14 @@ response buffer was killed by the callback, as it must be."
   (should (equal mdview-image-max-height 0.6))
   (should (null mdview-image-max-width))
   (should (equal mdview-image-timeout 10))
+  (should (equal mdview-image-max-parallel 6))
   (should (null mdview-image-captions))
   (should (null mdview-image-placeholder-format))
+  (should (null mdview-image-update-functions))
   (dolist (option '(mdview-display-images mdview-display-remote-images
                     mdview-image-max-height mdview-image-max-width
-                    mdview-image-timeout mdview-image-captions
-                    mdview-image-placeholder-format))
+                    mdview-image-timeout mdview-image-max-parallel
+                    mdview-image-captions mdview-image-placeholder-format))
     (should (custom-variable-p option))
     (should (assq option (get 'mdview 'custom-group))))
   (should (facep 'mdview-image-placeholder))
@@ -117,11 +146,14 @@ response buffer was killed by the callback, as it must be."
     (should (equal (substring-no-properties text) "🖼 A sample"))
     (should (eq (get-text-property 0 'face text) 'mdview-image-placeholder))
     (should (equal (get-text-property 0 'mdview-link text) url))
+    (should (equal (get-text-property 0 'mdview-image-url text) url))
     (should (equal (get-text-property 0 'help-echo text) url))
     (should (eq (get-text-property 0 'mouse-face text) 'highlight))
     ;; Properties cover the whole string.
     (should (eq (get-text-property (1- (length text)) 'face text)
                 'mdview-image-placeholder))
+    (should (equal (get-text-property (1- (length text)) 'mdview-image-url text)
+                   url))
     (should-not (get-text-property 0 'mdview-image-pending text))))
 
 (ert-deftest mdview-image-placeholder-empty-alt-uses-file-name ()
@@ -167,6 +199,19 @@ response buffer was killed by the callback, as it must be."
   (should (equal (mdview-image-label "/abs/dir/x.png" nil) "x.png"))
   (should (equal (mdview-image-label "https://h/x.png?q#f" "") "x.png"))
   (should (equal (mdview-image-label "https://h/" "") "https://h/")))
+
+(ert-deftest mdview-image-label-collapses-whitespace ()
+  "Newlines (hard breaks in the alt text), tabs and runs of spaces become one space."
+  (should (equal (mdview-image-label "x.png" "a  \nb") "a b"))
+  (should (equal (mdview-image-label "x.png" "a\nb") "a b"))
+  (should (equal (mdview-image-label "x.png" "a\r\n\tb   c") "a b c"))
+  (should (equal (mdview-image-label "x.png" "  padded  ") "padded"))
+  ;; Whitespace-only alt text still falls back to the file name.
+  (should (equal (mdview-image-label "dir/x.png" "\n\t ") "x.png"))
+  ;; The placeholder therefore never spans lines.
+  (let ((text (mdview-image-placeholder "x.png" "a  \nb")))
+    (should (equal (substring-no-properties text) "🖼 a b"))
+    (should-not (string-search "\n" text))))
 
 ;;;; URL classification and path resolution
 
@@ -424,10 +469,13 @@ In batch `image-size' signals, so the fallback path is exercised."
       (should (= (length mdview-image-test-calls) 2)))))
 
 (ert-deftest mdview-image-retrieve-error-keeps-placeholder ()
-  "An error status keeps the placeholder, drops the job, caches nothing."
+  "An error status keeps the placeholder, drops the job, caches nothing.
+The placeholder is no longer pending afterwards and its help-echo says
+that the image is unavailable, while it still opens the URL."
   (mdview-image-test-with-graphics
     (with-temp-buffer
       (mdview-image-insert mdview-image-test-url "Photo")
+      (should (get-text-property 1 'mdview-image-pending))
       (let ((before (buffer-string))
             (temp (generate-new-buffer " *mdview-image-test-error*")))
         (with-current-buffer temp
@@ -438,7 +486,29 @@ In batch `image-size' signals, so the fallback path is exercised."
         (should-not (overlays-in (point-min) (point-max)))
         (should (zerop (hash-table-count mdview-image--pending)))
         (should (zerop (hash-table-count mdview-image--inflight)))
-        (should-not (gethash mdview-image-test-url mdview-image-cache))))))
+        (should (zerop (hash-table-count mdview-image--running)))
+        (should-not (gethash mdview-image-test-url mdview-image-cache))
+        ;; Finding: a failed image must not look like one still loading.
+        (should-not (mdview-image--pending-ids (current-buffer)))
+        (should-not (get-text-property 1 'mdview-image-pending))
+        (should-not (get-text-property (1- (point-max)) 'mdview-image-pending))
+        (should (equal (get-text-property 1 'help-echo)
+                       (concat mdview-image-test-url " (unavailable)")))
+        (should (equal (get-text-property 1 'mdview-link) mdview-image-test-url))
+        (should (eq (get-text-property 1 'face) 'mdview-image-placeholder))))))
+
+(ert-deftest mdview-image-undisplayable-data-marks-placeholder ()
+  "Bytes that cannot be shown conclude the job: the placeholder stops pending."
+  (mdview-image-test-with-graphics
+    (with-temp-buffer
+      (mdview-image-insert mdview-image-test-url "Photo")
+      ;; In batch the PNG cannot be measured, so the replacement fails.
+      (should (mdview-image-test-respond mdview-image-test-url
+                                         (mdview-image-test-png-bytes)))
+      (should (equal (substring-no-properties (buffer-string)) "🖼 Photo"))
+      (should-not (get-text-property 1 'mdview-image-pending))
+      (should (string-suffix-p " (unavailable)"
+                               (get-text-property 1 'help-echo))))))
 
 (ert-deftest mdview-image-retrieve-success-caches-bytes ()
   "A 2xx response with image bytes is cached; the job is finished."
@@ -511,35 +581,107 @@ In batch `image-size' signals, so the fallback path is exercised."
     (should (zerop (hash-table-count mdview-image--pending)))))
 
 (ert-deftest mdview-image-timeout-gives-up ()
-  "The watchdog forgets the fetch and keeps the placeholder."
+  "The watchdog forgets the fetch and keeps the placeholder, no longer pending."
   (mdview-image-test-with-graphics
     (with-temp-buffer
       (mdview-image-insert mdview-image-test-url "Photo")
-      (let ((url-queue nil))
-        (mdview-image--on-timeout mdview-image-test-url))
+      (mdview-image--on-timeout mdview-image-test-url)
       (should (equal (substring-no-properties (buffer-string)) "🖼 Photo"))
+      (should-not (get-text-property 1 'mdview-image-pending))
       (should (zerop (hash-table-count mdview-image--pending)))
       (should (zerop (hash-table-count mdview-image--inflight)))
+      (should (zerop (hash-table-count mdview-image--running)))
       ;; A second timeout for the same URL is a harmless no-op.
       (mdview-image--on-timeout mdview-image-test-url))))
 
-(ert-deftest mdview-image-timeout-kills-queued-job ()
-  "A queued `url-queue' job for the URL is killed and reported as an error."
+(ert-deftest mdview-image-timeout-kills-running-retrieval ()
+  "A timed-out retrieval has its buffer killed; nothing is cached."
   (mdview-image-test-with-graphics
     (with-temp-buffer
       (mdview-image-insert mdview-image-test-url "Photo")
-      (let* ((job (make-url-queue :url mdview-image-test-url
-                                  :callback #'mdview-image--on-retrieve
-                                  :cbargs (list mdview-image-test-url)))
-             (other (make-url-queue :url "https://example.invalid/other"
-                                    :callback #'ignore))
-             (url-queue (list job other)))
+      (let ((buffer (gethash mdview-image-test-url mdview-image--running)))
+        (should (buffer-live-p buffer))
         (mdview-image--on-timeout mdview-image-test-url)
-        (should (equal url-queue (list other))))
+        (should-not (buffer-live-p buffer)))
       (should (equal (substring-no-properties (buffer-string)) "🖼 Photo"))
       (should (zerop (hash-table-count mdview-image--pending)))
       (should (zerop (hash-table-count mdview-image--inflight)))
+      (should (zerop (hash-table-count mdview-image--running)))
       (should-not (gethash mdview-image-test-url mdview-image-cache)))))
+
+(ert-deftest mdview-image-timeout-independent-of-url-queue ()
+  "The watchdog is armed for `mdview-image-timeout', whatever `url-queue-timeout' is.
+Nothing goes through `url-queue', whose global timeout used to cap the
+option at 5 seconds."
+  (mdview-image-test-with-graphics
+    (let ((mdview-image-timeout 30)
+          (url-queue-timeout 5)
+          (url-queue nil)
+          (now (float-time)))
+      (cl-letf (((symbol-function 'url-queue-retrieve)
+                 (lambda (&rest _) (error "url-queue must not be used"))))
+        (with-temp-buffer
+          (mdview-image-insert mdview-image-test-url "Photo")
+          (let ((timer (gethash mdview-image-test-url mdview-image--inflight)))
+            (should (timerp timer))
+            (should (eq (timer--function timer) #'mdview-image--on-timeout))
+            (should (equal (timer--args timer) (list mdview-image-test-url)))
+            (should (<= 29 (- (float-time (timer--time timer)) now) 31)))
+          (should (= (length mdview-image-test-calls) 1))
+          (should (null url-queue)))))))
+
+(ert-deftest mdview-image-fetches-limited-to-max-parallel ()
+  "At most `mdview-image-max-parallel' retrievals run; the rest wait their turn."
+  (mdview-image-test-with-graphics
+    (let ((mdview-image-max-parallel 2)
+          (urls '("https://example.invalid/1.png" "https://example.invalid/2.png"
+                  "https://example.invalid/3.png")))
+      (with-temp-buffer
+        (dolist (url urls)
+          (should (eq (cdr (mdview-image-insert url "x")) 'pending))
+          (insert " "))
+        (should (= (length mdview-image-test-calls) 2))
+        (should (equal (mapcar #'car (reverse mdview-image-test-calls))
+                       (list (nth 0 urls) (nth 1 urls))))
+        (should (equal mdview-image--waiting (list (nth 2 urls))))
+        (should (eq (gethash (nth 2 urls) mdview-image--inflight) 'waiting))
+        (should (= (hash-table-count mdview-image--running) 2))
+        (should (= (hash-table-count mdview-image--pending) 3))
+        ;; A fetch for a waiting URL is not queued twice.
+        (mdview-image-insert (nth 2 urls) "again")
+        (should (equal mdview-image--waiting (list (nth 2 urls))))
+        ;; Concluding one retrieval starts the waiting one with its watchdog.
+        (should (mdview-image-test-respond (nth 0 urls) "<html>no</html>"))
+        (should (= (length mdview-image-test-calls) 3))
+        (should (equal (car (car mdview-image-test-calls)) (nth 2 urls)))
+        (should (null mdview-image--waiting))
+        (should (timerp (gethash (nth 2 urls) mdview-image--inflight)))
+        (should (= (hash-table-count mdview-image--running) 2))
+        ;; A timeout also frees a slot.
+        (let ((mdview-image-max-parallel 1))
+          (mdview-image-insert "https://example.invalid/4.png" "x")
+          (should (equal mdview-image--waiting
+                         (list "https://example.invalid/4.png")))
+          (mdview-image--on-timeout (nth 1 urls))
+          (mdview-image--on-timeout (nth 2 urls))
+          (should (null mdview-image--waiting))
+          (should (= (hash-table-count mdview-image--running) 1)))))))
+
+(ert-deftest mdview-image-retrieve-signal-concludes-fetch ()
+  "An error signalled by `url-retrieve' itself fails the fetch at once."
+  (mdview-image-test-with-graphics
+    (cl-letf (((symbol-function 'url-retrieve)
+               (lambda (&rest _) (error "No network"))))
+      (with-temp-buffer
+        (let ((result (mdview-image-insert mdview-image-test-url "Photo")))
+          (should (eq (cdr result) 'placeholder))
+          (should (equal (substring-no-properties (buffer-string)) "🖼 Photo"))
+          (should-not (get-text-property 1 'mdview-image-pending))
+          (should-not (overlays-in (point-min) (point-max)))
+          (should (zerop (hash-table-count mdview-image--pending)))
+          (should (zerop (hash-table-count mdview-image--inflight)))
+          (should (zerop (hash-table-count mdview-image--running)))
+          (should (null mdview-image--waiting)))))))
 
 (ert-deftest mdview-image-job-region-survives-copying ()
   "A placeholder copied into an mdview-mode buffer is still found by its id."
@@ -568,6 +710,7 @@ In batch `image-size' signals, so the fallback path is exercised."
   "Only properties the module did not set are carried over on replacement."
   (let ((text (propertize "x" 'face 'bold 'mdview-link "u" 'help-echo "h"
                           'mouse-face 'highlight 'mdview-image-pending 7
+                          'mdview-image-url "u"
                           'mdview-source-line 12 'mdview-heading-id "hid")))
     (with-temp-buffer
       (insert text)
@@ -575,6 +718,231 @@ In batch `image-size' signals, so the fallback path is exercised."
         (should (equal (plist-get props 'mdview-source-line) 12))
         (should (equal (plist-get props 'mdview-heading-id) "hid"))
         (should (= (length props) 4))))))
+
+;;;; Replacing placeholders without changing the line width
+
+(defun mdview-image-test-first-line ()
+  "Return the first line of the current buffer without properties."
+  (save-excursion
+    (goto-char (point-min))
+    (buffer-substring-no-properties (point) (line-end-position))))
+
+(defun mdview-image-test-first-line-end ()
+  "Return the position of the last character of the first line."
+  (save-excursion
+    (goto-char (point-min))
+    (1- (line-end-position))))
+
+(ert-deftest mdview-image-adjust-padding ()
+  "Width changes are absorbed by the trailing spaces, from the start of the run."
+  (with-temp-buffer
+    ;; prefix "▌ ", content "ab", 8 columns of padding, a 1-column suffix.
+    (insert "▌ ab" (propertize "        " 'face 'italic)
+            (propertize " " 'face 'bold) "\n")
+    ;; 3 columns wider: three padding spaces go; the suffix survives.
+    (mdview-image--adjust-padding 5 3)
+    (should (equal (mdview-image-test-first-line) "▌ ab      "))
+    (should (eq (get-text-property 5 'face) 'italic))
+    (should (eq (get-text-property (mdview-image-test-first-line-end) 'face)
+                'bold))
+    ;; 2 columns narrower: spaces with the padding's properties come back.
+    (mdview-image--adjust-padding 5 -2)
+    (should (equal (mdview-image-test-first-line) "▌ ab        "))
+    (should (eq (get-text-property 5 'face) 'italic))
+    (should (eq (get-text-property 6 'face) 'italic))
+    (should (eq (get-text-property (mdview-image-test-first-line-end) 'face)
+                'bold))
+    ;; Zero is a no-op.
+    (let ((before (buffer-string)))
+      (mdview-image--adjust-padding 5 0)
+      (should (equal-including-properties (buffer-string) before)))
+    ;; More than the run holds removes the run and overflows gracefully.
+    (mdview-image--adjust-padding 5 100)
+    (should (equal (mdview-image-test-first-line) "▌ ab"))
+    ;; Narrower with no run at all: plain spaces are inserted.
+    (mdview-image--adjust-padding 5 -2)
+    (should (equal (mdview-image-test-first-line) "▌ ab  "))
+    (should-not (get-text-property 5 'face))
+    ;; Nothing before POS is touched, even when it is spaces.
+    (erase-buffer)
+    (insert "x   " "   \n")
+    (mdview-image--adjust-padding 5 2)
+    (should (equal (mdview-image-test-first-line) "x    "))))
+
+(ert-deftest mdview-image-replace-block-keeps-line-width ()
+  "A block image replacing its placeholder leaves the line exactly W wide."
+  (mdview-image-test-with-graphics
+    (mdview-image-test-with-fake-image 21
+      (with-temp-buffer
+        (let* ((width 40)
+               (result (mdview-image-insert mdview-image-test-url "GNU"
+                                            :max-width-px 280))
+               (cols (car result)))
+          (should (eq (cdr result) 'pending))
+          (should (= cols (string-width "🖼 GNU")))
+          (put-text-property 1 2 'mdview-source-line 13)
+          (insert (propertize (make-string (- width cols) ?\s) 'face 'italic)
+                  "\n")
+          (should (mdview-image-test-respond mdview-image-test-url
+                                             (mdview-image-test-png-bytes)))
+          (let ((line (buffer-substring 1 (line-end-position 0))))
+            ;; Label "GNU" carrying a 21-column image plus 19 columns of pad.
+            (should (equal (substring-no-properties line)
+                           (concat "GNU" (make-string (- width 21) ?\s))))
+            (should (equal (get-text-property 0 'display line)
+                           '(image :type png :data "fake")))
+            (should-not (get-text-property 3 'display line))
+            (should (eq (get-text-property 3 'face line) 'italic))
+            (should (equal (get-text-property 0 'mdview-source-line line) 13))
+            (should (equal (get-text-property 0 'mdview-link line)
+                           mdview-image-test-url))
+            (should (equal (get-text-property 0 'mdview-image-url line)
+                           mdview-image-test-url))
+            (should-not (get-text-property 0 'mdview-image-pending line))
+            (should-not (get-text-property 0 'keymap line)))
+          (should (zerop (hash-table-count mdview-image--pending))))))))
+
+(ert-deftest mdview-image-url-property-survives-link-override ()
+  "`mdview-image-url' stays when a link around the image replaces `mdview-link'."
+  (let ((text (mdview-image-placeholder "pic.png" "Badge")))
+    (add-text-properties 0 (length text) '(mdview-link "https://x.example/")
+                         text)
+    (should (equal (get-text-property 0 'mdview-link text) "https://x.example/"))
+    (should (equal (get-text-property 0 'mdview-image-url text) "pic.png"))
+    (should (memq 'mdview-image-url mdview-image--own-properties))))
+
+(ert-deftest mdview-image-replace-narrower-image-pads ()
+  "An image narrower than its placeholder gets the difference as padding."
+  (mdview-image-test-with-graphics
+    (mdview-image-test-with-fake-image 4
+      (with-temp-buffer
+        (let* ((width 30)
+               (cols (car (mdview-image-insert mdview-image-test-url
+                                               "a long alt text"))))
+          (insert (propertize (make-string (- width cols) ?\s) 'face 'italic)
+                  (propertize " " 'face 'bold) "\n")
+          (should (mdview-image-test-respond mdview-image-test-url
+                                             (mdview-image-test-png-bytes)))
+          (let ((line (buffer-substring 1 (line-end-position 0))))
+            (should (equal (substring-no-properties line)
+                           (concat "a long alt text"
+                                   (make-string (- width 4) ?\s) " ")))
+            (should (eq (get-text-property 15 'face line) 'italic))
+            (should (eq (get-text-property (1- (length line)) 'face line)
+                        'bold))))))))
+
+(ert-deftest mdview-image-replace-inline-uses-line-padding ()
+  "An inline badge mid-line takes its extra columns from the end of the line."
+  (mdview-image-test-with-graphics
+    (mdview-image-test-with-fake-image 16
+      (with-temp-buffer
+        (insert "▌ Inline badge ")
+        (let ((cols (car (mdview-image-insert mdview-image-test-url "badge"
+                                              :inline t))))
+          (should (= cols 7))
+          (insert " inside a quote"
+                  (propertize (make-string 20 ?\s) 'face 'italic)
+                  (propertize " " 'face 'bold) "\n")
+          (should (mdview-image-test-respond mdview-image-test-url
+                                             (mdview-image-test-png-bytes)))
+          (let ((line (buffer-substring 1 (line-end-position 0))))
+            (should (equal (substring-no-properties line)
+                           (concat "▌ Inline badge badge inside a quote"
+                                   (make-string (- 20 9) ?\s) " ")))
+            (should (equal (get-text-property 15 'display line)
+                           '(image :type png :data "fake")))
+            (should (eq (get-text-property (1- (length line)) 'face line)
+                        'bold))))))))
+
+(ert-deftest mdview-image-update-functions-run-after-replacement ()
+  "The hook names the buffer in which images were shown, once per fetch."
+  (mdview-image-test-with-graphics
+    (mdview-image-test-with-fake-image 5
+      (let* ((seen nil)
+             (mdview-image-update-functions
+              (list (lambda (buffer) (push buffer seen)))))
+        (with-temp-buffer
+          (mdview-image-insert mdview-image-test-url "One")
+          (insert "\n")
+          (mdview-image-insert mdview-image-test-url "Two")
+          (insert "\n")
+          (should (mdview-image-test-respond mdview-image-test-url
+                                             (mdview-image-test-png-bytes)))
+          (should (equal seen (list (current-buffer)))))
+        ;; A failed fetch shows nothing and does not run the hook.
+        (setq seen nil)
+        (with-temp-buffer
+          (mdview-image-insert "https://example.invalid/missing.png" "x")
+          (should (mdview-image-test-respond "https://example.invalid/missing.png"
+                                             "<html>404</html>" 404))
+          (should (null seen)))))))
+
+(ert-deftest mdview-image-insert-image-help-echo-single-line-alt ()
+  "The help-echo of a displayed image uses the alt text on one line."
+  (cl-letf (((symbol-function 'mdview-image--columns) (lambda (_image) 3)))
+    (with-temp-buffer
+      (should (= (mdview-image--insert-image '(image :type png :data "fake")
+                                             "x.png" "a  \nb")
+                 3))
+      (should (equal (buffer-substring-no-properties 1 (point-max)) "a b"))
+      (should (equal (get-text-property 1 'help-echo) "a b\nx.png"))
+      (should (equal (get-text-property 1 'mdview-link) "x.png")))
+    (with-temp-buffer
+      (mdview-image--insert-image '(image :type png :data "fake") "x.png" "")
+      (should (equal (get-text-property 1 'help-echo) "x.png")))))
+
+;;;; Resolving local images once and memoizing their size
+
+(ert-deftest mdview-image-local-image-resolution ()
+  "`mdview-image--local-image' resolves file and type in one go."
+  (let ((found (mdview-image--local-image "sample.png"
+                                          mdview-image-test-fixtures)))
+    (should (equal (car found)
+                   (expand-file-name "sample.png" mdview-image-test-fixtures)))
+    (should (eq (cdr found) 'png)))
+  (should-not (mdview-image--local-image "missing.png" mdview-image-test-fixtures))
+  (should-not (mdview-image--local-image mdview-image-test-url "/tmp/"))
+  (should-not (mdview-image--local-image mdview-image-test-dir "/tmp/")))
+
+(ert-deftest mdview-image-insert-resolves-local-file-once ()
+  "Inserting a local image reads its type once, not once per check."
+  (mdview-image-test-with-graphics
+    (let ((calls 0)
+          (orig (symbol-function 'mdview-image--file-type)))
+      (cl-letf (((symbol-function 'mdview-image--file-type)
+                 (lambda (file) (cl-incf calls) (funcall orig file))))
+        (with-temp-buffer
+          (mdview-image-insert "sample.png" "Sample"
+                               :base-dir mdview-image-test-fixtures)))
+      (should (= calls 1)))))
+
+(ert-deftest mdview-image-columns-memoized ()
+  "`image-size' runs once per image spec and character width for a while."
+  (mdview-image-test-with-graphics
+    (let ((calls 0)
+          (spec '(image :type png :file "/no/such.png" :max-width 700)))
+      (cl-letf (((symbol-function 'image-size)
+                 (lambda (&rest _) (cl-incf calls) '(145 . 140)))
+                ((symbol-function 'frame-char-width) (lambda (&optional _) 7)))
+        (should (= (mdview-image--columns spec) 21))
+        (should (= (mdview-image--columns (copy-tree spec)) 21))
+        (should (= calls 1))
+        ;; A different spec or character width is measured again.
+        (should (= (mdview-image--columns '(image :type png :file "/other.png"))
+                   21))
+        (should (= calls 2))
+        (cl-letf (((symbol-function 'frame-char-width) (lambda (&optional _) 10)))
+          (should (= (mdview-image--columns spec) 15)))
+        (should (= calls 3))
+        ;; Stale entries are refreshed and the cache can be emptied.
+        (puthash (cons 7 spec) (cons (- (float-time) 1000) 99)
+                 mdview-image--size-cache)
+        (should (= (mdview-image--columns spec) 21))
+        (should (= calls 4))
+        (mdview-image-clear-cache)
+        (should (zerop (hash-table-count mdview-image--size-cache)))
+        (should (= (mdview-image--columns spec) 21))
+        (should (= calls 5))))))
 
 ;;;; Cancelling and the cache
 
@@ -603,7 +971,10 @@ In batch `image-size' signals, so the fallback path is exercised."
             (let ((before (buffer-string)))
               ;; Without KILL the fetch survives for the other buffer.
               (should (equal (mdview-image-cancel-pending) 2))
-              (should (equal (buffer-string) before))
+              (should (equal-including-properties (buffer-string) before))
+              ;; Cancelling does not touch the placeholders: the buffer
+              ;; is about to be re-rendered, so they stay as they are.
+              (should (get-text-property 1 'mdview-image-pending))
               (should-not (overlays-in (point-min) (point-max)))
               (should (= (hash-table-count mdview-image--pending) 1))
               (should (gethash mdview-image-test-url mdview-image--inflight))
@@ -684,6 +1055,7 @@ In batch `image-size' signals, so the fallback path is exercised."
   (should (fboundp 'mdview-image-clear-cache))
   (should (fboundp 'mdview-image-cancel-pending))
   (should (fboundp 'mdview-image-open))
+  (should (boundp 'mdview-image-update-functions))
   (should (equal (func-arity 'mdview-image-displayable-p) '(1 . 2)))
   (should (equal (func-arity 'mdview-image-placeholder) '(2 . 2)))
   (should (equal (func-arity 'mdview-image-open) '(1 . 2)))

@@ -66,15 +66,24 @@ never more than its natural width).  Empty columns have minimum 1.")
   "Return the rendered string of CELL, calling RENDER-CELL on it.
 A nil (missing) CELL, or a non-string result, yields the empty string.
 Tabs are replaced by spaces so that `string-width' agrees with the
-display width."
+display width, and every line (the pieces between hard breaks) is
+trimmed, so that the text after a <br> starts at the column edge
+whether or not the cell has to wrap."
   (let ((string (and cell (funcall render-cell cell))))
-    (if (stringp string)
-        (subst-char-in-string ?\t ?\s string)
-      "")))
+    (cond
+     ((not (stringp string)) "")
+     (t
+      (when (string-search "\t" string)
+        (setq string (subst-char-in-string ?\t ?\s string)))
+      (if (string-search "\n" string)
+          (mapconcat #'string-trim (split-string string "\n") "\n")
+        (string-trim string))))))
 
 (defun mdview-table--split-lines (string)
   "Split STRING at newlines (hard breaks), keeping text properties."
-  (split-string string "\n"))
+  (if (string-search "\n" string)
+      (split-string string "\n")
+    (list string)))
 
 (defun mdview-table--max-width (strings)
   "Return the largest `string-width' among STRINGS, or 0 when empty."
@@ -82,33 +91,55 @@ display width."
 
 (defun mdview-table--natural-width (string)
   "Return the width of the widest line of cell STRING."
-  (mdview-table--max-width (mdview-table--split-lines string)))
+  (if (string-search "\n" string)
+      (mdview-table--max-width (mdview-table--split-lines string))
+    (string-width string)))
 
 (defun mdview-table--longest-word (string)
   "Return the width of the widest space-separated word of cell STRING."
-  (mdview-table--max-width (split-string string "[ \n]+" t)))
+  (if (string-match-p "[ \n]" string)
+      (mdview-table--max-width (split-string string "[ \n]+" t))
+    (string-width string)))
+
+(defun mdview-table--naturals (rows ncols available)
+  "Return the natural widths of the NCOLS columns of ROWS.
+A column's natural width is its widest cell, at least 1 and at most
+AVAILABLE, the width the columns may share."
+  (let ((cap (max 1 available))
+        (naturals nil))
+    (dotimes (index ncols)
+      (push (min cap (apply #'max 1 (mapcar (lambda (row)
+                                               (mdview-table--natural-width
+                                                (nth index row)))
+                                             rows)))
+            naturals))
+    (nreverse naturals)))
+
+(defun mdview-table--minimums (rows ncols naturals)
+  "Return the minimum widths of the NCOLS columns of ROWS given NATURALS.
+A column's minimum width is its longest word, at least
+`mdview-table-min-column-width' but no more than its natural width, or 1
+for a column without words."
+  (let ((minimums nil))
+    (dotimes (index ncols)
+      (let ((word (apply #'max 0 (mapcar (lambda (row)
+                                           (mdview-table--longest-word
+                                            (nth index row)))
+                                         rows)))
+            (natural (nth index naturals)))
+        (push (if (zerop word)
+                  1
+                (min natural (max mdview-table-min-column-width word)))
+              minimums)))
+    (nreverse minimums)))
 
 (defun mdview-table--measure (rows ncols available)
   "Measure the columns of ROWS; return (NATURALS . MINIMUMS).
-ROWS is a list of rows, each a list of NCOLS cell strings.  A column's
-natural width is its widest cell, at least 1.  Its minimum width is its
-longest word, at least `mdview-table-min-column-width' but no more than
-the natural width, or 1 for a column without words.  Both are capped at
-AVAILABLE, the width the columns may share."
-  (let ((cap (max 1 available))
-        (naturals nil)
-        (minimums nil))
-    (dotimes (index ncols)
-      (let* ((cells (mapcar (lambda (row) (nth index row)) rows))
-             (natural (min cap (apply #'max 1 (mapcar #'mdview-table--natural-width
-                                                      cells))))
-             (word (apply #'max 0 (mapcar #'mdview-table--longest-word cells)))
-             (minimum (if (zerop word)
-                          1
-                        (min natural (max mdview-table-min-column-width word)))))
-        (push natural naturals)
-        (push minimum minimums)))
-    (cons (nreverse naturals) (nreverse minimums))))
+ROWS is a list of rows, each a list of NCOLS cell strings.  See
+`mdview-table--naturals' and `mdview-table--minimums'; both are capped
+at AVAILABLE, the width the columns may share."
+  (let ((naturals (mdview-table--naturals rows ncols available)))
+    (cons naturals (mdview-table--minimums rows ncols naturals))))
 
 ;;;; Integer arithmetic (ports of Rich's helpers)
 
@@ -217,8 +248,10 @@ AVAILABLE is the width the columns share, separators excluded.  When the
 natural widths fit, the spare width is distributed in proportion to them
 if EXPAND is non-nil, otherwise they are kept.  When they do not fit the
 widest columns are collapsed first and, if the minimums still do not fit,
-the minimums are scaled down.  When AVAILABLE is smaller than the number
-of columns every column is one column wide and the caller truncates."
+the minimums are scaled down.  MINIMUMS may be a function returning the
+list, called only when the natural widths do not fit.  When AVAILABLE is
+smaller than the number of columns every column is one column wide and
+the caller truncates."
   (let ((count (length naturals))
         (total (apply #'+ naturals)))
     (cond
@@ -229,7 +262,8 @@ of columns every column is one column wide and the caller truncates."
                      (mdview-table--ratio-distribute (- available total) naturals))
         naturals))
      (t
-      (let ((widths (mdview-table--collapse naturals minimums available)))
+      (let* ((minimums (if (functionp minimums) (funcall minimums) minimums))
+             (widths (mdview-table--collapse naturals minimums available)))
         (if (<= (apply #'+ widths) available)
             widths
           (mdview-table--scale-minimums minimums available)))))))
@@ -285,10 +319,14 @@ shorter cells are padded with blank lines at the bottom."
     (nreverse lines)))
 
 (defun mdview-table--fit (string width)
-  "Return STRING padded with spaces or truncated to exactly WIDTH columns."
-  (let ((fitted (truncate-string-to-width string width nil ?\s)))
-    (cl-assert (= (string-width fitted) width))
-    fitted))
+  "Return STRING padded with spaces or truncated to exactly WIDTH columns.
+A string that already has the right width (the common case for a row
+assembled from aligned cells) is returned as is."
+  (let ((current (string-width string)))
+    (cond
+     ((= current width) string)
+     ((< current width) (concat string (make-string (- width current) ?\s)))
+     (t (truncate-string-to-width string width nil ?\s)))))
 
 (defun mdview-table--rule (width)
   "Return the header rule: WIDTH columns of the `table-rule' glyph.
@@ -369,9 +407,14 @@ truncated.  A table without rows yields nil."
                              (mdview-table--row-strings row ncols render-cell))
                            (cdr rows)))
              (available (max 0 (- inner-width (1- ncols))))
-             (measure (mdview-table--measure (cons header body) ncols available))
-             (widths (mdview-table--column-widths (car measure) (cdr measure)
-                                                  available expand))
+             (cells (cons header body))
+             (naturals (mdview-table--naturals cells ncols available))
+             ;; The minimums (longest words) are only needed when the
+             ;; natural widths do not fit; measure them lazily.
+             (widths (mdview-table--column-widths
+                      naturals
+                      (lambda () (mdview-table--minimums cells ncols naturals))
+                      available expand))
              ;; In the degenerate case wrapping at width 1 would only
              ;; multiply lines that get truncated anyway.
              (wrap (and (>= available ncols) wrap)))

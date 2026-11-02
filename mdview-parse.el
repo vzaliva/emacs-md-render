@@ -37,8 +37,10 @@
 ;; group (Emacs's matcher overflows its stack on such patterns when a
 ;; line is hundreds of kilobytes long); runs of marker characters are
 ;; counted with plain loops instead.  Container nesting is capped by
-;; `mdview-parse-max-depth' so that the recursive conversion and the
-;; renderer stay within `max-lisp-eval-depth'.
+;; `mdview-parse-max-depth' (and inline nesting by
+;; `mdview-inline-max-depth') so that the recursive conversion, the
+;; footnote and heading-id passes and the renderer stay within
+;; `max-lisp-eval-depth'.
 
 ;;; Code:
 
@@ -48,11 +50,6 @@
 (require 'mdview-inline)
 
 ;;;; Options
-
-(defgroup mdview nil
-  "Render Markdown in the style of Frogmouth."
-  :group 'text
-  :prefix "mdview-")
 
 (defcustom mdview-parse-max-depth 200
   "Maximum nesting depth of container blocks.
@@ -947,31 +944,27 @@ cells as that line.  Return 2 on success."
            (rest (substring line (mdview-parse--state-next-nonspace p)))
            (aligns (mdview-parse--delimiter-row rest)))
       (when aligns
-        (let* ((content (mdview-parse--content container))
-               (cut (string-search "\n" content nil))
-               (header-text content) (before nil))
-          ;; Find the last line of the paragraph.
-          (while cut
-            (setq before (substring content 0 cut)
-                  header-text (substring content (1+ cut))
-                  cut (string-search "\n" content (1+ cut))))
-          (let ((cells (mdview-parse--split-row header-text)))
-            (when (= (length cells) (length aligns))
-              (mdview-parse--close-unmatched-blocks p)
-              (let ((parent (mdview-parse--block-parent container)))
-                (if before
-                    (progn
-                      (setf (mdview-parse--block-strings container) (list before))
-                      (mdview-parse--finalize p container))
-                  (mdview-parse--remove-block container)
-                  (setf (mdview-parse--state-tip p) parent))
-                (let ((table (mdview-parse--add-child p 'table)))
-                  (setf (mdview-parse--block-align table) aligns
-                        (mdview-parse--block-rows table) (list cells)
-                        (mdview-parse--block-line table)
-                        (1- (mdview-parse--state-line-number p)))))
-              (mdview-parse--advance-offset p (length line) nil)
-              2)))))))
+        ;; The paragraph's lines are stored newest first, so its last
+        ;; line is simply the head of the list; nothing is joined or
+        ;; copied unless the header actually matches.
+        (let* ((strings (mdview-parse--block-strings container))
+               (cells (mdview-parse--split-row (car strings))))
+          (when (= (length cells) (length aligns))
+            (mdview-parse--close-unmatched-blocks p)
+            (let ((parent (mdview-parse--block-parent container)))
+              (if (cdr strings)
+                  (progn
+                    (setf (mdview-parse--block-strings container) (cdr strings))
+                    (mdview-parse--finalize p container))
+                (mdview-parse--remove-block container)
+                (setf (mdview-parse--state-tip p) parent))
+              (let ((table (mdview-parse--add-child p 'table)))
+                (setf (mdview-parse--block-align table) aligns
+                      (mdview-parse--block-rows table) (list cells)
+                      (mdview-parse--block-line table)
+                      (1- (mdview-parse--state-line-number p)))))
+            (mdview-parse--advance-offset p (length line) nil)
+            2))))))
 
 (defun mdview-parse--start-table-row (p container)
   "Add the current line of parser state P as a row of table CONTAINER.
@@ -1150,7 +1143,10 @@ or a run of non-space characters with balanced parentheses."
             (cond ((and (eq c ?\\) (< (1+ i) len)
                         (mdview-parse--escapable-p (aref s (1+ i))))
                    (setq i (+ i 2)))
-                  ((eq c ?\() (setq parens (1+ parens) i (1+ i)))
+                  ((eq c ?\()
+                   ;; Like cmark, give up after 32 unclosed parens.
+                   (setq parens (1+ parens))
+                   (if (> parens 32) (setq done t) (setq i (1+ i))))
                   ((eq c ?\))
                    (if (< parens 1) (setq done t) (setq parens (1- parens) i (1+ i))))
                   ((or (<= c ?\s) (eq c #x7f)) (setq done t))
@@ -1296,11 +1292,13 @@ linear."
 
 (defun mdview-parse--take-task-marker (item)
   "Strip a GFM task marker from the first paragraph of ITEM.
-Return `checked', `unchecked' or nil."
+Return `checked', `unchecked' or nil.  The marker must be followed by
+whitespace, a line ending or the end of the paragraph (`- [ ]' alone,
+as in issue templates, is an empty check box on GitHub too)."
   (let ((first (car (last (mdview-parse--block-children item)))))
     (when (and first (eq (mdview-parse--block-type first) 'paragraph))
       (let ((content (mdview-parse--content first)))
-        (when (string-match "\\`\\[\\([ xX]\\)\\]\\(?:[ \t]+\\|\n\\)" content)
+        (when (string-match "\\`\\[\\([ xX]\\)\\]\\(?:[ \t]+\\|\n\\|\\'\\)" content)
           (setf (mdview-parse--block-strings first)
                 (list (substring content (match-end 0))))
           (if (eq (aref content 1) ?\s) 'unchecked 'checked))))))
@@ -1481,6 +1479,9 @@ The node has `:refs', a hash table from normalized link labels to
 \(URL . TITLE), and `:footnotes', the referenced footnote definitions
 in order of first reference; its children are the block nodes of
 docs/DESIGN.md section 3.  Parsing never signals an error."
+  ;; Nesting is capped (`mdview-parse-max-depth' for blocks,
+  ;; `mdview-inline-max-depth' for inlines), so the passes below need a
+  ;; few hundred frames at most; the raised limit is a safety margin.
   (let* ((max-lisp-eval-depth (max max-lisp-eval-depth 6000))
          (p (mdview-parse--build-tree string))
          (refs (mdview-parse--state-refs p))

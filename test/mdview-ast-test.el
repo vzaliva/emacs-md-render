@@ -233,6 +233,29 @@
   (should (equal (mdview-ast-decode-entities "&#x110000;") "�"))
   (should (equal (mdview-ast-decode-entities "&#xFFFFFF;") "�")))
 
+(ert-deftest mdview-ast-decode-control-characters ()
+  "Control characters and noncharacters become U+FFFD; tab and newline stay.
+Numeric references bypass the parser's normalization of literal NUL and
+CR, so a `&#13;' would otherwise put a raw ^M into the rendered buffer."
+  (dolist (ref '("&#13;" "&#XD;" "&#1;" "&#x1b;" "&#x7f;" "&#x80;" "&#x85;"
+                 "&#x9F;" "&#xB;" "&#xC;" "&#xFDD0;" "&#xFDEF;" "&#xFFFE;"
+                 "&#xFFFF;" "&#x1FFFF;" "&#x10FFFE;"))
+    (should (equal (mdview-ast-decode-entities ref) "�")))
+  (should (equal (mdview-ast-decode-entities "&#9;") "\t"))
+  (should (equal (mdview-ast-decode-entities "&#10;") "\n"))
+  (should (equal (mdview-ast-decode-entities "&#32;") " "))
+  (should (equal (mdview-ast-decode-entities "&#xA0;") " "))
+  (should (equal (mdview-ast-decode-entities "&#xFDF0;") "ﷰ"))
+  (should (equal (mdview-ast-decode-entities "&#x10FFFD;") (string #x10FFFD)))
+  (should (equal (mdview-ast-decode-entities "a &#XD; b &#9;c")
+                 "a � b \tc")))
+
+(ert-deftest mdview-ast-custom-group ()
+  "The `mdview' group is defined by this root module, with its link."
+  (should (stringp (get 'mdview 'group-documentation)))
+  (should (get 'mdview 'custom-links))
+  (should (memq 'mdview (mapcar #'car (get 'text 'custom-group)))))
+
 (ert-deftest mdview-ast-decode-not-entities ()
   "Malformed or unknown references are left untouched."
   (dolist (s '("&nosuch;" "&Amp;" "&amp" "&;" "&#;" "&#x;" "&#12345678;"

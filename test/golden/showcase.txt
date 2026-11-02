@@ -207,7 +207,7 @@ Inline image in a paragraph: 🖼 tiny followed by text.
 ▎                                HTML and misc                                 ▊
 ▎                                                                              ▊
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
-Raw HTML block                                                                  
+                                 Raw HTML block                                 
                                                                                 
 Inline Ctrl+C html and a                                                        
 break.                                                                          

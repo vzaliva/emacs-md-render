@@ -20,6 +20,14 @@
 ;; information is available the derivation is a silent no-op and the
 ;; static face specs apply.
 ;;
+;; The glyph profile (ASCII or Unicode, and whether the emoji image
+;; marker must give way to a plain symbol the display draws one column
+;; wide) is resolved by `mdview-faces-resolve-glyphs'; the renderer binds
+;; the result to `mdview-faces--profile' for the duration of a document
+;; so that `mdview-glyph' does not probe the display per glyph.  Buffers
+;; whose derived faces were installed by `mdview-faces-remap' are
+;; refreshed from `enable-theme-functions' and `disable-theme-functions'.
+;;
 ;; Colours are Textual's default design as resolved by Frogmouth:
 ;;
 ;;   text-muted  #A5A5A5 / #666666      panel     #24292F / #DCE3E8
@@ -36,12 +44,7 @@
 (require 'color)
 (require 'face-remap)
 (require 'seq)
-
-(defgroup mdview nil
-  "Render Markdown in the visual style of Frogmouth."
-  :group 'text
-  :prefix "mdview-"
-  :link '(url-link "https://github.com/vzaliva/emacs-md-render"))
+(require 'mdview-ast)                   ; the `mdview' customization group
 
 ;;;; Faces
 
@@ -212,6 +215,42 @@ thin inset; `mdview-faces-remap' sets it buffer-locally from the real
   "Face for image captions (the alt text under a block image)."
   :group 'mdview)
 
+(defface mdview-summary
+  '((t :weight bold))
+  "Face for the summary line of an HTML <details> element."
+  :group 'mdview)
+
+;; GitHub's alert colours (light theme / dark theme).
+(defface mdview-alert-note
+  '((((background dark)) :foreground "#4493F8")
+    (((background light)) :foreground "#0969DA"))
+  "Face for the bar and title of a [!NOTE] alert."
+  :group 'mdview)
+
+(defface mdview-alert-tip
+  '((((background dark)) :foreground "#3FB950")
+    (((background light)) :foreground "#1A7F37"))
+  "Face for the bar and title of a [!TIP] alert."
+  :group 'mdview)
+
+(defface mdview-alert-important
+  '((((background dark)) :foreground "#AB7DF8")
+    (((background light)) :foreground "#8250DF"))
+  "Face for the bar and title of an [!IMPORTANT] alert."
+  :group 'mdview)
+
+(defface mdview-alert-warning
+  '((((background dark)) :foreground "#D29922")
+    (((background light)) :foreground "#9A6700"))
+  "Face for the bar and title of a [!WARNING] alert."
+  :group 'mdview)
+
+(defface mdview-alert-caution
+  '((((background dark)) :foreground "#F85149")
+    (((background light)) :foreground "#CF222E"))
+  "Face for the bar and title of a [!CAUTION] alert."
+  :group 'mdview)
+
 ;;;; Options
 
 (defcustom mdview-box-frame-style 'wide
@@ -237,7 +276,9 @@ mode `auto' selects the Unicode glyphs."
     (bullet-5 . "⭑") (quote-bar . "▌") (box-top . "▁") (box-bottom . "▔")
     (box-left . "▎") (box-right . "▊") (rule . "━") (thin-rule . "─")
     (guide . "│") (task-checked . "☑") (task-unchecked . "☐")
-    (table-rule . "━") (h3-rule . "▔") (image . "🖼"))
+    (table-rule . "━") (h3-rule . "▔") (image . "🖼") (summary . "▸")
+    (alert-note . "◉") (alert-tip . "✦") (alert-important . "❢")
+    (alert-warning . "⚠") (alert-caution . "⊘"))
   "Glyphs used by the renderer, keyed by role.
 `bullet-1' .. `bullet-5' are the bullets for successive list depths;
 `quote-bar' the block quote border; `box-top', `box-bottom', `box-left'
@@ -245,9 +286,13 @@ and `box-right' the frame of heading and table boxes; `rule' the thematic
 break; `thin-rule' the footnotes separator; `guide' the code indent
 guide; `task-checked' and `task-unchecked' the task-list boxes;
 `table-rule' the header rule of tables; `h3-rule' the underline of level-3
-headings; `image' the marker of image placeholders.  Every value should
-be one column wide (see `string-width') except the task boxes and image
-marker, which may be wider."
+headings; `image' the marker of image placeholders; `summary' the marker
+of a <details> summary line; `alert-note' .. `alert-caution' the icons of
+GitHub alerts.  Every value should be one column wide (see
+`string-width') except the task boxes, the alert icons and the image
+marker, which may be wider.  The `image' glyph is replaced by
+`mdview-image-glyph-fallback' on displays that do not draw it one column
+wide (see `mdview-faces-resolve-glyphs')."
   :type '(alist :key-type symbol :value-type string)
   :group 'mdview)
 
@@ -256,10 +301,25 @@ marker, which may be wider."
     (bullet-5 . "*") (quote-bar . "|") (box-top . "-") (box-bottom . "-")
     (box-left . "|") (box-right . "|") (rule . "-") (thin-rule . "-")
     (guide . "|") (task-checked . "[x]") (task-unchecked . "[ ]")
-    (table-rule . "-") (h3-rule . "-") (image . "[img]"))
+    (table-rule . "-") (h3-rule . "-") (image . "[img]") (summary . ">")
+    (alert-note . "(i)") (alert-tip . "(*)") (alert-important . "(!!)")
+    (alert-warning . "(!)") (alert-caution . "(x)"))
   "ASCII replacements for `mdview-glyphs', with the same keys.
 Used when `mdview-use-ascii-glyphs' selects the ASCII profile."
   :type '(alist :key-type symbol :value-type string)
+  :group 'mdview)
+
+(defcustom mdview-image-glyph-fallback "▣"
+  "Glyph drawn instead of the `image' glyph of `mdview-glyphs' when needed.
+The default image marker is an emoji that graphical Emacs draws with an
+emoji font, often wider than a text column, and that many terminals draw
+two cells wide although `string-width' counts one; both misalign the
+right edge of boxes.  This Basic Multilingual Plane symbol is used
+instead on a graphical frame whose font does not draw the configured
+glyph exactly one column wide, and on text terminals whenever the
+configured glyph lies outside the Basic Multilingual Plane.  In batch
+mode the configured glyph is always used."
+  :type 'string
   :group 'mdview)
 
 ;;;; Glyphs
@@ -273,15 +333,58 @@ chosen only on an interactive display that cannot show `●'."
                 (not (char-displayable-p ?●))))
     (value value)))
 
+(defun mdview-faces-glyph-fits-p (glyph)
+  "Return non-nil when the display draws GLYPH `string-width' columns wide.
+Everything fits in batch mode.  On a graphical frame the glyph must be
+displayable and its pixel width must be its column count times
+`frame-char-width'.  On a text terminal a glyph outside the Basic
+Multilingual Plane is assumed not to fit, because many terminals draw
+such pictographs two cells wide while Emacs counts one."
+  (cond
+   (noninteractive t)
+   ((display-graphic-p)
+    (condition-case nil
+        (and (seq-every-p #'char-displayable-p glyph)
+             (= (string-pixel-width glyph)
+                (* (string-width glyph) (frame-char-width))))
+      (error t)))
+   (t (not (seq-some (lambda (char) (>= char #x10000)) glyph)))))
+
+(defun mdview-faces--image-glyph-override ()
+  "Return the glyph replacing the Unicode `image' glyph, or nil to keep it."
+  (let ((glyph (cdr (assq 'image mdview-glyphs))))
+    (and (stringp glyph)
+         (not (string-empty-p glyph))
+         (not (mdview-faces-glyph-fits-p glyph))
+         mdview-image-glyph-fallback)))
+
+(defvar mdview-faces--profile nil
+  "The glyph profile resolved for the current rendering, or nil.
+A cons (ASCII . IMAGE): ASCII is non-nil when the ASCII profile is in
+use and IMAGE is the string overriding the `image' glyph, or nil.
+`mdview-render-document' binds it to `mdview-faces-resolve-glyphs' so
+that `mdview-glyph' probes the display once per document rather than
+once per glyph.  When nil every call of `mdview-glyph' probes.")
+
+(defun mdview-faces-resolve-glyphs ()
+  "Probe the display and return the glyph profile for `mdview-faces--profile'."
+  (let ((ascii (and (mdview-faces-ascii-p) t)))
+    (cons ascii (and (not ascii) (mdview-faces--image-glyph-override)))))
+
 (defun mdview-glyph (key)
   "Return the glyph string for KEY from the active glyph profile.
 KEY is one of the keys of `mdview-glyphs'.  Falls back to the other
 profile when KEY is missing from the active one, and to the empty string
-when KEY is unknown, so rendering never signals."
-  (or (and (mdview-faces-ascii-p) (cdr (assq key mdview-ascii-glyphs)))
-      (cdr (assq key mdview-glyphs))
-      (cdr (assq key mdview-ascii-glyphs))
-      ""))
+when KEY is unknown, so rendering never signals.  The `image' glyph is
+subject to `mdview-image-glyph-fallback'."
+  (let* ((profile mdview-faces--profile)
+         (ascii (if profile (car profile) (mdview-faces-ascii-p))))
+    (or (and (eq key 'image) (not ascii)
+             (if profile (cdr profile) (mdview-faces--image-glyph-override)))
+        (and ascii (cdr (assq key mdview-ascii-glyphs)))
+        (cdr (assq key mdview-glyphs))
+        (cdr (assq key mdview-ascii-glyphs))
+        "")))
 
 ;;;; Colour derivation
 
@@ -334,6 +437,20 @@ Nil means the colour is unavailable (batch mode, monochrome terminal)."
 (defvar-local mdview-faces--remap-cookies nil
   "Cookies returned by `face-remap-add-relative' in this buffer.")
 
+(defvar-local mdview-faces--remapped nil
+  "Non-nil in buffers where `mdview-faces-remap' has run.
+Such buffers get their derived faces recomputed when a theme is enabled
+or disabled (see `mdview-faces-theme-changed').")
+
+(defun mdview-faces-theme-changed (&rest _)
+  "Recompute the derived faces in every buffer that has them.
+Runs from `enable-theme-functions' and `disable-theme-functions' so that
+open views follow the new `default' background without a re-render."
+  (dolist (buffer (buffer-list))
+    (when (buffer-local-value 'mdview-faces--remapped buffer)
+      (with-current-buffer buffer
+        (mdview-faces-remap)))))
+
 (defun mdview-faces-remap ()
   "Install the theme-derived faces buffer-locally.
 Computes the `mdview-quote', `mdview-quote-2' and `mdview-quote-3'
@@ -342,8 +459,13 @@ foreground (equal to the buffer background) from the `default' face, and
 installs them with `face-remap-add-relative'.  Any earlier remapping by
 this function is removed first.  When the default background cannot be
 determined (as in batch mode) nothing is changed and no error is
-signalled.  Return the list of remapping cookies."
+signalled.  The buffer is remembered so that `mdview-faces-theme-changed'
+refreshes it after `load-theme' or `disable-theme'.  Return the list of
+remapping cookies."
   (mdview-faces-unremap)
+  (setq mdview-faces--remapped t)
+  (add-hook 'enable-theme-functions #'mdview-faces-theme-changed)
+  (add-hook 'disable-theme-functions #'mdview-faces-theme-changed)
   (let ((rgb (mdview-faces-default-background)))
     (when rgb
       (let ((level 0))
@@ -358,9 +480,11 @@ signalled.  Return the list of remapping cookies."
   mdview-faces--remap-cookies)
 
 (defun mdview-faces-unremap ()
-  "Remove the face remappings installed by `mdview-faces-remap'."
+  "Remove the face remappings installed by `mdview-faces-remap'.
+The buffer no longer follows theme changes until the next remap."
   (mapc #'face-remap-remove-relative mdview-faces--remap-cookies)
-  (setq mdview-faces--remap-cookies nil))
+  (setq mdview-faces--remap-cookies nil
+        mdview-faces--remapped nil))
 
 (provide 'mdview-faces)
 ;;; mdview-faces.el ends here

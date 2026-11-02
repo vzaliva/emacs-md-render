@@ -132,9 +132,30 @@ The oldest entry comes first; `mdview--history-index' is the current one.")
 (defvar-local mdview--refit-timer nil
   "The idle timer scheduled by `mdview--window-size-changed', or nil.")
 
+(defvar-local mdview--image-update-timer nil
+  "The idle timer scheduled by `mdview--on-images-updated', or nil.")
+
 (defvar-local mdview--source-window nil
   "The window in which this view replaced its source buffer, or nil.
-`mdview-quit' switches that window back to the source.")
+`mdview-quit' switches that window back to `mdview--origin-buffer'.")
+
+(defvar-local mdview--origin-buffer nil
+  "The buffer this view replaced in `mdview--source-window', or nil.
+It is the buffer the view was opened from and stays the same when links
+to other documents are followed, so that `mdview-quit' returns there.")
+
+(defvar-local mdview--document nil
+  "The parsed source of this view as (KEY . DOCUMENT), or nil.
+KEY identifies the source text (see `mdview--source-key'); while it still
+matches, re-rendering for a new width or image setting reuses DOCUMENT
+instead of parsing again.")
+
+(defvar mdview--render-gc-threshold (* 64 1024 1024)
+  "Value `gc-cons-threshold' is raised to while a view is rendered.
+The renderer allocates many short-lived strings and lists; with the
+default threshold a large document triggers hundreds of collections,
+each re-marking the intervals of every open view, and the collections
+dominate the rendering time.")
 
 ;;;; Keymap and mode
 
@@ -175,6 +196,10 @@ text out at render time).  Headings are indexed for `imenu'.
   :group 'mdview
   (setq truncate-lines t)
   (setq buffer-read-only t)
+  ;; The view is rewritten wholesale on every render; undo records of
+  ;; that are useless in a read-only buffer and would retain the whole
+  ;; previous rendering.
+  (buffer-disable-undo)
   (setq-local imenu-create-index-function #'mdview--imenu-create-index)
   (setq-local revert-buffer-function #'mdview--revert-buffer)
   (setq left-margin-width mdview-margin
@@ -182,7 +207,12 @@ text out at render time).  Headings are indexed for `imenu'.
   (setq mdview--images-enabled mdview-display-images)
   (mdview-faces-remap)
   (add-hook 'kill-buffer-hook #'mdview--on-kill nil t)
-  (add-hook 'window-size-change-functions #'mdview--window-size-changed nil t))
+  (add-hook 'window-size-change-functions #'mdview--window-size-changed nil t)
+  ;; Refresh-on-save is a global hook filtered by source buffer, so that a
+  ;; mode change in the source (`kill-all-local-variables') cannot lose it.
+  (add-hook 'after-save-hook #'mdview--after-save)
+  ;; Remote images that arrive after the rendering re-flow the view.
+  (add-hook 'mdview-image-update-functions #'mdview--on-images-updated))
 
 ;;;; Width and margins
 
@@ -218,8 +248,13 @@ by `mdview-max-width'."
                   0)))
     (setq left-margin-width (+ mdview-margin (/ extra 2))
           right-margin-width mdview-margin)
+    ;; Margins take effect when the window is (re)assigned its buffer,
+    ;; which also resets the window's start; only do it when they changed.
     (dolist (window windows)
-      (set-window-buffer window (current-buffer)))))
+      (let ((margins (window-margins window)))
+        (unless (and (eql (or (car margins) 0) left-margin-width)
+                     (eql (or (cdr margins) 0) right-margin-width))
+          (set-window-buffer window (current-buffer)))))))
 
 ;;;; Source access and the rendering pipeline
 
@@ -237,15 +272,49 @@ The live source buffer wins; otherwise the source file is read."
              (buffer-string)))
           (t (user-error "The source of this view no longer exists")))))
 
-(defun mdview--source-line-at (&optional pos)
-  "Return the source line of the block at or before POS (default: point).
-This is the value of the nearest preceding `mdview-source-line' text
-property, or nil when there is none."
+(defun mdview--source-key ()
+  "Return a value identifying the current text of this view's source.
+A live source buffer is identified by its `buffer-chars-modified-tick',
+a file by its modification time and size.  Return nil when there is no
+readable source."
+  (let ((buffer mdview--source-buffer)
+        (file mdview--source-file))
+    (cond ((buffer-live-p buffer)
+           (list buffer (buffer-chars-modified-tick buffer)))
+          ((and file (file-readable-p file))
+           (let ((attributes (file-attributes file)))
+             (list file
+                   (file-attribute-modification-time attributes)
+                   (file-attribute-size attributes)))))))
+
+(defun mdview--source-document ()
+  "Return the parsed document of this view's source, parsing when needed.
+The result is cached in `mdview--document' together with the key of the
+source text (`mdview--source-key'), so re-rendering an unchanged source
+for a new width or image setting skips the parser."
+  (let ((key (mdview--source-key)))
+    (if (and key mdview--document (equal key (car mdview--document)))
+        (cdr mdview--document)
+      (let ((document (mdview-parse-string (mdview--source-text))))
+        (setq mdview--document (and key (cons key document)))
+        document))))
+
+(defun mdview--block-at (&optional pos)
+  "Return (LINE . START) for the block at or before POS (default: point).
+LINE is the value of the nearest preceding `mdview-source-line' text
+property and START the position where that run of the property begins;
+nil when there is no block before POS."
   (let ((pos (or pos (point)))
         (line nil))
     (while (and pos (not (setq line (get-text-property pos 'mdview-source-line))))
       (setq pos (previous-single-property-change pos 'mdview-source-line)))
-    line))
+    (and line (cons line pos))))
+
+(defun mdview--source-line-at (&optional pos)
+  "Return the source line of the block at or before POS (default: point).
+This is the value of the nearest preceding `mdview-source-line' text
+property, or nil when there is none."
+  (car (mdview--block-at pos)))
 
 (defun mdview--block-starts ()
   "Return the blocks of the view as a list of (SOURCE-LINE . POSITION)."
@@ -257,18 +326,23 @@ property, or nil when there is none."
       (setq pos (next-single-property-change pos 'mdview-source-line)))
     (nreverse result)))
 
+(defun mdview--source-line-position (line)
+  "Return the start of the first block rendered from source LINE or later.
+When every block starts before LINE, return the start of the last block;
+without any block, `point-min'."
+  (let ((last nil))
+    (or (catch 'found
+          (dolist (entry (mdview--block-starts))
+            (setq last (cdr entry))
+            (when (>= (car entry) line)
+              (throw 'found (cdr entry)))))
+        last
+        (point-min))))
+
 (defun mdview--goto-source-line (line)
   "Move point to the first block rendered from source LINE or a later one.
 When every block starts before LINE, move to the last block."
-  (let ((target nil)
-        (last nil))
-    (catch 'found
-      (dolist (entry (mdview--block-starts))
-        (setq last (cdr entry))
-        (when (>= (car entry) line)
-          (setq target (cdr entry))
-          (throw 'found nil))))
-    (goto-char (or target last (point-min)))))
+  (goto-char (mdview--source-line-position line)))
 
 (defun mdview--view-point ()
   "Return point as seen in the window showing the view, else `point'."
@@ -277,22 +351,59 @@ When every block starts before LINE, move to the last block."
         (window-point window)
       (point))))
 
+(defun mdview--window-starts (buffer)
+  "Return the scroll positions of the windows showing BUFFER.
+Each element is (WINDOW LINE OFFSET): the source line of the block at
+the top of WINDOW and the number of lines between that block's first
+line and the window start.  Windows above the first block are omitted."
+  (with-current-buffer buffer
+    (delq nil
+          (mapcar (lambda (window)
+                    (let* ((start (window-start window))
+                           (block (mdview--block-at start)))
+                      (and block
+                           (list window (car block)
+                                 (count-lines (cdr block) start)))))
+                  (get-buffer-window-list buffer nil t)))))
+
+(defun mdview--restore-window-starts (positions)
+  "Scroll the windows listed in POSITIONS back to where they were.
+POSITIONS comes from `mdview--window-starts'.  Each window is started
+at the block that was at its top before the re-rendering, the recorded
+number of lines further down, so the text does not jump; redisplay may
+still scroll to keep point visible."
+  (pcase-dolist (`(,window ,line ,offset) positions)
+    (when (and (window-live-p window)
+               (eq (window-buffer window) (current-buffer)))
+      (save-excursion
+        (goto-char (mdview--source-line-position line))
+        (forward-line offset)
+        (set-window-start window (point) t)))))
+
 (defun mdview--render-into (buffer &optional line)
   "Render the source of the view BUFFER into it and restore the position.
 Point ends up at the block rendered from source line LINE (an integer),
-or, when LINE is nil, at the block that was at point before."
+or, when LINE is nil, at the block that was at point before; the windows
+showing the view keep the block that was at their top.  The parsed
+document is reused when the source text did not change (see
+`mdview--source-document'), and garbage collection is made less eager
+for the duration (`mdview--render-gc-threshold')."
   (with-current-buffer buffer
-    (let ((text (mdview--source-text))
-          (line (or line (mdview--source-line-at (mdview--view-point))))
-          (width (mdview--content-width))
-          (inhibit-read-only t)
-          (mdview-display-images mdview--images-enabled))
+    (let* ((gc-cons-threshold (max gc-cons-threshold mdview--render-gc-threshold))
+           (gc-cons-percentage (max gc-cons-percentage 0.5))
+           (document (mdview--source-document))
+           (line (or line (mdview--source-line-at (mdview--view-point))))
+           (starts (mdview--window-starts buffer))
+           (width (mdview--content-width))
+           (inhibit-read-only t)
+           (buffer-undo-list t)
+           (mdview-display-images mdview--images-enabled))
       (mdview--cancel-refit)
+      (mdview--cancel-image-update)
       (when (fboundp 'mdview-image-cancel-pending)
         (mdview-image-cancel-pending buffer))
       (erase-buffer)
-      (mdview-render-document (mdview-parse-string text)
-                              :width width :base-dir mdview--base-dir)
+      (mdview-render-document document :width width :base-dir mdview--base-dir)
       (setq mdview--last-width width)
       (setq imenu--index-alist nil)
       (set-buffer-modified-p nil)
@@ -300,7 +411,8 @@ or, when LINE is nil, at the block that was at point before."
       (goto-char (point-min))
       (when line (mdview--goto-source-line line))
       (dolist (window (get-buffer-window-list buffer nil t))
-        (set-window-point window (point))))))
+        (set-window-point window (point)))
+      (mdview--restore-window-starts starts))))
 
 (defun mdview-render-string (string &optional width base-dir)
   "Render the Markdown STRING and return the result as a propertized string.
@@ -334,29 +446,42 @@ WIDTH is the content width in columns (default: `mdview-max-width' or
                          source)))
               (buffer-list)))
 
+(defun mdview--view-shows-p (view buffer file)
+  "Return non-nil when VIEW's current source is BUFFER or FILE."
+  (or (and buffer
+           (eq (buffer-local-value 'mdview--source-buffer view) buffer))
+      (and file
+           (equal (buffer-local-value 'mdview--source-file view) file))))
+
+(defun mdview--view-showed-p (view buffer file)
+  "Return non-nil when BUFFER or FILE occurs in the history of VIEW."
+  (seq-some (lambda (entry)
+              (let ((source (car entry)))
+                (or (and buffer (eq source buffer))
+                    (and file (equal source file)))))
+            (buffer-local-value 'mdview--history view)))
+
 (defun mdview--find-view (buffer file)
-  "Return the live view rendered from BUFFER or from FILE, or nil."
-  (seq-find (lambda (view)
-              (and (mdview--view-p view)
-                   (or (and buffer
-                            (eq (buffer-local-value 'mdview--source-buffer view)
-                                buffer))
-                       (and file
-                            (equal (buffer-local-value 'mdview--source-file view)
-                                   file)))))
-            (buffer-list)))
+  "Return the live view rendered from BUFFER or from FILE, or nil.
+A view currently showing that source is preferred; failing that, a view
+that showed it earlier in its history (and then followed a link to
+another document) is returned, so that toggling from the same source
+comes back to the same view instead of creating a second one."
+  (let ((views (seq-filter #'mdview--view-p (buffer-list))))
+    (or (seq-find (lambda (view) (mdview--view-shows-p view buffer file)) views)
+        (seq-find (lambda (view) (mdview--view-showed-p view buffer file)) views))))
 
 (defun mdview--source-name (buffer file)
-  "Return the display name of a source given its BUFFER and FILE."
-  (cond (file (file-name-nondirectory file))
-        ((buffer-live-p buffer) (buffer-name buffer))
-        (t "?")))
+  "Return the display name of a source given its BUFFER and FILE.
+The result is never empty."
+  (let ((name (cond (file (file-name-nondirectory (directory-file-name file)))
+                    ((buffer-live-p buffer) (buffer-name buffer)))))
+    (if (and name (not (string-empty-p name))) name "?")))
 
 (defun mdview--set-source (buffer file)
   "Make BUFFER and/or FILE (either may be nil) the source of this view.
-Updates the base directory, `default-directory', the save hook of the
-source buffer and the name of the view buffer."
-  (mdview--remove-save-hook)
+Updates the base directory, `default-directory' and the name of the view
+buffer."
   (setq mdview--source-buffer buffer
         mdview--source-file (and file (expand-file-name file))
         mdview--base-dir (cond (file (file-name-directory (expand-file-name file)))
@@ -364,7 +489,6 @@ source buffer and the name of the view buffer."
                                 (buffer-local-value 'default-directory buffer))
                                (t default-directory)))
   (setq default-directory mdview--base-dir)
-  (mdview--install-save-hook)
   (let ((name (mdview--buffer-name (mdview--source-name buffer file))))
     (unless (equal (buffer-name) name)
       (rename-buffer name t))))
@@ -387,12 +511,40 @@ An existing view of the same source is reused; a new one is put in
     view))
 
 (defun mdview--display (view)
-  "Show VIEW with `mdview-display-action' and remember where it came from."
-  (let ((origin (selected-window)))
-    (funcall mdview-display-action view)
-    (with-current-buffer view
-      (setq mdview--source-window
-            (and (eq (window-buffer origin) view) origin)))))
+  "Show VIEW and remember where it came from.
+When VIEW is already visible in a window of the selected frame, that
+window is selected, so toggling from a source shown next to its view
+keeps both visible.  Otherwise `mdview-display-action' shows it, and
+when that replaced the buffer of the selected window, the window and
+the buffer are remembered for `mdview-quit'."
+  (let ((window (get-buffer-window view)))
+    (if window
+        (select-window window)
+      (let* ((origin (selected-window))
+             (buffer (let ((source (buffer-local-value 'mdview--source-buffer view)))
+                       (if (buffer-live-p source) source (window-buffer origin)))))
+        (funcall mdview-display-action view)
+        (with-current-buffer view
+          (let ((replaced (eq (window-buffer origin) view)))
+            (setq mdview--source-window (and replaced origin)
+                  mdview--origin-buffer (and replaced buffer))))))))
+
+(defun mdview--show (view line)
+  "Display VIEW and render it with point at source LINE; return VIEW.
+When the very first rendering of a new view fails, the view is killed
+and the windows restored before the error is signalled again, so that
+no empty view is left on display."
+  (let ((fresh (null (buffer-local-value 'mdview--last-width view)))
+        (configuration (current-window-configuration)))
+    (mdview--display view)
+    (condition-case err
+        (mdview--render-into view line)
+      (error
+       (when fresh
+         (set-window-configuration configuration)
+         (kill-buffer view))
+       (signal (car err) (cdr err))))
+    view))
 
 (defun mdview--ensure-source-buffer ()
   "Return the live source buffer of this view, visiting the file if needed."
@@ -406,37 +558,23 @@ An existing view of the same source is reused; a new one is put in
 ;;;; Hooks: saving the source, killing the view, resizing the window
 
 (defun mdview--after-save ()
-  "Re-render the views of the buffer that was just saved.
-Runs from the buffer-local `after-save-hook' of a source buffer."
+  "Re-render the views of the buffer that was just saved, if any.
+Runs from the global `after-save-hook' (installed by `mdview-mode') and
+does nothing for buffers that are not the source of a view."
   (when mdview-refresh-on-save
     (dolist (view (mdview--views-of (current-buffer)))
       (condition-case err
           (mdview--render-into view)
         (error (message "mdview: %s" (error-message-string err)))))))
 
-(defun mdview--install-save-hook ()
-  "Install `mdview--after-save' in the source buffer of this view."
-  (when (buffer-live-p mdview--source-buffer)
-    (with-current-buffer mdview--source-buffer
-      (add-hook 'after-save-hook #'mdview--after-save nil t))))
-
-(defun mdview--remove-save-hook ()
-  "Remove `mdview--after-save' from the source unless another view needs it."
-  (let ((source mdview--source-buffer)
-        (view (current-buffer)))
-    (when (and (buffer-live-p source)
-               (not (seq-some (lambda (other) (not (eq other view)))
-                              (mdview--views-of source))))
-      (with-current-buffer source
-        (remove-hook 'after-save-hook #'mdview--after-save t)))))
-
 (defun mdview--on-kill ()
   "Clean up when a view buffer is killed."
   (mdview--cancel-refit)
-  (mdview--remove-save-hook)
+  (mdview--cancel-image-update)
   (when (fboundp 'mdview-image-cancel-pending)
     (mdview-image-cancel-pending (current-buffer) t))
-  (setq mdview--source-buffer nil))
+  (setq mdview--source-buffer nil
+        mdview--document nil))
 
 (defun mdview--cancel-refit ()
   "Cancel the pending refit timer of this view, if any."
@@ -456,17 +594,70 @@ Runs from the buffer-local `window-size-change-functions'."
                 (run-with-idle-timer mdview-refit-delay nil
                                      #'mdview--refit buffer)))))))
 
-(defun mdview--refit (buffer)
+(defun mdview--refit (buffer &optional line)
   "Re-render the view BUFFER if its content width changed.
-Return non-nil when a rendering happened."
+Point goes to the block of source LINE, or stays on the current block
+when LINE is nil.  The rendering is abandoned as soon as the user types
+and rescheduled for the next idle period (with LINE remembered), so a
+resize never locks Emacs up; a failure is reported in the echo area
+once rather than on every resize.  Return non-nil when a rendering
+completed."
   (when (mdview--view-p buffer)
     (with-current-buffer buffer
       (setq mdview--refit-timer nil)
       (let ((window (get-buffer-window buffer t)))
         (when (and window
                    (not (eql (mdview--content-width window) mdview--last-width)))
-          (mdview--render-into buffer)
-          t)))))
+          (let ((line (or line (mdview--source-line-at (mdview--view-point)))))
+            (condition-case err
+                (if (while-no-input (mdview--render-into buffer line) nil)
+                    (progn
+                      (setq mdview--refit-timer
+                            (run-with-idle-timer mdview-refit-delay nil
+                                                 #'mdview--refit buffer line))
+                      nil)
+                  t)
+              (error
+               ;; Do not retry at this width on every subsequent resize.
+               (setq mdview--last-width (mdview--content-width window))
+               (message "mdview: %s" (error-message-string err))
+               nil))))))))
+
+(defun mdview--cancel-image-update ()
+  "Cancel the pending image re-rendering timer of this view, if any."
+  (when mdview--image-update-timer
+    (cancel-timer mdview--image-update-timer)
+    (setq mdview--image-update-timer nil)))
+
+(defun mdview--on-images-updated (buffer)
+  "Schedule a re-rendering of the view BUFFER after remote images arrived.
+Runs from `mdview-image-update-functions' (installed by `mdview-mode')
+and ignores buffers that are not views.  The image module replaces a
+placeholder in place, which keeps the width of its line but cannot
+re-wrap a paragraph around an inline image, so the view is rendered
+again from the cached document (the image bytes are cached as well)
+once Emacs has been idle for `mdview-refit-delay'; images arriving close
+together share one rendering."
+  (when (mdview--view-p buffer)
+    (with-current-buffer buffer
+      (mdview--cancel-image-update)
+      (setq mdview--image-update-timer
+            (run-with-idle-timer mdview-refit-delay nil
+                                 #'mdview--rerender-for-images buffer)))))
+
+(defun mdview--rerender-for-images (buffer)
+  "Re-render the view BUFFER so that its text re-flows around its images.
+Nothing happens when images are switched off in the view.  Like a refit
+the rendering is abandoned and rescheduled when the user types, and a
+failure is reported once in the echo area."
+  (when (mdview--view-p buffer)
+    (with-current-buffer buffer
+      (setq mdview--image-update-timer nil)
+      (when mdview--images-enabled
+        (condition-case err
+            (when (while-no-input (mdview--render-into buffer) nil)
+              (mdview--on-images-updated buffer))
+          (error (message "mdview: %s" (error-message-string err))))))))
 
 (defun mdview--revert-buffer (&rest _)
   "Re-render the view; the `revert-buffer-function' of `mdview-mode'."
@@ -715,6 +906,41 @@ resolve against the view's base directory."
                           (mdview--face-member-p (cdr face) target)))
         (t nil)))
 
+(defun mdview--image-url-at (pos)
+  "Return the URL of the image shown at POS when it is known, else nil.
+The image module records it as the text property `mdview-image-url' or,
+on pending placeholders, on their overlay; for a displayed local image
+the file of its `display' spec is returned (an absolute name)."
+  (or (get-text-property pos 'mdview-image-url)
+      (seq-some (lambda (overlay) (overlay-get overlay 'mdview-image-url))
+                (overlays-at pos))
+      (let* ((display (get-text-property pos 'display))
+             (spec (cond ((eq (car-safe display) 'image) display)
+                         ((consp display)
+                          (seq-find (lambda (item) (eq (car-safe item) 'image))
+                                    display))))
+             (file (and spec (plist-get (cdr spec) :file))))
+        (and file (expand-file-name file)))))
+
+(defun mdview--image-link-p (pos url)
+  "Return non-nil when URL, the link at POS, is the image shown there.
+An image wrapped in a link carries the link's URL instead of its own,
+and following it must behave like following a text link.  When the
+image's own URL is not recorded, anchors and Markdown files are taken
+to be link targets, since they cannot be images."
+  (let ((image (mdview--image-url-at pos))
+        (path (car (mdview--split-fragment url))))
+    (cond (image (or (equal url image)
+                     (and (file-name-absolute-p image)
+                          (not (mdview--external-url-p url))
+                          (not (string-empty-p path))
+                          (equal (mdview--local-file path) image))))
+          ((string-prefix-p "#" url) nil)
+          ((and (not (mdview--external-url-p url))
+                (mdview--markdown-file-p path))
+           nil)
+          (t t))))
+
 (defun mdview--goto-footnote (property index what)
   "Move to the first text whose PROPERTY equals INDEX; WHAT names it."
   (let ((target (save-excursion
@@ -739,12 +965,9 @@ Return the view buffer."
   (let ((source (get-buffer (or buffer (current-buffer)))))
     (if (mdview--view-p source)
         (with-current-buffer source (mdview-refresh) source)
-      (let* ((line (with-current-buffer source (line-number-at-pos)))
-             (file (buffer-file-name (or (buffer-base-buffer source) source)))
-             (view (mdview--make-view source file)))
-        (mdview--display view)
-        (mdview--render-into view line)
-        view))))
+      (let ((line (with-current-buffer source (line-number-at-pos)))
+            (file (buffer-file-name (or (buffer-base-buffer source) source))))
+        (mdview--show (mdview--make-view source file) line)))))
 
 ;;;###autoload
 (defun mdview-file (file)
@@ -756,14 +979,13 @@ view buffer."
   (interactive "fMarkdown file: ")
   (let* ((file (expand-file-name file))
          (buffer (find-buffer-visiting file)))
+    (when (file-directory-p file)
+      (user-error "%s is a directory, not a Markdown file" file))
     (unless (file-readable-p file)
       (user-error "Cannot read %s" file))
     (if buffer
         (mdview buffer)
-      (let ((view (mdview--make-view nil file)))
-        (mdview--display view)
-        (mdview--render-into view 1)
-        view))))
+      (mdview--show (mdview--make-view nil file) 1))))
 
 ;;;###autoload
 (defun mdview-toggle ()
@@ -776,29 +998,41 @@ the block at point, visiting the source file when no buffer holds it."
       (mdview-visit-source)
     (mdview)))
 
+(defun mdview--check-view ()
+  "Signal a `user-error' unless the current buffer is an mdview view."
+  (unless (derived-mode-p 'mdview-mode)
+    (user-error "Not in an mdview buffer (use M-x mdview to render this one)")))
+
 (defun mdview-refresh ()
   "Re-render the view from its source, keeping the current block."
   (interactive)
+  (mdview--check-view)
   (mdview--render-into (current-buffer)))
 
 (defun mdview-quit ()
   "Quit the view.
-When the view replaced its source buffer in the selected window, show
-the source there again; otherwise use `quit-window'."
+When the view replaced another buffer in the selected window (the
+Markdown buffer it was opened from, even after links to other documents
+were followed), show that buffer there again; otherwise use
+`quit-window'."
   (interactive)
   (let ((view (current-buffer))
-        (source mdview--source-buffer))
+        (back (if (buffer-live-p mdview--origin-buffer)
+                  mdview--origin-buffer
+                mdview--source-buffer)))
     (if (and (eq (selected-window) mdview--source-window)
-             (buffer-live-p source))
+             (buffer-live-p back))
         (progn
-          (setq mdview--source-window nil)
-          (pop-to-buffer-same-window source)
+          (setq mdview--source-window nil
+                mdview--origin-buffer nil)
+          (pop-to-buffer-same-window back)
           (bury-buffer view))
       (quit-window))))
 
 (defun mdview-visit-source ()
   "Visit the source of this view at the line of the block at point."
   (interactive)
+  (mdview--check-view)
   (let* ((line (mdview--source-line-at (point)))
          (buffer (mdview--ensure-source-buffer))
          (window (get-buffer-window buffer)))
@@ -836,8 +1070,9 @@ the source there again; otherwise use `quit-window'."
 Anchors move to the heading and scroll it to the top; Markdown files
 are rendered in this view (see `mdview-history-back'); other local
 files are visited with `find-file-other-window'; external URLs go to
-`browse-url'; images open with `mdview-image-open'; footnote references
-and definitions jump to each other."
+`browse-url'; images open with `mdview-image-open', except that an
+image wrapped in a link follows the link like text would; footnote
+references and definitions jump to each other."
   (interactive)
   (let* ((pos (or pos (point)))
          (ref (get-text-property pos 'mdview-footnote-ref))
@@ -845,7 +1080,7 @@ and definitions jump to each other."
          (url (get-text-property pos 'mdview-link)))
     (cond (ref (mdview--goto-footnote 'mdview-footnote-def ref "definition"))
           (def (mdview--goto-footnote 'mdview-footnote-ref def "reference"))
-          ((and url (mdview--image-at-p pos))
+          ((and url (mdview--image-at-p pos) (mdview--image-link-p pos url))
            (mdview-image-open url mdview--base-dir))
           (url (mdview--open-url url))
           (t (user-error "No link at point")))))
@@ -875,49 +1110,86 @@ and definitions jump to each other."
     (unless previous (user-error "No previous heading"))
     (goto-char (nth 0 previous))))
 
+(defun mdview--toc-default (index)
+  "Return the label in the imenu INDEX of the heading at or before point."
+  (let ((best nil))
+    (dolist (entry index)
+      (when (and (<= (cdr entry) (point))
+                 (or (null best) (> (cdr entry) (cdr best))))
+        (setq best entry)))
+    (car best)))
+
 (defun mdview--toc-completing-read (index)
-  "Prompt for a heading from the imenu INDEX and move point to it."
-  (let ((choice (completing-read "Heading: " index nil t)))
-    (goto-char (cdr (assoc choice index)))))
+  "Prompt for a heading from the imenu INDEX and move point to it.
+The heading at or before point is offered as the default."
+  (let* ((default (mdview--toc-default index))
+         (choice (completing-read (format-prompt "Heading" default)
+                                  index nil t nil nil default))
+         (target (assoc choice index)))
+    (unless target (user-error "No such heading: %s" choice))
+    (goto-char (cdr target))))
 
 (defun mdview-toc ()
   "Jump to a heading chosen from the table of contents.
-Uses `imenu'; should that fail, a plain completion prompt is offered."
+The headings are offered with completion under their own names, the
+one at point being the default.  When `imenu-use-popup-menu' is
+`always' and the display has menus, the `imenu' menu is used instead
+\(falling back to completion should it fail)."
   (interactive)
   (let ((index (mdview--imenu-create-index)))
     (unless index (user-error "No headings in this document"))
     (setq imenu--index-alist nil)
-    (condition-case nil
-        (let ((imenu-auto-rescan t)
-              (imenu-use-popup-menu (and (eq imenu-use-popup-menu 'always)
-                                         'always)))
-          (call-interactively #'imenu))
-      (error (mdview--toc-completing-read index)))))
+    (if (and (eq imenu-use-popup-menu 'always) (display-popup-menus-p))
+        (condition-case nil
+            (let ((imenu-auto-rescan t))
+              (call-interactively #'imenu))
+          (error (mdview--toc-completing-read index)))
+      (mdview--toc-completing-read index))))
 
 (defun mdview-history-back ()
   "Show the previous document of this view's history."
   (interactive)
+  (mdview--check-view)
   (mdview--history-move -1))
 
 (defun mdview-history-forward ()
   "Show the next document of this view's history."
   (interactive)
+  (mdview--check-view)
   (mdview--history-move 1))
 
 (defun mdview-toggle-images ()
   "Toggle the display of images in this view and re-render it."
   (interactive)
+  (mdview--check-view)
   (setq mdview--images-enabled (not mdview--images-enabled))
   (mdview--render-into (current-buffer))
   (message "Images %s" (if mdview--images-enabled "shown" "hidden")))
 
-(defun mdview-copy-link ()
-  "Copy the URL of the link at point to the kill ring."
-  (interactive)
+(defun mdview--resolved-link (url)
+  "Return URL with the path of a local link made absolute.
+Anchors, external URLs and empty paths are returned unchanged; the
+#anchor part of a local link is kept."
+  (if (or (string-prefix-p "#" url) (mdview--external-url-p url))
+      url
+    (pcase-let ((`(,path . ,anchor) (mdview--split-fragment url)))
+      (if (string-empty-p path)
+          url
+        (concat (mdview--local-file path)
+                (and anchor (concat "#" anchor)))))))
+
+(defun mdview-copy-link (&optional raw)
+  "Copy the URL of the link at point to the kill ring.
+A link to a local file is copied as the absolute file name it resolves
+to (with any #anchor kept), because the relative form written in the
+document is only meaningful next to it.  With a prefix argument RAW the
+URL is copied exactly as written; anchors and external URLs always are."
+  (interactive "P")
   (let ((url (get-text-property (point) 'mdview-link)))
     (unless url (user-error "No link at point"))
-    (kill-new url)
-    (message "Copied %s" url)))
+    (let ((text (if raw url (mdview--resolved-link url))))
+      (kill-new text)
+      (message "Copied %s" text))))
 
 ;;;###autoload
 (defun mdview-version (&optional show)

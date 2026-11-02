@@ -16,8 +16,12 @@
 ;; cell into the list of inline nodes of the AST contract.
 ;;
 ;; The algorithm is the one of the CommonMark reference implementations:
-;; the text is scanned left to right in a temporary buffer (every regexp
-;; is anchored with `looking-at', so a failed match never scans ahead);
+;; the text is scanned left to right in a hidden buffer reused across
+;; calls (every regexp is anchored with `looking-at', so a failed match
+;; never scans ahead; searches for code span closers and HTML
+;; terminators are memoized per parse as cmark does, and the link
+;; destination scanner gives up after 32 unclosed parens, so that
+;; pathological input stays linear-ish);
 ;; code spans, autolinks, raw HTML, entities and escapes are recognised
 ;; directly; `*', `_' and `~' runs become delimiters on a stack and `['
 ;; openers go on a bracket stack; when a `]' closes a link or image the
@@ -26,7 +30,9 @@
 ;; rules, the multiple-of-3 rule, `_' intraword rule).  Nodes live in a
 ;; doubly linked list while parsing so that moving ranges is cheap; the
 ;; result is converted to the plain (TYPE PLIST . CHILDREN) shape at the
-;; end, merging adjacent text.
+;; end, merging adjacent text; nesting deeper than
+;; `mdview-inline-max-depth' degrades the whole text to one text node so
+;; that no consumer of the tree can exhaust the Lisp stack.
 ;;
 ;; GFM extensions: strikethrough (`~' and `~~', runs of equal length
 ;; match), footnote references `[^label]' (the block parser numbers them
@@ -47,6 +53,17 @@ and e-mail addresses in running text, following the rules of the GitHub
 Flavored Markdown specification.  Angle-bracket autolinks are always
 recognised."
   :type 'boolean
+  :group 'mdview)
+
+(defcustom mdview-inline-max-depth 100
+  "Maximum nesting depth of inline nodes.
+When emphasis, links and images nest more deeply than this,
+`mdview-inline-parse' returns its input as a single text node instead
+of a tree.  The cap bounds the Lisp recursion of the conversion to the
+AST, of the block parser's passes over the tree and of the renderer on
+adversarial input such as thousands of nested `*' runs; markdown-it,
+the parser behind Frogmouth, limits nesting to 100 as well."
+  :type 'natnum
   :group 'mdview)
 
 ;;;; Working data structures
@@ -84,6 +101,27 @@ PREV-DELIM the delimiter stack top when the bracket was pushed."
 
 (defvar mdview-inline--refs nil
   "The link reference map of the current parse (label to (URL . TITLE)).")
+
+(defvar mdview-inline--buffer nil
+  "The hidden buffer the inline parser scans in, reused across calls.
+Creating and killing a temporary buffer for every paragraph, heading
+and table cell was the largest single cost of parsing big documents.")
+
+(defvar mdview-inline--absent-terminators nil
+  "Terminators known not to occur after point in the current parse.
+`mdview-inline--search-terminator' records every string (\"-->\",
+\"]]>\", \">\", \"?>\") a search failed to find, so a text full of
+unclosed comments or declarations is not rescanned for each of them.")
+
+(defvar mdview-inline--backtick-last nil
+  "Hash table from backtick run length to the start of the last run seen.
+Filled while scanning for the closer of a code span; nil until the
+first backtick of the parse.  See `mdview-inline--parse-backticks'.")
+
+(defvar mdview-inline--backticks-scanned nil
+  "Non-nil once a scan for a code span closer reached the end of the text.
+Together with `mdview-inline--backtick-last' this makes the search for
+closers linear overall, as in cmark.")
 
 ;;;; Linked-list operations
 
@@ -233,6 +271,16 @@ parser's `:refs' table."
                     (throw 'done nil)))))
              (t (throw 'done nil)))))))))
 
+(defun mdview-inline--search-terminator (terminator)
+  "Search forward for TERMINATOR; return the position after it, or nil.
+A failed search is remembered in `mdview-inline--absent-terminators'
+for the rest of the parse: every later candidate lies further on, so
+the terminator cannot follow it either and it is answered without
+scanning the text again."
+  (unless (member terminator mdview-inline--absent-terminators)
+    (or (and (search-forward terminator nil t) (point))
+        (progn (push terminator mdview-inline--absent-terminators) nil))))
+
 (defun mdview-inline--scan-html ()
   "Scan a raw HTML construct at point (a `<'); return its end or nil."
   (let ((c (char-after (1+ (point)))))
@@ -243,16 +291,16 @@ parser's `:refs' table."
        ((looking-at "<!-->\\|<!--->") (match-end 0))
        ((looking-at "<!--")
         (save-excursion (goto-char (match-end 0))
-                        (and (search-forward "-->" nil t) (point))))
+                        (mdview-inline--search-terminator "-->")))
        ((looking-at "<!\\[CDATA\\[")
         (save-excursion (goto-char (match-end 0))
-                        (and (search-forward "]]>" nil t) (point))))
+                        (mdview-inline--search-terminator "]]>")))
        ((looking-at "<![A-Za-z]")
         (save-excursion (goto-char (match-end 0))
-                        (and (search-forward ">" nil t) (point))))))
+                        (mdview-inline--search-terminator ">")))))
      ((eq c ??)
       (save-excursion (forward-char 2)
-                      (and (search-forward "?>" nil t) (point))))
+                      (mdview-inline--search-terminator "?>")))
      ((eq c ?/)
       (and (looking-at "</[A-Za-z][A-Za-z0-9-]*[ \t\n]*>") (match-end 0)))
      ((or (<= ?a c ?z) (<= ?A c ?Z))
@@ -305,7 +353,11 @@ Point moves past the destination on success."
            ((and (eq c ?\\) (< (1+ (point)) (point-max))
                  (mdview-inline--escapable-p (char-after (1+ (point)))))
             (forward-char 2))
-           ((eq c ?\() (setq parens (1+ parens)) (forward-char))
+           ((eq c ?\()
+            ;; Like cmark, give up after 32 unclosed parens so that a
+            ;; failing scan never walks to the end of a long line.
+            (setq parens (1+ parens))
+            (if (> parens 32) (setq done t) (forward-char)))
            ((eq c ?\))
             (if (< parens 1) (setq done t)
               (setq parens (1- parens)) (forward-char)))
@@ -361,15 +413,27 @@ Point moves past the destination on success."
      (t (mdview-inline--add-text root "\\")))))
 
 (defun mdview-inline--parse-backticks (root)
-  "Parse the backtick run at point under ROOT: a code span or literal text."
+  "Parse the backtick run at point under ROOT: a code span or literal text.
+The search for the closing run is memoized as in cmark: every run met
+while scanning is recorded in `mdview-inline--backtick-last', and once
+a scan has reached the end of the text an opener with no later run of
+its length is rejected without scanning again."
   (let ((start (point)))
     (skip-chars-forward "`")
     (let* ((after-open (point))
            (len (- after-open start))
            (found nil))
-      (while (and (not found) (re-search-forward "`+" nil t))
-        (when (= (- (match-end 0) (match-beginning 0)) len)
-          (setq found (match-beginning 0))))
+      (unless mdview-inline--backtick-last
+        (setq mdview-inline--backtick-last (make-hash-table :test #'eql)))
+      (unless (and mdview-inline--backticks-scanned
+                   (<= (gethash len mdview-inline--backtick-last 0) start))
+        (while (and (not found) (re-search-forward "`+" nil t))
+          (let ((n (- (match-end 0) (match-beginning 0))))
+            (puthash n (match-beginning 0) mdview-inline--backtick-last)
+            (when (= n len)
+              (setq found (match-beginning 0)))))
+        (unless found
+          (setq mdview-inline--backticks-scanned t)))
       (if (not found)
           (progn (goto-char after-open)
                  (mdview-inline--add-text
@@ -639,7 +703,11 @@ collapsed `[]' and shortcut forms using the bracketed text.  Return
          (label (cond
                  ((> n 2)
                   (buffer-substring-no-properties (1+ before) (+ before n -1)))
-                 ((not (mdview-inline--bracket-after opener))
+                 ((and (not (mdview-inline--bracket-after opener))
+                       ;; Like a scanned label, the bracketed text is a
+                       ;; label only when it holds at most 999 characters.
+                       (<= (- close-pos (mdview-inline--bracket-index opener))
+                           999))
                   (buffer-substring-no-properties
                    (mdview-inline--bracket-index opener) close-pos)))))
     (when (= n 0) (goto-char save))
@@ -673,8 +741,12 @@ so that links never nest."
     (mdview-inline--remove-bracket)
     (mdview-inline--unlink opener-node)
     (unless image
+      ;; Deactivation is monotone: when a link opener was deactivated,
+      ;; every older one was too, so the walk stops at the first
+      ;; inactive opener instead of visiting the whole stack each time.
       (let ((b mdview-inline--brackets))
-        (while b
+        (while (and b (or (mdview-inline--bracket-image b)
+                          (mdview-inline--bracket-active b)))
           (unless (mdview-inline--bracket-image b)
             (setf (mdview-inline--bracket-active b) nil))
           (setq b (mdview-inline--bracket-prev b)))))))
@@ -727,8 +799,14 @@ requires at least one period (the `www.' form)."
 (defun mdview-inline--trim-autolink-end (string start end)
   "Return the end of the autolink in STRING from START, trimming after END.
 Trailing punctuation, an unbalanced closing paren and a trailing entity
-reference are excluded per the GFM rules."
-  (let ((changed t))
+reference are excluded per the GFM rules.  The parentheses are counted
+once and the count is kept up to date while trimming, so a URL followed
+by thousands of `)' is handled in linear time."
+  (let ((opens 0) (closes 0) (i start) (changed t))
+    (while (< i end)
+      (cond ((eq (aref string i) ?\() (setq opens (1+ opens)))
+            ((eq (aref string i) ?\)) (setq closes (1+ closes))))
+      (setq i (1+ i)))
     (while (and changed (> end start))
       (setq changed nil)
       (let ((c (aref string (1- end))))
@@ -736,13 +814,8 @@ reference are excluded per the GFM rules."
          ((memq c '(?? ?! ?. ?, ?: ?* ?_ ?~ ?' ?\"))
           (setq end (1- end) changed t))
          ((eq c ?\))
-          (let ((opens 0) (closes 0) (i start))
-            (while (< i end)
-              (cond ((eq (aref string i) ?\() (setq opens (1+ opens)))
-                    ((eq (aref string i) ?\)) (setq closes (1+ closes))))
-              (setq i (1+ i)))
-            (when (> closes opens)
-              (setq end (1- end) changed t))))
+          (when (> closes opens)
+            (setq closes (1- closes) end (1- end) changed t)))
          ((eq c ?\;)
           (let ((i (1- end)))
             (while (and (> i start)
@@ -754,19 +827,36 @@ reference are excluded per the GFM rules."
               (setq end (1- i) changed t)))))))
     end))
 
+(defun mdview-inline--prefix-at-p (prefix string start)
+  "Return non-nil when PREFIX occurs in STRING at index START.
+Unlike an unanchored `string-match' this never scans past the prefix."
+  (eq t (compare-strings prefix nil nil string start (+ start (length prefix)))))
+
 (defun mdview-inline--match-url-autolink (string start)
   "Match a bare URL at START of STRING; return (END . URL) or nil."
   (let* ((len (length string))
-         (www (eq (string-match "www\\." string start) start))
+         (www (mdview-inline--prefix-at-p "www." string start))
          (scheme-end (cond (www start)
-                           ((eq (string-match "https?://\\|ftp://" string start) start)
-                            (match-end 0)))))
+                           ((mdview-inline--prefix-at-p "https://" string start)
+                            (+ start 8))
+                           ((mdview-inline--prefix-at-p "http://" string start)
+                            (+ start 7))
+                           ((mdview-inline--prefix-at-p "ftp://" string start)
+                            (+ start 6)))))
     (when scheme-end
-      (let ((i scheme-end))
+      (let ((i scheme-end)
+            (domain-start (if www (+ start 4) scheme-end)))
         (while (and (< i len) (mdview-inline--domain-char-p (aref string i)))
           (setq i (1+ i)))
-        (let ((domain (substring string (if www (+ start 4) scheme-end) i)))
-          (when (mdview-inline--valid-domain-p domain www)
+        ;; A period right after the domain ends the sentence rather than
+        ;; a segment ("see www.example.org."): leave it to the trailing
+        ;; punctuation rule, as cmark-gfm does.
+        (let ((domain-end i))
+          (while (and (> domain-end domain-start)
+                      (eq (aref string (1- domain-end)) ?.))
+            (setq domain-end (1- domain-end)))
+          (when (mdview-inline--valid-domain-p
+                 (substring string domain-start domain-end) www)
             (while (and (< i len)
                         (not (memq (aref string i) '(?\s ?\t ?\n ?<))))
               (setq i (1+ i)))
@@ -808,9 +898,11 @@ reference are excluded per the GFM rules."
       (setq i (string-match "www\\.\\|https?://\\|ftp://" string (1+ i))))
     i))
 
-(defun mdview-inline--next-email-candidate (string from)
-  "Return the first index at or after FROM of STRING where an address may start."
-  (let ((at (string-search "@" string from)) (result nil))
+(defun mdview-inline--next-email-candidate (string from at-from)
+  "Return the first index at or after FROM of STRING where an address may start.
+The `@' is looked for from AT-FROM on; the local part before it is
+followed back no further than FROM."
+  (let ((at (string-search "@" string (max from at-from))) (result nil))
     (while (and at (not result))
       (let ((b at))
         (while (and (> b from) (mdview-inline--local-part-char-p (aref string (1- b))))
@@ -823,19 +915,20 @@ reference are excluded per the GFM rules."
 (defun mdview-inline--autolink-split (string)
   "Split STRING into text and link nodes at bare URLs and addresses."
   (let ((len (length string)) (pos 0) (text-start 0) (out nil)
-        (url-cand -1) (email-cand -1))
+        (url-cand -1) (email-cand -1) (at-from 0))
     (while (< pos len)
       (when (and url-cand (< url-cand pos))
         (setq url-cand (mdview-inline--next-url-candidate string pos)))
       (when (and email-cand (< email-cand pos))
-        (setq email-cand (mdview-inline--next-email-candidate string pos)))
+        (setq email-cand (mdview-inline--next-email-candidate string pos at-from)))
       (let ((cand (cond ((and url-cand email-cand) (min url-cand email-cand))
                         (t (or url-cand email-cand)))))
         (if (null cand)
             (setq pos len)
-          (let ((hit (if (and url-cand (= cand url-cand))
-                         (mdview-inline--match-url-autolink string cand)
-                       (mdview-inline--match-email-autolink string cand))))
+          (let* ((email (not (and url-cand (= cand url-cand))))
+                 (hit (if email
+                          (mdview-inline--match-email-autolink string cand)
+                        (mdview-inline--match-url-autolink string cand))))
             (if hit
                 (progn
                   (when (> cand text-start)
@@ -845,6 +938,12 @@ reference are excluded per the GFM rules."
                                      (substring string cand (car hit)))
                         out)
                   (setq pos (car hit) text-start pos))
+              (when email
+                ;; The address failed on its domain, which is the same for
+                ;; every start inside this local part: look for the next
+                ;; `@' beyond the one just tried instead of retrying from
+                ;; each character of the local part.
+                (setq at-from (1+ (string-search "@" string cand))))
               (setq pos (1+ cand)))))))
     (when (< text-start len)
       (push (substring string text-start) out))
@@ -852,9 +951,10 @@ reference are excluded per the GFM rules."
 
 ;;;; Conversion to the AST
 
-(defun mdview-inline--convert (node in-link)
+(defun mdview-inline--convert (node in-link depth)
   "Return the AST node for the finished parse NODE.
-IN-LINK non-nil means inside a link or image, where bare URLs stay text."
+IN-LINK non-nil means inside a link or image, where bare URLs stay text.
+DEPTH is the nesting depth of NODE (1 for a child of the root)."
   (let ((type (mdview-inline--node-type node))
         (props (mdview-inline--node-props node)))
     (pcase type
@@ -862,16 +962,21 @@ IN-LINK non-nil means inside a link or image, where bare URLs stay text."
       ('html-inline (mdview-node 'html-inline nil (mdview-inline--node-text node)))
       ((or 'hard-break 'soft-break 'footnote-reference) (mdview-node type props))
       ('image
-       (let ((children (mdview-inline--children node t)))
+       (let ((children (mdview-inline--children node t depth)))
          (apply #'mdview-node 'image
                 (append props (list :alt (mapconcat #'mdview-node-text children "")))
                 children)))
-      ('link (apply #'mdview-node 'link props (mdview-inline--children node t)))
-      (_ (apply #'mdview-node type props (mdview-inline--children node in-link))))))
+      ('link (apply #'mdview-node 'link props (mdview-inline--children node t depth)))
+      (_ (apply #'mdview-node type props
+                (mdview-inline--children node in-link depth))))))
 
-(defun mdview-inline--children (node in-link)
+(defun mdview-inline--children (node in-link depth)
   "Return the AST children of container NODE, merging adjacent text.
-IN-LINK is passed on to `mdview-inline--convert'."
+IN-LINK is passed on to `mdview-inline--convert'.  DEPTH is the nesting
+depth of NODE; beyond `mdview-inline-max-depth' the conversion is
+abandoned by throwing to `mdview-inline--too-deep'."
+  (when (> depth mdview-inline-max-depth)
+    (throw 'mdview-inline--too-deep t))
   (let ((child (mdview-inline--node-first node))
         (pending nil)
         (out nil))
@@ -888,7 +993,7 @@ IN-LINK is passed on to `mdview-inline--convert'."
         (if (eq (mdview-inline--node-type child) 'text)
             (push (mdview-inline--node-text child) pending)
           (flush)
-          (push (mdview-inline--convert child in-link) out))
+          (push (mdview-inline--convert child in-link (1+ depth)) out))
         (setq child (mdview-inline--node-next child)))
       (flush))
     (nreverse out)))
@@ -913,6 +1018,14 @@ IN-LINK is passed on to `mdview-inline--convert'."
      ((eq c ?&) (mdview-inline--parse-entity root))
      (t (mdview-inline--parse-text root)))))
 
+(defun mdview-inline--scratch-buffer ()
+  "Return the hidden buffer the parser scans in, creating it when needed."
+  (unless (buffer-live-p mdview-inline--buffer)
+    (setq mdview-inline--buffer (generate-new-buffer " *mdview-inline*" t))
+    (with-current-buffer mdview-inline--buffer
+      (setq-local case-fold-search nil)))
+  mdview-inline--buffer)
+
 (defun mdview-inline-parse (string refs)
   "Parse the Markdown inline content STRING into a list of inline nodes.
 REFS is the document's link reference map, a hash table from normalized
@@ -921,19 +1034,31 @@ The result follows the inline node contract of docs/DESIGN.md section
 3: plain strings are text (entities decoded, escapes resolved), and
 `emphasis', `strong', `strikethrough', `code', `link', `image',
 `hard-break', `soft-break', `html-inline' and `footnote-reference'
-nodes carry the properties listed there."
+nodes carry the properties listed there.  Nesting deeper than
+`mdview-inline-max-depth' degrades the result to STRING as one text
+node.  The parser is not reentrant: it scans in a single hidden buffer
+that every call reuses."
   (let ((mdview-inline--refs refs)
         (mdview-inline--delims nil)
         (mdview-inline--brackets nil)
+        (mdview-inline--absent-terminators nil)
+        (mdview-inline--backtick-last nil)
+        (mdview-inline--backticks-scanned nil)
         (case-fold-search nil)
-        (root (mdview-inline--make-node :type 'root)))
-    (with-temp-buffer
+        (root (mdview-inline--make-node :type 'root))
+        (result nil))
+    (with-current-buffer (mdview-inline--scratch-buffer)
+      (erase-buffer)
       (insert string)
       (goto-char (point-min))
       (while (not (eobp))
         (mdview-inline--parse-one root))
       (mdview-inline--process-emphasis nil))
-    (mdview-inline--children root nil)))
+    (if (catch 'mdview-inline--too-deep
+          (setq result (mdview-inline--children root nil 0))
+          nil)
+        (list string)
+      result)))
 
 (provide 'mdview-inline)
 ;;; mdview-inline.el ends here

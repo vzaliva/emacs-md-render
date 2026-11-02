@@ -544,6 +544,21 @@
     (should (equal (mapcar #'mdview-node-text (mdview-node-children (cadr (mdview-node-children table))))
                    '("bar" "")))))
 
+(ert-deftest mdview-parse-table-header-candidates-linear ()
+  "Delimiter rows that never match the line above cost linear time.
+Only the paragraph's last line is examined (it is the head of the stored
+lines); joining the paragraph for every candidate was cubic."
+  (let* ((md (apply #'concat (make-list 2000 "a\n|-|-|-\n")))
+         (start (float-time))
+         (types (mdview-parse-test--types md)))
+    (should (< (- (float-time) start) 2))
+    (should (equal types '(paragraph))))
+  ;; Several candidates, then a match: the text before stays a paragraph.
+  (let ((blocks (mdview-parse-test--blocks "a\n|-|-|\nb\n|-|-|\n| c | d |\n|---|---|\n| 1 | 2 |")))
+    (should (equal (mapcar #'mdview-node-type blocks) '(paragraph table)))
+    (should (equal (mdview-parse-test--flat (car blocks)) "a |-|-| b |-|-|"))
+    (should (= (mdview-node-prop (cadr blocks) :line) 5))))
+
 (ert-deftest mdview-parse-table-after-paragraph-and-in-containers ()
   ;; Only the last line of a paragraph becomes the header.
   (let ((blocks (mdview-parse-test--blocks "intro text\n| a | b |\n|---|---|\n| 1 | 2 |")))
@@ -625,6 +640,21 @@
   ;; Only the first paragraph counts.
   (let ((item (car (mdview-node-children (mdview-parse-test--first "- text\n\n  [ ] later")))))
     (should-not (mdview-node-prop item :task))))
+
+(ert-deftest mdview-parse-task-marker-alone ()
+  "A marker with nothing after it is a task too (GitHub issue templates)."
+  (let ((items (mdview-node-children
+                (mdview-parse-test--first "- [x]\n- [ ]\n  - sub\n- [X]  \n- [ ]\n\n  later"))))
+    (should (equal (mapcar (lambda (i) (mdview-node-prop i :task)) items)
+                   '(checked unchecked checked unchecked)))
+    (should (equal (mapcar #'mdview-parse-test--flat items)
+                   '("" "sub" "" "later")))
+    ;; The nested list of the second item is intact.
+    (should (equal (mdview-parse-test--child-types (nth 1 items)) '(paragraph list))))
+  ;; Without a space after `]' it is still ordinary text.
+  (should-not (mdview-node-prop
+               (car (mdview-node-children (mdview-parse-test--first "- [ ]x")))
+               :task)))
 
 ;;;; Link reference definitions
 
@@ -853,6 +883,16 @@
              (slice (substring text (min a b) (max a b))))
         (should (eq (mdview-node-type (mdview-parse-string slice)) 'document))))))
 
+(ert-deftest mdview-parse-reference-destination-paren-nesting-limit ()
+  "A definition's destination may nest parens 32 deep but not 33 (cmark)."
+  (let ((ok (concat "[a]: " (make-string 32 ?\() "b" (make-string 32 ?\)) "\n\n[a]"))
+        (deep (concat "[a]: " (make-string 33 ?\() "b" (make-string 33 ?\)) "\n\n[a]")))
+    (let ((para (mdview-parse-test--first ok)))
+      (should (eq (mdview-node-type (car (mdview-node-children para))) 'link))
+      (should (equal (mdview-node-prop (car (mdview-node-children para)) :url)
+                     (concat (make-string 32 ?\() "b" (make-string 32 ?\))))))
+    (should (equal (mdview-parse-test--types deep) '(paragraph paragraph)))))
+
 (ert-deftest mdview-parse-never-signals-on-adversarial-input ()
   (dolist (md (list (make-string 5000 ?>)
                     (concat (make-string 3000 ?>) " deep")
@@ -872,6 +912,29 @@
                     "---\n---\n---\n" "-\n-\n-\n" "1.\n2.\n" "> \n>\n> >" "```\n" "~~~~\n```\n~~~"
                     "\t\t\t-\t\t\tfoo" "|\n|\n|---|\n|" "[^]: x\n[^ ]: y\n[^a]:" "- [ ]\n- [x]"))
     (should (eq (mdview-node-type (mdview-parse-string md)) 'document))))
+
+(ert-deftest mdview-parse-deep-inline-nesting-never-signals ()
+  "Thousands of nested emphasis runs degrade to text in every pass.
+The inline parser caps nesting, so the footnote pass and the heading id
+pass, which recurse over the tree, cannot overflow the stack."
+  (dolist (n '(5800 5900 5950 5990))
+    (let* ((stars (concat (make-string n ?*) "a" (make-string n ?*)))
+           (doc (mdview-parse-string stars))
+           (para (car (mdview-node-children doc))))
+      (should (eq (mdview-node-type para) 'paragraph))
+      (should (equal (mdview-node-children para) (list stars)))
+      (let ((heading (car (mdview-node-children
+                           (mdview-parse-string (concat "# " stars))))))
+        (should (eq (mdview-node-type heading) 'heading))
+        (should (stringp (mdview-node-prop heading :id))))
+      (should (eq (mdview-node-type
+                   (with-temp-buffer (insert stars "\n\n[^f]\n\n[^f]: n " stars)
+                                     (mdview-parse-buffer)))
+                  'document))))
+  ;; Moderate nesting is still parsed as a tree.
+  (let ((para (mdview-parse-test--first
+               (concat (make-string 100 ?*) "a" (make-string 100 ?*)))))
+    (should (eq (mdview-node-type (car (mdview-node-children para))) 'strong))))
 
 (ert-deftest mdview-parse-deep-nesting-is-capped ()
   ;; Deeper than the cap, markers become paragraph text and nothing signals.

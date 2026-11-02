@@ -581,5 +581,52 @@ KEYS are passed on to `mdview-table-layout'."
     (should (equal (nth 3 lines) "two   r  "))
     (should (equal (nth 4 lines) "z   y w  "))))
 
+;;;; Review findings
+
+(ert-deftest mdview-table-cell-lines-are-trimmed-after-hard-break ()
+  "Text after a <br> starts at the column edge whether or not it wraps."
+  (let ((table (mdview-table-test--table nil '("A" "B") '("\n in cell " " after "))))
+    (let ((lines (mdview-table-test--layout table 20 :expand nil)))
+      (mdview-table-test--check-widths lines 20)
+      ;; Naturals 7 5 measured on the trimmed pieces.
+      (should (equal (nth 0 lines) (mdview-table-test--line "A" 6 " " "B" 4 7)))
+      (should (equal (nth 2 lines) (mdview-table-test--line 7 " " "after" 7)))
+      (should (equal (nth 3 lines) (mdview-table-test--line "in cell" " " 5 7))))
+    ;; Narrow enough to wrap (column A collapses to 6): still flush left.
+    (let ((lines (mdview-table-test--layout table 12)))
+      (mdview-table-test--check-widths lines 12)
+      (should (equal (nth 2 lines) (mdview-table-test--line 6 " " "after")))
+      (should (equal (nth 3 lines) (mdview-table-test--line "in" 4 " " 5)))
+      (should (equal (nth 4 lines) (mdview-table-test--line "cell" 2 " " 5))))))
+
+(ert-deftest mdview-table-minimums-measured-only-when-needed ()
+  (let ((calls 0))
+    (cl-letf* ((original (symbol-function 'mdview-table--longest-word))
+               ((symbol-function 'mdview-table--longest-word)
+                (lambda (string) (setq calls (1+ calls)) (funcall original string))))
+      (mdview-table-test--layout mdview-table-test-abc 60)
+      (should (= calls 0))
+      (mdview-table-test--layout mdview-table-test-shrink 30)
+      (should (> calls 0))))
+  ;; A thunk is accepted in place of the list.
+  (should (equal (mdview-table--column-widths '(9 90) (lambda () '(4 9)) 93 t) '(9 84)))
+  (should (equal (mdview-table--column-widths '(5 5) (lambda () (error "Not needed")) 20 nil)
+                 '(5 5))))
+
+(ert-deftest mdview-table-fit-fast-paths ()
+  (let ((exact "abc"))
+    (should (eq (mdview-table--fit exact 3) exact)))
+  (should (equal (mdview-table--fit "ab" 4) "ab  "))
+  (should (equal (mdview-table--fit "abcdef" 4) "abcd"))
+  (should (equal (mdview-table--fit "日本" 3) "日 "))
+  (should (equal (mdview-table--fit "" 0) "")))
+
+(ert-deftest mdview-table-width-helpers-fast-paths ()
+  (should (= (mdview-table--natural-width "hello") 5))
+  (should (= (mdview-table--natural-width "hi\nthere") 5))
+  (should (= (mdview-table--longest-word "hello") 5))
+  (should (= (mdview-table--longest-word "a bb\nccc d") 3))
+  (should (= (mdview-table--longest-word "") 0)))
+
 (provide 'mdview-table-test)
 ;;; mdview-table-test.el ends here

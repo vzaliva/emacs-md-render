@@ -1,5 +1,11 @@
 ;;; mdview-image.el --- Image display for mdview  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026  Vadim Zaliva
+
+;; Author: Vadim Zaliva
+;; Keywords: text, docs
+;; Package-Requires: ((emacs "29.1"))
+
 ;; This file is part of mdview, distributed under the MIT license; see
 ;; LICENSE in the repository root.
 
@@ -12,10 +18,17 @@
 ;; many columns it occupies.  Local images are resolved against the
 ;; document's directory and shown synchronously.  Remote http(s) images
 ;; get a placeholder first and are fetched asynchronously with
-;; `url-queue-retrieve'; when the bytes arrive the placeholder is swapped
-;; for the image, provided the view buffer and the placeholder still
-;; exist.  Raw bytes are cached per URL in `mdview-image-cache' so that a
-;; re-rendered view shows remote images immediately.
+;; `url-retrieve' through a small queue of this module's own, which
+;; limits the number of parallel fetches (`mdview-image-max-parallel')
+;; and gives up after `mdview-image-timeout' seconds.  When the bytes
+;; arrive the placeholder is swapped for the image, provided the view
+;; buffer and the placeholder still exist; the line keeps its width
+;; because the difference between the placeholder and the image is taken
+;; from the line's trailing padding.  Views whose placeholders were
+;; replaced are announced on `mdview-image-update-functions' so that the
+;; viewer can re-flow paragraphs around inline images.  Raw bytes are
+;; cached per URL in `mdview-image-cache' so that a re-rendered view
+;; shows remote images immediately.
 ;;
 ;; Everything degrades to placeholders in `emacs -nw' and `--batch': no
 ;; display-dependent primitive (`image-size', `frame-char-width',
@@ -26,9 +39,9 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
+(require 'url)
 (require 'url-parse)
 (require 'url-util)
-(require 'url-queue)
 (require 'mdview-faces)
 
 (defvar url-http-response-status)       ; url-http.el, local to responses
@@ -68,8 +81,17 @@ limit further."
   :group 'mdview)
 
 (defcustom mdview-image-timeout 10
-  "Seconds to wait for a remote image before keeping its placeholder."
+  "Seconds to wait for a remote image before keeping its placeholder.
+The time counts from the moment the fetch starts (see
+`mdview-image-max-parallel'); it is enforced by this module's own
+watchdog and does not depend on `url-queue-timeout'."
   :type 'number
+  :group 'mdview)
+
+(defcustom mdview-image-max-parallel 6
+  "Maximum number of remote images fetched at the same time.
+Further images wait in a queue until a fetch completes or times out."
+  :type 'natnum
   :group 'mdview)
 
 (defcustom mdview-image-placeholder-format nil
@@ -89,6 +111,17 @@ the option; `mdview-render' decides what to draw."
   :type 'boolean
   :group 'mdview)
 
+(defvar mdview-image-update-functions nil
+  "Abnormal hook run after remote images were shown in a view buffer.
+Each function is called with one argument, the buffer in which one or
+more placeholders were just replaced by images.  Replacing a placeholder
+keeps the width of its line (the difference is taken from the trailing
+padding) but cannot re-wrap a paragraph around an inline image, so a
+viewer may use this hook to schedule a re-rendering of the buffer; the
+image bytes are in `mdview-image-cache' by then, so the re-rendering
+shows them at once.  The hook runs from the retrieval callback: do the
+work from a timer rather than inline.")
+
 ;; The faces `mdview-image-placeholder' and `mdview-image-caption' are
 ;; defined in mdview-faces.el together with the rest of the palette.
 
@@ -107,14 +140,38 @@ Filled by successful fetches; `mdview-image-clear-cache' empties it.")
   "Pending remote images: identifier → `mdview-image--job'.")
 
 (defvar mdview-image--inflight (make-hash-table :test #'equal)
-  "URLs being fetched → the watchdog timer enforcing `mdview-image-timeout'.")
+  "URLs whose fetch was requested and has not concluded.
+The value is the symbol `waiting' while the URL sits in
+`mdview-image--waiting' and the watchdog timer enforcing
+`mdview-image-timeout' once the retrieval has started.")
+
+(defvar mdview-image--waiting nil
+  "URLs queued behind `mdview-image-max-parallel' running fetches, oldest first.")
+
+(defvar mdview-image--running (make-hash-table :test #'equal)
+  "URLs being retrieved → the buffer `url-retrieve' returned for them.")
 
 (defvar mdview-image--counter 0
   "Source of unique identifiers for pending placeholders.")
 
+(defvar mdview-image--size-cache (make-hash-table :test #'equal)
+  "Memo of `mdview-image--columns': (CHAR-WIDTH . IMAGE) → (TIME . COLUMNS).
+Entries older than `mdview-image--size-cache-ttl' seconds are recomputed,
+and the table is emptied when it holds `mdview-image--size-cache-limit'
+entries, so that it never grows without bound.")
+
+(defconst mdview-image--size-cache-ttl 30
+  "Seconds for which a memoized image size is trusted.")
+
+(defconst mdview-image--size-cache-limit 512
+  "Number of entries at which `mdview-image--size-cache' is emptied.")
+
+(defconst mdview-image--unavailable-note " (unavailable)"
+  "Suffix added to the `help-echo' of a placeholder whose fetch failed.")
+
 (defconst mdview-image--own-properties
-  '(face display mdview-link help-echo mouse-face keymap rear-nonsticky
-    inhibit-isearch mdview-image-pending)
+  '(face display mdview-link mdview-image-url help-echo mouse-face keymap
+    rear-nonsticky inhibit-isearch mdview-image-pending)
   "Text properties this module puts on placeholders and images.")
 
 ;;;; URL classification and path resolution
@@ -159,13 +216,22 @@ Percent-escapes are decoded unless a file with the literal name exists."
 
 ;;;; Placeholders
 
+(defun mdview-image--collapse-space (text)
+  "Return TEXT with every run of whitespace, newlines included, as one space.
+Leading and trailing whitespace is removed.  Alt text may contain hard
+breaks and the renderer keeps lines intact only for single-line labels."
+  (string-trim (replace-regexp-in-string "[ \t\n\r\f]+" " " text t t)))
+
 (defun mdview-image-label (url alt)
   "Return the text labelling the image URL: ALT, or a name derived from URL.
-When ALT is nil or blank, the file name part of URL is used (query and
-fragment stripped, percent-escapes decoded); for unsupported schemes the
-scheme name is used, e.g. \"data image\"."
+Whitespace in ALT, including newlines from hard breaks, is collapsed to
+single spaces so that the label always stays on one line.  When ALT is
+nil or blank, the file name part of URL is used (query and fragment
+stripped, percent-escapes decoded); for unsupported schemes the scheme
+name is used, e.g. \"data image\"."
   (cond
-   ((and alt (string-match-p "[^[:space:]]" alt)) alt)
+   ((and alt (string-match-p "[^ \t\n\r\f]" alt))
+    (mdview-image--collapse-space alt))
    ((null (mdview-image-url-kind url))
     (format "%s image" (url-type (url-generic-parse-url url))))
    (t
@@ -187,7 +253,9 @@ scheme name is used, e.g. \"data image\"."
 The text is `mdview-image-placeholder-format' applied to the label of
 URL and ALT (see `mdview-image-label').  It carries the face
 `mdview-image-placeholder' and the text properties `mdview-link' (URL),
-`help-echo' and `mouse-face', so it behaves like a link."
+`help-echo' and `mouse-face', so it behaves like a link, and
+`mdview-image-url' (URL as well), which survives when the renderer
+replaces `mdview-link' by the target of a link wrapped around the image."
   (let* ((url (or url ""))
          (label (mdview-image-label url (or alt "")))
          (text (condition-case nil
@@ -196,6 +264,7 @@ URL and ALT (see `mdview-image-label').  It carries the face
     (propertize text
                 'face 'mdview-image-placeholder
                 'mdview-link url
+                'mdview-image-url url
                 'help-echo url
                 'mouse-face 'highlight)))
 
@@ -217,6 +286,30 @@ Return nil when FILE is nil, unreadable, a directory or not an image."
        (or (image-supported-file-p file)
            (ignore-errors (image-type-from-file-header file)))))
 
+(defun mdview-image--local-image (url base-dir)
+  "Return (FILE . TYPE) for the local image URL when Emacs can display it.
+FILE is the absolute file name resolved against BASE-DIR and TYPE its
+available image type.  Return nil for a missing or unreadable file, a
+file that is not an image, or an image type this Emacs lacks."
+  (let* ((file (mdview-image-local-path url base-dir))
+         (type (mdview-image--file-type file)))
+    (and type (image-type-available-p type) (cons file type))))
+
+(defun mdview-image--displayable (url base-dir)
+  "Return how the image URL can be shown as a real image, or nil.
+The value is `remote' for a fetchable http(s) URL and (FILE . TYPE) for
+a displayable local file resolved against BASE-DIR (see
+`mdview-image--local-image'); nil means the placeholder must be used.
+The display, `mdview-display-images' and `mdview-display-remote-images'
+are checked first, so no file is touched unless images can be shown at
+all."
+  (and mdview-display-images
+       (mdview-image--graphic-p)
+       (pcase (mdview-image-url-kind url)
+         ('remote (and mdview-display-remote-images 'remote))
+         ('local (mdview-image--local-image url base-dir))
+         (_ nil))))
+
 (defun mdview-image-displayable-p (url &optional base-dir)
   "Return non-nil when the image at URL can be shown as a real image.
 This is nil in batch mode, on a text terminal, when `mdview-display-images'
@@ -225,14 +318,7 @@ are missing or whose image type is not available in this Emacs.  Remote
 http(s) images are displayable when `mdview-display-remote-images' is
 non-nil; their type is checked once the data arrives.  Relative paths
 resolve against BASE-DIR (default `default-directory')."
-  (and mdview-display-images
-       (mdview-image--graphic-p)
-       (pcase (mdview-image-url-kind url)
-         ('remote (and mdview-display-remote-images t))
-         ('local (let ((type (mdview-image--file-type
-                              (mdview-image-local-path url base-dir))))
-                   (and type (image-type-available-p type) t)))
-         (_ nil))))
+  (and (mdview-image--displayable url base-dir) t))
 
 ;;;; Sizes
 
@@ -279,16 +365,30 @@ MAX-WIDTH, MAX-HEIGHT and INLINE are as in `mdview-image--create'."
 (defun mdview-image--columns (image)
   "Return the number of text columns IMAGE occupies on the selected frame.
 Signal an error when IMAGE cannot be loaded or the frame has no window
-system."
-  (let ((pixels (car (image-size image t))))
-    (max 1 (ceiling (/ pixels (float (frame-char-width)))))))
+system.  The size of a given image spec is memoized for a while in
+`mdview-image--size-cache', because a document repeating the same image
+hundreds of times would otherwise pay for `image-size' every time."
+  (let* ((char-width (frame-char-width))
+         (key (cons char-width image))
+         (hit (gethash key mdview-image--size-cache))
+         (now (float-time)))
+    (if (and hit (< (- now (car hit)) mdview-image--size-cache-ttl))
+        (cdr hit)
+      (let* ((pixels (car (image-size image t)))
+             (columns (max 1 (ceiling (/ pixels (float char-width))))))
+        (when (>= (hash-table-count mdview-image--size-cache)
+                  mdview-image--size-cache-limit)
+          (clrhash mdview-image--size-cache))
+        (puthash key (cons now columns) mdview-image--size-cache)
+        columns))))
 
 (defun mdview-image--insert-image (image url alt)
   "Insert IMAGE at point and return the number of columns it occupies.
 The underlying text is the label of URL and ALT, so copying the region
-yields the alt text.  The text gets `mdview-link', `help-echo' and
-`mouse-face'; the `keymap' that `insert-image' adds is removed so that
-the mode's own bindings apply on images."
+yields the alt text.  The text gets `mdview-link', `mdview-image-url'
+\(both URL), `help-echo' and `mouse-face'; the `keymap' that
+`insert-image' adds is removed so that the mode's own bindings apply on
+images."
   (let ((columns (mdview-image--columns image))
         (label (mdview-image-label url alt))
         (start (point)))
@@ -297,7 +397,10 @@ the mode's own bindings apply on images."
     (add-text-properties
      start (point)
      (list 'mdview-link url
-           'help-echo (if (string-empty-p alt) url (concat alt "\n" url))
+           'mdview-image-url url
+           'help-echo (if (string-blank-p alt)
+                          url
+                        (concat (mdview-image--collapse-space alt) "\n" url))
            'mouse-face 'highlight))
     columns))
 
@@ -317,17 +420,15 @@ yields nil and leaves the buffer unchanged."
     (insert text)
     (cons (string-width text) 'placeholder)))
 
-(defun mdview-image--insert-local (url alt base-dir max-width max-height
-                                      inline)
-  "Insert the local image URL at point; return (COLUMNS . image) or nil.
-ALT, BASE-DIR, MAX-WIDTH, MAX-HEIGHT and INLINE are as in
-`mdview-image-insert'."
-  (let ((file (mdview-image-local-path url base-dir)))
-    (mdview-image--try-insert
-     (ignore-errors
-       (mdview-image--create file (mdview-image--file-type file) nil
-                             max-width max-height inline))
-     url alt)))
+(defun mdview-image--insert-local (file type url alt max-width max-height
+                                        inline)
+  "Insert the local image FILE of image TYPE; return (COLUMNS . image) or nil.
+URL is the image's URL in the document.  ALT, MAX-WIDTH, MAX-HEIGHT and
+INLINE are as in `mdview-image-insert'."
+  (mdview-image--try-insert
+   (ignore-errors
+     (mdview-image--create file type nil max-width max-height inline))
+   url alt))
 
 (defun mdview-image--insert-remote (url alt max-width max-height inline)
   "Insert the remote image URL from the cache, or a placeholder awaiting it.
@@ -357,13 +458,14 @@ once.  Everything else gets the placeholder of `mdview-image-placeholder'.
 
 Return (COLUMNS . KIND): COLUMNS is the width in text columns of what
 was inserted and KIND is `image', `placeholder' or `pending'."
-  (let ((url (or url ""))
-        (alt (or alt "")))
-    (or (and (mdview-image-displayable-p url base-dir)
+  (let* ((url (or url ""))
+         (alt (or alt ""))
+         (how (mdview-image--displayable url base-dir)))
+    (or (and how
              (let ((max-width (mdview-image-max-width-px max-width-px))
                    (max-height (mdview-image-max-height-px max-height-px)))
-               (if (eq (mdview-image-url-kind url) 'local)
-                   (mdview-image--insert-local url alt base-dir
+               (if (consp how)
+                   (mdview-image--insert-local (car how) (cdr how) url alt
                                                max-width max-height inline)
                  (mdview-image--insert-remote url alt
                                               max-width max-height inline))))
@@ -374,7 +476,8 @@ was inserted and KIND is `image', `placeholder' or `pending'."
 (defun mdview-image--insert-pending (url alt max-width max-height inline)
   "Insert a placeholder for the remote image URL and start fetching it.
 ALT, MAX-WIDTH, MAX-HEIGHT and INLINE are as in `mdview-image-insert' and
-are remembered for the eventual display.  Return (COLUMNS . pending)."
+are remembered for the eventual display.  Return (COLUMNS . pending),
+or (COLUMNS . placeholder) when the fetch fails before this returns."
   (let* ((id (cl-incf mdview-image--counter))
          (text (propertize (mdview-image-placeholder url alt)
                            'mdview-image-pending id))
@@ -392,7 +495,8 @@ are remembered for the eventual display.  Return (COLUMNS . pending)."
                                           :inline inline)
                mdview-image--pending))
     (mdview-image--fetch url)
-    (cons (string-width text) 'pending)))
+    (cons (string-width text)
+          (if (gethash id mdview-image--pending) 'pending 'placeholder))))
 
 (defun mdview-image--pending-region (id buffer &optional from)
   "Return (START . END) of the placeholder with pending ID in BUFFER, or nil.
@@ -436,38 +540,99 @@ the renderer copies the placeholder text into another buffer."
       (setq props (cddr props)))
     result))
 
+(defun mdview-image--adjust-padding (pos delta)
+  "Absorb DELTA columns in the trailing spaces of the line containing POS.
+POS is where the text that grew by DELTA columns ends.  The renderer
+pads every line with spaces to the content width (followed by a suffix
+of further spaces inside block quotes), so a replacement that is DELTA
+columns wider than the placeholder removes DELTA of those spaces, taken
+from the start of the run, and a narrower one inserts spaces carrying the
+padding's properties there.  More columns than the run holds are left
+to overflow; nothing before POS is touched."
+  (unless (zerop delta)
+    (save-excursion
+      (goto-char pos)
+      (let* ((eol (line-end-position))
+             (run-start (progn (goto-char eol)
+                               (skip-chars-backward " " pos)
+                               (point))))
+        (if (> delta 0)
+            (delete-region run-start (min eol (+ run-start delta)))
+          (goto-char run-start)
+          (insert (apply #'propertize (make-string (- delta) ?\s)
+                         (and (< run-start eol)
+                              (text-properties-at run-start)))))))))
+
 (defun mdview-image--replace (job region data)
   "Show the image bytes DATA in place of JOB's placeholder at REGION.
 REGION is (BUFFER START END).  Text properties the renderer put on the
-placeholder (such as `mdview-source-line') are carried over.  When the
-data cannot be displayed the placeholder is left alone."
+placeholder (such as `mdview-source-line') are carried over, and the
+line keeps its width: the difference in columns between the image and
+the placeholder is taken from or added to the line's trailing padding
+\(see `mdview-image--adjust-padding').  Return non-nil when the image was
+inserted; when the data cannot be displayed the placeholder is left
+alone and nil is returned."
   (pcase-let ((`(,buffer ,start ,end) region))
     (with-current-buffer buffer
       (let ((image (mdview-image--from-data data
                                             (mdview-image--job-max-width job)
                                             (mdview-image--job-max-height job)
                                             (mdview-image--job-inline job)))
-            (props (mdview-image--foreign-properties start)))
+            (props (mdview-image--foreign-properties start))
+            (old-columns (string-width (buffer-substring-no-properties start end))))
         (when image
           (with-silent-modifications
             (save-excursion
               (goto-char start)
-              (when (mdview-image--try-insert image (mdview-image--job-url job)
-                                              (mdview-image--job-alt job))
-                (let ((new-end (point)))
-                  (delete-region new-end (+ new-end (- end start)))
-                  (add-text-properties start new-end props))))))))))
+              (let ((result (mdview-image--try-insert
+                             image (mdview-image--job-url job)
+                             (mdview-image--job-alt job))))
+                (when result
+                  (let ((new-end (point)))
+                    (delete-region new-end (+ new-end (- end start)))
+                    (add-text-properties start new-end props)
+                    (mdview-image--adjust-padding
+                     new-end (- (car result) old-columns)))
+                  t)))))))))
 
-(defun mdview-image--job-done (job data)
+(defun mdview-image--mark-unavailable (region)
+  "Record on the placeholder at REGION that its image will not arrive.
+REGION is (BUFFER START END).  The `mdview-image-pending' property is
+removed, so that nothing waits for the placeholder any longer, and
+`mdview-image--unavailable-note' is appended to its `help-echo'; the
+`mdview-link' stays so that RET still opens the URL."
+  (pcase-let ((`(,buffer ,start ,end) region))
+    (with-current-buffer buffer
+      (with-silent-modifications
+        (remove-list-of-text-properties start end '(mdview-image-pending))
+        (let ((echo (get-text-property start 'help-echo)))
+          (when (and (stringp echo)
+                     (not (string-suffix-p mdview-image--unavailable-note echo)))
+            (put-text-property start end 'help-echo
+                               (concat echo mdview-image--unavailable-note))))))))
+
+(defun mdview-image--job-done (job data &optional cancel)
   "Finish JOB: show the image bytes DATA (or nil) on its placeholder if possible.
-The job is forgotten and its overlay deleted in every case."
+When the placeholder still exists but gets no image, because DATA is nil
+\(the fetch failed), the display is not graphical or the bytes are not a
+displayable image, it is marked with `mdview-image--mark-unavailable' so
+that it no longer looks pending -- unless CANCEL is non-nil, in which
+case the placeholder is left untouched because its buffer is about to
+be re-rendered or killed.  The job is forgotten and its overlay deleted
+in every case.  Return the buffer in which an image was shown, or nil."
   (remhash (mdview-image--job-id job) mdview-image--pending)
-  (let ((region (and data (mdview-image--job-region job))))
-    (when (and region (mdview-image--graphic-p))
-      (mdview-image--replace job region data)))
-  (let ((overlay (mdview-image--job-overlay job)))
-    (when (overlay-buffer overlay)
-      (delete-overlay overlay))))
+  (prog1
+      (let ((region (and (not cancel) (mdview-image--job-region job))))
+        (when region
+          (if (and data
+                   (mdview-image--graphic-p)
+                   (mdview-image--replace job region data))
+              (car region)
+            (mdview-image--mark-unavailable region)
+            nil)))
+    (let ((overlay (mdview-image--job-overlay job)))
+      (when (overlay-buffer overlay)
+        (delete-overlay overlay)))))
 
 (defun mdview-image--jobs-for (url)
   "Return the pending jobs waiting for URL, oldest first."
@@ -481,43 +646,77 @@ The job is forgotten and its overlay deleted in every case."
 
 (defun mdview-image--finish (url data)
   "Conclude the fetch of URL with the image bytes DATA (nil on failure).
-Stop the watchdog timer and complete every job waiting for URL."
+Stop the watchdog timer, forget the fetch, complete every job waiting
+for URL, run `mdview-image-update-functions' for each buffer in which an
+image was shown, and start the next waiting fetch."
   (let ((timer (gethash url mdview-image--inflight)))
     (when (timerp timer)
       (cancel-timer timer))
-    (remhash url mdview-image--inflight))
-  (dolist (job (mdview-image--jobs-for url))
-    (mdview-image--job-done job data)))
+    (remhash url mdview-image--inflight)
+    (remhash url mdview-image--running)
+    (setq mdview-image--waiting (delete url mdview-image--waiting)))
+  (let (buffers)
+    (dolist (job (mdview-image--jobs-for url))
+      (let ((buffer (mdview-image--job-done job data)))
+        (when (and buffer (not (memq buffer buffers)))
+          (push buffer buffers))))
+    (dolist (buffer (nreverse buffers))
+      (when (buffer-live-p buffer)
+        (run-hook-with-args 'mdview-image-update-functions buffer))))
+  (mdview-image--run-queue))
 
 ;;;; Remote images: fetching
 
 (defun mdview-image--fetch (url)
-  "Start fetching URL asynchronously unless a fetch is already in flight.
-The result arrives in `mdview-image--on-retrieve'; a watchdog timer
-enforces `mdview-image-timeout' because `url-queue' only checks its own
-`url-queue-timeout' when the queue is poked."
+  "Queue URL for fetching unless a fetch of it is already in flight.
+The retrieval starts at once when fewer than `mdview-image-max-parallel'
+fetches are running and otherwise when one of them concludes; its result
+arrives in `mdview-image--on-retrieve' or, after `mdview-image-timeout'
+seconds, in `mdview-image--on-timeout'."
   (unless (gethash url mdview-image--inflight)
-    (puthash url (run-at-time mdview-image-timeout nil
-                              #'mdview-image--on-timeout url)
-             mdview-image--inflight)
-    (let ((url-request-method "GET")
-          (url-queue-timeout mdview-image-timeout))
-      (url-queue-retrieve url #'mdview-image--on-retrieve (list url) t t))))
+    (puthash url 'waiting mdview-image--inflight)
+    (setq mdview-image--waiting (append mdview-image--waiting (list url)))
+    (mdview-image--run-queue)))
 
-(defun mdview-image--queue-jobs (url)
-  "Return the entries of `url-queue' that fetch URL for this module."
-  (seq-filter (lambda (job)
-                (and (eq (url-queue-callback job) #'mdview-image--on-retrieve)
-                     (equal (url-queue-cbargs job) (list url))))
-              url-queue))
+(defun mdview-image--run-queue ()
+  "Start waiting fetches while fewer than `mdview-image-max-parallel' run."
+  (while (and mdview-image--waiting
+              (< (hash-table-count mdview-image--running)
+                 (max 1 mdview-image-max-parallel)))
+    (mdview-image--start (pop mdview-image--waiting))))
+
+(defun mdview-image--start (url)
+  "Retrieve URL asynchronously with `url-retrieve' and arm its watchdog.
+A retrieval that fails before it even starts (an error signalled by
+`url-retrieve') concludes the fetch at once as a failure."
+  (puthash url (run-at-time mdview-image-timeout nil
+                            #'mdview-image--on-timeout url)
+           mdview-image--inflight)
+  (let ((buffer (condition-case nil
+                    (let ((url-request-method "GET")
+                          (url-request-noninteractive t))
+                      (url-retrieve url #'mdview-image--on-retrieve
+                                    (list url) t t))
+                  (error nil))))
+    (cond ((not (gethash url mdview-image--inflight)))
+          ;; `url-retrieve' may have concluded the fetch synchronously;
+          ;; then there is nothing left to track.
+          ((bufferp buffer) (puthash url buffer mdview-image--running))
+          (t (mdview-image--finish url nil)))))
 
 (defun mdview-image--kill-fetch (url)
   "Abort the fetch of URL, if any, keeping its placeholders.
-Running or queued `url-queue' jobs are killed, which reports an error to
-`mdview-image--on-retrieve'; the fetch is forgotten in any case."
-  (dolist (job (mdview-image--queue-jobs url))
-    (setq url-queue (delq job url-queue))
-    (url-queue-kill-job job))
+A running retrieval has its process deleted silently and its buffer
+killed, so that `mdview-image--on-retrieve' never runs for it; the fetch
+is forgotten in any case and its jobs conclude without an image."
+  (let ((buffer (gethash url mdview-image--running)))
+    (when (buffer-live-p buffer)
+      (let (process)
+        (while (setq process (get-buffer-process buffer))
+          (set-process-sentinel process #'ignore)
+          (ignore-errors (delete-process process))))
+      (let ((kill-buffer-query-functions nil))
+        (ignore-errors (kill-buffer buffer)))))
   (mdview-image--finish url nil))
 
 (defun mdview-image--on-timeout (url)
@@ -591,7 +790,7 @@ and, with KILL, when killing it."
                  (push job jobs)))
              mdview-image--pending)
     (dolist (job jobs)
-      (mdview-image--job-done job nil))
+      (mdview-image--job-done job nil t))
     (when kill
       (dolist (url (seq-uniq (mapcar #'mdview-image--job-url jobs)))
         (unless (mdview-image--jobs-for url)
@@ -599,9 +798,10 @@ and, with KILL, when killing it."
     (length jobs)))
 
 (defun mdview-image-clear-cache ()
-  "Forget all cached remote image data."
+  "Forget all cached remote image data and memoized image sizes."
   (interactive)
   (clrhash mdview-image-cache)
+  (clrhash mdview-image--size-cache)
   nil)
 
 (defun mdview-image-open (url &optional base-dir)

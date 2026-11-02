@@ -20,6 +20,16 @@
 
 ;;; Code:
 
+;;;; Customization group
+
+;; Defined here, in the one file every other module requires, so that
+;; the group exists however little of the package is loaded.
+(defgroup mdview nil
+  "Render Markdown in the visual style of Frogmouth."
+  :group 'text
+  :prefix "mdview-"
+  :link '(url-link "https://github.com/vzaliva/emacs-md-render"))
+
 ;;;; Nodes
 
 (defun mdview-node (type plist &rest children)
@@ -254,10 +264,18 @@ The bounded repetitions follow CommonMark's limits, so matching is linear.")
 
 (defun mdview-ast--codepoint-string (code)
   "Return the string for code point CODE, or U+FFFD when CODE is invalid.
-As in CommonMark, zero, surrogates and values above U+10FFFF are invalid."
+As in CommonMark, zero, surrogates and values above U+10FFFF are
+invalid.  So are, as in markdown-it, control characters other than tab
+and newline (C0, DEL and C1: a `&#13;' or `&#1;' would otherwise put a
+raw control character into the rendered buffer) and the Unicode
+noncharacters."
   (if (or (<= code 0)
           (> code #x10FFFF)
-          (<= #xD800 code #xDFFF))
+          (<= #xD800 code #xDFFF)
+          (and (< code #x20) (not (memq code '(9 10))))
+          (<= #x7F code #x9F)
+          (<= #xFDD0 code #xFDEF)
+          (>= (logand code #xFFFE) #xFFFE))
       (string #xFFFD)
     (string code)))
 

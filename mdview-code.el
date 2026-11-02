@@ -15,8 +15,8 @@
 ;; section 8).  `mdview-code-fontify' resolves the language name of a
 ;; block to a major mode (`mdview-code-lang-modes' first, then
 ;; `LANG-ts-mode' when its grammar is installed, then `LANG-mode'),
-;; fontifies the code with that mode in a temporary buffer with every
-;; hook suppressed, and maps the resulting font-lock faces to the
+;; fontifies the code with that mode in a hidden scratch buffer with
+;; every hook suppressed, and maps the resulting font-lock faces to the
 ;; `mdview-code-*' faces, which carry the colours of the Pygments
 ;; "material" theme that Frogmouth uses.  An unknown language, a block
 ;; larger than `mdview-code-highlight-max-chars' or any failure yields the
@@ -24,12 +24,19 @@
 ;; `mdview-code-indent-guides' draws Rich-style indentation guides in the
 ;; leading whitespace of a line.
 ;;
+;; Fontification is the most expensive part of rendering, so one scratch
+;; buffer per major mode stays alive across blocks (the mode is set up
+;; once, as `org-src' does) and results are memoized in a bounded cache,
+;; so that refitting, refreshing or toggling images never fontifies an
+;; unchanged block again.
+;;
 ;; Nothing here prompts, downloads a grammar or starts a process on its
 ;; own: tree-sitter modes are used only when `treesit-ready-p' already
 ;; succeeds, and a mode guessed from the language name must be a major
-;; mode defined with `define-derived-mode'.  Everything works under
-;; `emacs -Q --batch', where `font-lock-ensure' fontifies even though
-;; `font-lock-mode' itself stays off.
+;; mode derived from `prog-mode', `text-mode' or `conf-mode' (so a fence
+;; labelled "tar" or "help" never runs `tar-mode' or `help-mode').
+;; Everything works under `emacs -Q --batch', where `font-lock-ensure'
+;; fontifies even though `font-lock-mode' itself stays off.
 
 ;;; Code:
 
@@ -237,7 +244,8 @@ when it is defined (`fboundp'); a tree-sitter mode (whose name ends in
 prompt.  An entry is authoritative: when none of its modes is available
 the block is not highlighted.  Languages absent from this table resolve
 to `LANG-ts-mode' when that grammar is ready, else to `LANG-mode' when it
-is a major mode.  See `mdview-code-resolve-mode'."
+is a major mode derived from `prog-mode', `text-mode' or `conf-mode'
+\(list a mode here to use it regardless).  See `mdview-code-resolve-mode'."
   :type '(alist :key-type (string :tag "Language")
                 :value-type (choice (const :tag "No highlighting" nil)
                                     (symbol :tag "Major mode")
@@ -320,14 +328,22 @@ Tree-sitter modes use the same font-lock faces as classic modes."
   :type 'integer
   :group 'mdview)
 
+(defvar mdview-code-debug nil
+  "Non-nil reports highlighting failures in the echo area.
+By default a block whose major mode signals an error is silently shown
+as plain text, because a document must never produce echo-area noise.")
+
 ;;;; Language resolution
 
 (defconst mdview-code--ts-languages
   '((c++-ts-mode . cpp) (js-ts-mode . javascript))
   "Tree-sitter modes whose grammar name differs from the mode name prefix.")
 
-(defconst mdview-code--root-modes '(fundamental-mode text-mode prog-mode)
-  "Major modes that have no `derived-mode-parent' property.")
+(defconst mdview-code--text-modes '(prog-mode text-mode conf-mode)
+  "Modes a major mode guessed from a language name must derive from.
+Modes for viewing structured data, such as `tar-mode', `help-mode' and
+other `special-mode' descendants, expect their own buffer contents and
+signal or misbehave on arbitrary text; they are never guessed.")
 
 (defun mdview-code--normalize-lang (lang)
   "Return LANG as a trimmed lower-case string, or nil when blank.
@@ -365,17 +381,36 @@ grammar, which is checked before its library is ever loaded."
        (or (not (mdview-code--ts-mode-p mode))
            (mdview-code--treesit-ready-p (mdview-code--ts-language mode)))))
 
+(defun mdview-code--text-mode-p (mode)
+  "Return non-nil when MODE is, or derives from, one of `mdview-code--text-modes'.
+Aliases are resolved and the walk follows the `derived-mode-parent'
+property that `define-derived-mode' sets, stopping on a cycle.  A parent
+that is still an autoload is loaded on the way, because the property of
+an autoloaded mode is only set once its library is loaded."
+  (let ((seen nil) (found nil))
+    (while (and mode (not found) (not (memq mode seen)))
+      (push mode seen)
+      (let ((definition (symbol-function mode)))
+        (cond ((and definition (symbolp definition))
+               (setq mode definition))
+              ((autoloadp definition)
+               (ignore-errors (autoload-do-load definition mode)))))
+      (if (memq mode mdview-code--text-modes)
+          (setq found t)
+        (setq mode (get mode 'derived-mode-parent))))
+    found))
+
 (defun mdview-code--major-mode-p (mode)
-  "Return non-nil when MODE is an available major mode.
-Loads the autoload of MODE if needed, then requires MODE to have been
-defined with `define-derived-mode' (or to be a root mode) and not to be
-a minor mode.  This keeps a language name taken from a document from
-calling arbitrary commands such as `describe-mode' or `server-mode'."
+  "Return non-nil when MODE is an available major mode fit for code.
+Loads the autoload of MODE if needed, then requires MODE not to be a
+minor mode and to be, or derive from, one of `mdview-code--text-modes'
+\(see `mdview-code--text-mode-p').  This keeps a language name taken from
+a document from calling arbitrary commands such as `describe-mode' or
+`server-mode', or modes such as `tar-mode' that choke on plain text."
   (and (mdview-code--mode-available-p mode)
        (ignore-errors (autoload-do-load (symbol-function mode) mode) t)
        (not (memq mode minor-mode-list))
-       (or (memq mode mdview-code--root-modes)
-           (and (get mode 'derived-mode-parent) t))))
+       (mdview-code--text-mode-p mode)))
 
 (defun mdview-code--first-available (candidates)
   "Return the first available major mode among CANDIDATES, or nil.
@@ -387,7 +422,8 @@ CANDIDATES is a mode symbol, a list of mode symbols, or nil."
   "Return a major mode for the language NAME by naming convention, or nil.
 Tries `NAME-ts-mode' when its grammar is ready, then `NAME-mode'.  Only
 symbols that already exist are considered (nothing is interned), and only
-real major modes are returned; see `mdview-code--major-mode-p'."
+major modes derived from `prog-mode', `text-mode' or `conf-mode' are
+returned; see `mdview-code--major-mode-p'."
   (let ((ts (intern-soft (concat name "-ts-mode")))
         (plain (intern-soft (concat name "-mode"))))
     (cond ((and ts (mdview-code--major-mode-p ts)) ts)
@@ -409,7 +445,8 @@ LANG is the language name from the info string of a fenced code block,
 compared case-insensitively; nil or a blank string means no mode.
 `mdview-code-lang-modes' is consulted first; a language not listed there
 resolves to `LANG-ts-mode' when its tree-sitter grammar is installed and
-otherwise to `LANG-mode' when that is a major mode.  The result honours
+otherwise to `LANG-mode' when that is a major mode derived from
+`prog-mode', `text-mode' or `conf-mode'.  The result honours
 `major-mode-remap-alist' where Emacs supports it.  No grammar is ever
 downloaded and nothing prompts."
   (let ((name (mdview-code--normalize-lang lang)))
@@ -494,26 +531,94 @@ is dropped.  Faces are translated with `mdview-code-map-face' when
         (setq start end)))
     result))
 
+(defvar mdview-code--cache (make-hash-table :test #'equal)
+  "Memo of fontifications: (MODE CODE THEME FACE-ALIST) → propertized string.
+THEME is the value of `mdview-code-material-theme' and FACE-ALIST that of
+`mdview-code-face-alist' (nil when THEME is nil) at the time, so that
+changing either option invalidates the entries.  The table is emptied
+when the memoized code exceeds `mdview-code--cache-max-chars'.")
+
+(defvar mdview-code--cache-chars 0
+  "Total number of characters of the code memoized in `mdview-code--cache'.")
+
+(defconst mdview-code--cache-max-chars 2000000
+  "Characters of code `mdview-code--cache' may hold before it is emptied.")
+
+(defconst mdview-code--scratch-prefix " *mdview-code:"
+  "Prefix of the names of the scratch buffers used for fontification.")
+
+(defun mdview-code-clear-cache ()
+  "Forget memoized fontifications and kill the fontification scratch buffers."
+  (interactive)
+  (clrhash mdview-code--cache)
+  (setq mdview-code--cache-chars 0)
+  (dolist (buffer (buffer-list))
+    (when (string-prefix-p mdview-code--scratch-prefix (buffer-name buffer))
+      (kill-buffer buffer)))
+  nil)
+
+(defun mdview-code--scratch-buffer (mode)
+  "Return the hidden buffer in which MODE fontifies code, creating it if needed.
+The buffer's name starts with a space, so undo and `font-lock-mode' stay
+off in it, and buffer hooks are inhibited."
+  (get-buffer-create (format "%s%s*" mdview-code--scratch-prefix mode) t))
+
 (defun mdview-code--fontify-with-mode (code mode)
   "Return CODE fontified by the major mode MODE, or nil when that fails.
-Works in a temporary buffer with the mode hooks delayed and the change
-hooks suppressed, so that user configuration (language servers, linters,
-...) never runs.  A newline is appended for the duration of the
-fontification so that keywords anchored on line ends (as in `diff-mode')
-match on the last line too.  Return nil if MODE altered the text."
-  (with-temp-buffer
-    (insert code "\n")
-    (let ((inhibit-message t)
-          (change-major-mode-hook nil)
-          (after-change-major-mode-hook nil)
-          (font-lock-mode-hook nil)
-          (prog-mode-hook nil)
-          (text-mode-hook nil))
-      (delay-mode-hooks (funcall mode))
-      (font-lock-ensure)
-      (when (string= (buffer-substring-no-properties (point-min) (point-max))
-                     (concat code "\n"))
-        (mdview-code--collect-faces code)))))
+Works in the scratch buffer of MODE (see `mdview-code--scratch-buffer'),
+which keeps the mode set up from one block to the next, with the mode
+hooks delayed and the change hooks suppressed, so that user configuration
+\(language servers, linters, ...) never runs.  A newline is appended for
+the duration of the fontification so that keywords anchored on line ends
+\(as in `diff-mode') match on the last line too.  Return nil if MODE
+altered the text; a mode that does so, or that signals, loses its
+scratch buffer so that its state is never reused."
+  (let ((buffer (mdview-code--scratch-buffer mode))
+        (result nil)
+        (done nil))
+    (unwind-protect
+        (with-current-buffer buffer
+          (let ((inhibit-read-only t)
+                (inhibit-message t)
+                (change-major-mode-hook nil)
+                (after-change-major-mode-hook nil)
+                (font-lock-mode-hook nil)
+                (prog-mode-hook nil)
+                (text-mode-hook nil))
+            (erase-buffer)
+            (insert code "\n")
+            (unless (eq major-mode mode)
+              (delay-mode-hooks (funcall mode)))
+            (setq font-lock-fontified nil)
+            (font-lock-ensure)
+            (when (string= (buffer-substring-no-properties (point-min) (point-max))
+                           (concat code "\n"))
+              (setq result (mdview-code--collect-faces code)))
+            (setq done t)))
+      ;; A mode that signalled or altered the text never gets reused.
+      (when (and (buffer-live-p buffer) (or (not done) (not result)))
+        (kill-buffer buffer)))
+    result))
+
+(defun mdview-code--fontify-cached (code mode)
+  "Return CODE fontified by MODE, memoized in `mdview-code--cache'.
+A fresh copy of the memoized string is returned so that callers may
+alter its properties freely.  nil means MODE failed on CODE."
+  (let* ((key (list mode code mdview-code-material-theme
+                    (and mdview-code-material-theme mdview-code-face-alist)))
+         (hit (gethash key mdview-code--cache)))
+    (if hit
+        (copy-sequence hit)
+      (let ((result (mdview-code--fontify-with-mode code mode)))
+        (when result
+          (when (> (+ mdview-code--cache-chars (length code))
+                   mdview-code--cache-max-chars)
+            (clrhash mdview-code--cache)
+            (setq mdview-code--cache-chars 0))
+          (puthash key (copy-sequence result) mdview-code--cache)
+          (setq mdview-code--cache-chars
+                (+ mdview-code--cache-chars (length code))))
+        result))))
 
 (defun mdview-code-fontify (code lang)
   "Return CODE highlighted for the language LANG as a propertized string.
@@ -526,14 +631,17 @@ replaced by the `mdview-code-*' faces (see `mdview-code-face-alist');
 otherwise they are kept.  Plain text is returned when LANG resolves to no
 mode (see `mdview-code-resolve-mode'), when CODE is longer than
 `mdview-code-highlight-max-chars' or when highlighting fails for any
-reason; such failures are demoted to messages."
+reason; failures are silent unless `mdview-code-debug' is non-nil.
+Results are memoized (see `mdview-code-clear-cache')."
   (let ((code (if (stringp code) code "")))
     (or (and (<= (length code) mdview-code-highlight-max-chars)
-             (condition-case nil
-                 (with-demoted-errors "mdview-code: highlighting failed: %S"
-                   (let ((mode (mdview-code-resolve-mode lang)))
-                     (and mode (mdview-code--fontify-with-mode code mode))))
-               (error nil)))
+             (condition-case err
+                 (let ((mode (mdview-code-resolve-mode lang)))
+                   (and mode (mdview-code--fontify-cached code mode)))
+               ((debug error)
+                (when mdview-code-debug
+                  (message "mdview-code: highlighting failed: %S" err))
+                nil)))
         (substring-no-properties code))))
 
 ;;;; Indent guides
