@@ -142,4 +142,5 @@ style specification derived from Frogmouth.
 
 ## License
 
-GPL-3.0-or-later.  See [LICENSE](LICENSE).
+MIT.  See [LICENSE](LICENSE).  Frogmouth and Textual, whose design this
+package reproduces, are MIT licensed as well.
