@@ -23,5 +23,13 @@ resolve, such as the terminal's own default, is written as \"none\"."
     (with-temp-file file
       (insert (funcall hex :background) " " (funcall hex :foreground)))))
 
+(defun mdview-shot-tidy ()
+  "Hide the menu bar and clear the startup message of the capturing Emacs.
+Neither has anything to do with how mdview renders, and they clutter a
+screenshot.  The message appears only once startup has finished, so it is
+cleared from a timer."
+  (menu-bar-mode -1)
+  (run-with-timer 2 nil (lambda () (message nil))))
+
 (provide 'mdview-dev-shot-colors)
 ;;; shot-colors.el ends here

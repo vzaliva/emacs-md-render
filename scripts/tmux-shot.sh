@@ -32,7 +32,7 @@ setup_args=""
 if [ -n "${SHOT_SETUP:-}" ]; then setup_args="-l '$SHOT_SETUP'"; fi
 # COLORTERM would make Emacs use 24-bit colour whatever TERM says.
 tmux -L "$sock" new-session -d -s shot -x "$cols" -y "$rows" \
-  "unset COLORTERM; TERM=$term $emacs_bin -nw -Q --eval '(setq load-prefer-newer t)' -L '$here' -l '$here/scripts/shot-colors.el' $setup_args --eval \"(progn (load-theme '$emtheme t) (mdview-shot-record-colors \\\"$out/$name-$theme.colors\\\") (require 'mdview) (setq mdview-auto-refit nil) (mdview-file \\\"$file\\\"))\""
+  "unset COLORTERM; TERM=$term $emacs_bin -nw -Q --eval '(setq load-prefer-newer t)' -L '$here' -l '$here/scripts/shot-colors.el' $setup_args --eval \"(progn (load-theme '$emtheme t) (mdview-shot-record-colors \\\"$out/$name-$theme.colors\\\") (mdview-shot-tidy) (require 'mdview) (setq mdview-auto-refit nil) (mdview-file \\\"$file\\\"))\""
 sleep 4
 tmux -L "$sock" capture-pane -t shot -p -e -S 0 -E "$((rows-1))" > "$out/$name-$theme.ansi"
 tmux -L "$sock" capture-pane -t shot -p > "$out/$name-$theme.screen.txt"
