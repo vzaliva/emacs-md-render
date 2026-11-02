@@ -75,14 +75,15 @@
   "Test face inheriting from `mdview-code-test-inherit'."
   :group 'mdview)
 
-(defface mdview-code-test-cycle-a
-  '((t :inherit mdview-code-test-cycle-b))
-  "Test face in an inheritance cycle."
+;; Emacs 31 refuses to define faces that inherit from each other in a
+;; cycle, so these two are plain faces; the cycle is faked where it is
+;; needed (see `mdview-code-map-face-inheritance').
+(defface mdview-code-test-cycle-a '((t))
+  "Test face standing in for one end of an inheritance cycle."
   :group 'mdview)
 
-(defface mdview-code-test-cycle-b
-  '((t :inherit mdview-code-test-cycle-a))
-  "Test face in an inheritance cycle."
+(defface mdview-code-test-cycle-b '((t))
+  "Test face standing in for the other end of an inheritance cycle."
   :group 'mdview)
 
 (defconst mdview-code-test-elisp
@@ -633,7 +634,17 @@ scratch buffer is discarded either way."
   (should (eq (mdview-code-map-face 'mdview-code-test-inherit) 'mdview-code-type))
   (should (eq (mdview-code-map-face 'mdview-code-test-inherit-2) 'mdview-code-type))
   ;; A cycle terminates with nil instead of looping.
-  (should-not (mdview-code-map-face 'mdview-code-test-cycle-a))
+  (let ((real-face-attribute (symbol-function 'face-attribute)))
+    (cl-letf (((symbol-function 'face-attribute)
+               (lambda (face attribute &rest args)
+                 (if (and (eq attribute :inherit)
+                          (memq face '(mdview-code-test-cycle-a
+                                       mdview-code-test-cycle-b)))
+                     (if (eq face 'mdview-code-test-cycle-a)
+                         'mdview-code-test-cycle-b
+                       'mdview-code-test-cycle-a)
+                   (apply real-face-attribute face attribute args)))))
+      (should-not (mdview-code-map-face 'mdview-code-test-cycle-a))))
   ;; Material faces themselves are left alone.
   (should (eq (mdview-code-map-face 'mdview-code-keyword) 'mdview-code-keyword)))
 
