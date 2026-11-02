@@ -822,8 +822,7 @@ The buffer-local hooks are installed on the first rendering and stay
   window and render it; rejects directories and unreadable files with a
   `user-error`; returns the buffer), `mdview-toggle` (switch source ↔
   rendering; `C-c C-v` in the rendering), `mdview-mode`.
-- Keys while rendered: `q` `mdview-quit` (`quit-window`; the buffer stays
-  rendered), `e` and `C-x C-q` (`[remap read-only-mode]`) `mdview-edit`
+- Keys while rendered: `e` `mdview-edit`
   (back to the source at the line of the block at point), `g`
   `mdview-refresh` (render again, parsing again), `TAB`/`S-TAB`
   `mdview-next-link`/`mdview-previous-link`, `RET`/`mouse-1`/`mouse-2`

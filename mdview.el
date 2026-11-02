@@ -224,7 +224,6 @@ See `mdview--apply-view-settings' for the values used while rendered.")
 
 (defvar mdview-mode-map
   (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "q") #'mdview-quit)
     (define-key map (kbd "g") #'mdview-refresh)
     (define-key map (kbd "TAB") #'mdview-next-link)
     (define-key map [backtab] #'mdview-previous-link)
@@ -246,7 +245,6 @@ See `mdview--apply-view-settings' for the values used while rendered.")
     (define-key map (kbd "<") #'beginning-of-buffer)
     (define-key map (kbd ">") #'end-of-buffer)
     (define-key map (kbd "C-c C-v") #'mdview-toggle)
-    (define-key map [remap read-only-mode] #'mdview-edit)
     map)
   "Keymap of `mdview-mode', active while a buffer is rendered.")
 
@@ -1478,12 +1476,6 @@ Point goes to the line of the block at point."
   (interactive)
   (mdview--check-view)
   (mdview-mode -1))
-
-(defun mdview-quit ()
-  "Quit the window showing the rendered buffer, with `quit-window'.
-The buffer stays rendered; \\[mdview-edit] shows its source instead."
-  (interactive)
-  (quit-window))
 
 (defun mdview-next-link ()
   "Move point to the next link, wrapping around to the first one."

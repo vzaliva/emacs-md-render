@@ -153,7 +153,6 @@ Keys in the rendered buffer (`mdview-mode`):
 
 | Key | Action |
 |---|---|
-| `q` | `quit-window` (the buffer stays rendered) |
 | `g` | Re-render from the source |
 | `TAB` / `S-TAB` | Next / previous link |
 | `RET`, `mouse-1`, `mouse-2` | Follow the link at point: anchors scroll to the heading, Markdown files are visited and shown rendered in the same window (with history), other local files open in Emacs, URLs in the browser; footnote references jump to their definition and back; local images open in Emacs, remote ones in the browser; an image that is itself a link follows the link |
@@ -161,7 +160,7 @@ Keys in the rendered buffer (`mdview-mode`):
 | `t` | Table of contents: pick a heading with completion (the heading at point is the default) |
 | `l` / `r` | Back / forward through the Markdown documents followed via links in this window (the history is per window) |
 | `i` | Toggle inline images |
-| `e`, `C-x C-q` | Show the source for editing (`mdview-edit`), at the corresponding line |
+| `e` | Show the source for editing (`mdview-edit`), at the corresponding line |
 | `w` | Copy the link at point: local files as the absolute file name they resolve to, URLs as written (`C-u w` always copies the raw link) |
 | `SPC` / `DEL` / `S-SPC` | Scroll down / up |
 | `<` / `>` | Beginning / end of the document |

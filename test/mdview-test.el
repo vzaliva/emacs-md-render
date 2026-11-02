@@ -187,7 +187,7 @@ window, and BODY runs with it current; it is killed afterwards."
           (should (= unremapped 1)))))))
 
 (ert-deftest mdview-test-keymap ()
-  (dolist (binding '(("q" . mdview-quit) ("g" . mdview-refresh)
+  (dolist (binding '(("g" . mdview-refresh)
                      ("TAB" . mdview-next-link) ("<backtab>" . mdview-previous-link)
                      ("RET" . mdview-follow-link) ("n" . mdview-next-heading)
                      ("p" . mdview-previous-heading) ("t" . mdview-toc)
@@ -198,7 +198,8 @@ window, and BODY runs with it current; it is killed afterwards."
                      ("<" . beginning-of-buffer) (">" . end-of-buffer)
                      ("C-c C-v" . mdview-toggle)))
     (should (eq (lookup-key mdview-mode-map (kbd (car binding))) (cdr binding))))
-  (should (eq (lookup-key mdview-mode-map [remap read-only-mode]) #'mdview-edit))
+  (should-not (lookup-key mdview-mode-map (kbd "q")))
+  (should-not (command-remapping 'read-only-mode nil (list mdview-mode-map)))
   (should (eq (lookup-key mdview-mode-map [mouse-1]) #'mdview-mouse-follow-link))
   (should (eq (lookup-key mdview-mode-map [mouse-2]) #'mdview-mouse-follow-link)))
 
@@ -561,16 +562,6 @@ window, and BODY runs with it current; it is killed afterwards."
       (should (equal (mdview-test--source-lines) '(1 3 5)))
       (should (= (mdview--source-line-at (point)) 5))
       (should-not (buffer-modified-p)))))
-
-(ert-deftest mdview-test-quit-keeps-rendering ()
-  (mdview-test-with-source (source "Text\n")
-    (let ((called nil))
-      (with-current-buffer source
-        (mdview-mode 1)
-        (cl-letf (((symbol-function 'quit-window) (lambda (&rest _) (setq called t))))
-          (mdview-quit))
-        (should called)
-        (should mdview--rendered)))))
 
 ;;;; Saving, reverting, auto-revert, major modes, killing
 
