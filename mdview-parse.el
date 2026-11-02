@@ -32,6 +32,14 @@
 ;; complete reference map.  Heading ids, task list markers, footnote
 ;; indices and the YAML front matter are handled here as well.
 ;;
+;; Source positions: every line is split off the input with its source
+;; offset, and every string a block stores is paired with the offset of
+;; its first character.  Block nodes get `:pos' (and code and HTML blocks
+;; `:positions', one per line), and the content offsets that the inline
+;; parser records in the `mdview-pos' text property are translated into
+;; source offsets through a segment map of the block's lines
+;; (`mdview-parse--segments', `mdview-parse--translate-positions').
+;;
 ;; Robustness: the parser never signals.  Regular expressions are only
 ;; applied to single lines and never contain unbounded repetition of a
 ;; group (Emacs's matcher overflows its stack on such patterns when a
@@ -81,14 +89,18 @@ CommonMark requires."
 TYPE is one of `document', `paragraph', `heading', `blockquote', `list',
 `item', `code-block', `html-block', `thematic-break', `table' or
 `footnote-definition'.  CHILDREN and STRINGS are kept in reverse order
-while parsing."
+while parsing.  POSITIONS is parallel to STRINGS (same order, same
+length): the source offset of the first character of each string.  POS
+is the source offset of the block's start (docs/DESIGN.md section 3)."
   type
   (open t)
   parent
   children
   line
+  pos
   depth
   strings
+  positions
   last-line-blank
   last-line-checked
   ;; heading
@@ -102,16 +114,18 @@ while parsing."
   ;; footnote definitions
   label
   ;; tables: ALIGN is the alignment list, ROWS the reversed list of rows,
-  ;; each a list of cell strings
+  ;; each a list of cells (STRING . SOURCE-OFFSET)
   align rows)
 
 (cl-defstruct (mdview-parse--state
                (:constructor mdview-parse--make-state)
                (:copier nil))
-  "The parser state threaded through phase 1."
+  "The parser state threaded through phase 1.
+LINE-START is the source offset of the first character of LINE."
   doc tip oldtip
   (line "")
   (line-number 0)
+  (line-start 0)
   (offset 0)
   (column 0)
   (next-nonspace 0)
@@ -173,12 +187,25 @@ a string holding a very long run of blanks followed by other text."
 Return nil when REGEXP does not match there."
   (and (eq (string-match regexp line start) start) (match-end 0)))
 
-(defun mdview-parse--normalize-newlines (string)
-  "Return STRING with CRLF and CR line endings turned into LF and NUL replaced."
-  (let ((s (if (string-search "\r" string)
-               (replace-regexp-in-string "\r\n?" "\n" string t t)
-             string)))
-    (if (string-search "\0" s) (subst-char-in-string ?\0 #xFFFD s) s)))
+(defun mdview-parse--split-lines (string)
+  "Split STRING into lines at CRLF, CR or LF.
+Return a cons of two lists: the lines without their terminators (NUL
+characters replaced by U+FFFD), and in parallel the source offsets of
+their first characters.  A terminator at the very end yields no
+extra empty line (but the empty string is one empty line)."
+  (let* ((text (if (string-search "\0" string)
+                   (subst-char-in-string ?\0 #xFFFD string)
+                 string))
+         (len (length text))
+         (pos 0) (lines nil) (starts nil))
+    (while (string-match "\r\n?\\|\n" text pos)
+      (push (substring text pos (match-beginning 0)) lines)
+      (push pos starts)
+      (setq pos (match-end 0)))
+    (when (or (< pos len) (= len 0))
+      (push (substring text pos) lines)
+      (push pos starts))
+    (cons (nreverse lines) (nreverse starts))))
 
 ;;;; Backslash escapes, entities, labels
 
@@ -286,9 +313,13 @@ tab stop."
       (substring line offset))))
 
 (defun mdview-parse--add-line (p)
-  "Append the remainder of the current line of P to the tip block."
-  (push (mdview-parse--rest-of-line p)
-        (mdview-parse--block-strings (mdview-parse--state-tip p))))
+  "Append the remainder of the current line of P to the tip block.
+Its source offset (that of a partially consumed tab, if any) is
+recorded in the block's positions."
+  (let ((tip (mdview-parse--state-tip p)))
+    (push (mdview-parse--rest-of-line p) (mdview-parse--block-strings tip))
+    (push (+ (mdview-parse--state-line-start p) (mdview-parse--state-offset p))
+          (mdview-parse--block-positions tip))))
 
 (defun mdview-parse--content (block)
   "Return the raw text content of leaf BLOCK: its lines joined by newlines."
@@ -316,6 +347,8 @@ Blocks that cannot contain TYPE are finalized first."
          (block (mdview-parse--make-block
                  :type type :parent tip
                  :line (mdview-parse--state-line-number p)
+                 :pos (+ (mdview-parse--state-line-start p)
+                         (mdview-parse--state-next-nonspace p))
                  :depth (1+ (mdview-parse--block-depth tip)))))
     (push block (mdview-parse--block-children tip))
     (setf (mdview-parse--state-tip p) block)
@@ -336,10 +369,12 @@ Blocks that cannot contain TYPE are finalized first."
     ('code-block
      (unless (mdview-parse--block-fenced block)
        ;; Indented code: trailing blank lines are not part of the block.
-       (let ((strings (mdview-parse--block-strings block)))
+       (let ((strings (mdview-parse--block-strings block))
+             (positions (mdview-parse--block-positions block)))
          (while (and strings (mdview-parse--blank-from-p (car strings) 0))
-           (setq strings (cdr strings)))
-         (setf (mdview-parse--block-strings block) strings))))
+           (setq strings (cdr strings) positions (cdr positions)))
+         (setf (mdview-parse--block-strings block) strings
+               (mdview-parse--block-positions block) positions))))
     ('list (mdview-parse--finalize-list block)))
   (setf (mdview-parse--state-tip p) (mdview-parse--block-parent block)))
 
@@ -353,15 +388,37 @@ Blocks that cannot contain TYPE are finalized first."
         (setf (mdview-parse--state-oldtip p) parent)))
     (setf (mdview-parse--state-all-closed p) t)))
 
+(defun mdview-parse--drop-prefix (block count)
+  "Remove the first COUNT characters of the content of leaf BLOCK.
+The content is the block's strings joined by newlines (see
+`mdview-parse--content'); the strings and their positions are cut
+segment-wise, so the positions stay exact: whole leading strings
+\(with their joining newline) are removed, the first remaining string
+is shortened and its position advanced by the rest."
+  (when (> count 0)
+    (let ((strings (reverse (mdview-parse--block-strings block)))
+          (positions (reverse (mdview-parse--block-positions block))))
+      (while (and (> count 0) (cdr strings)
+                  (>= count (1+ (length (car strings)))))
+        (setq count (- count (1+ (length (car strings))))
+              strings (cdr strings)
+              positions (cdr positions)))
+      (when (and (> count 0) strings)
+        (let ((n (min count (length (car strings)))))
+          (setq strings (cons (substring (car strings) n) (cdr strings))
+                positions (cons (+ (or (car positions) 0) n) (cdr positions)))))
+      (setf (mdview-parse--block-strings block) (nreverse strings)
+            (mdview-parse--block-positions block) (nreverse positions)))))
+
 (defun mdview-parse--finalize-paragraph (p block)
   "Strip link reference definitions from paragraph BLOCK; drop it if empty.
 P is the parser state whose reference map receives the definitions."
-  (let ((rest (mdview-parse--strip-references
-               (mdview-parse--content block)
-               (mdview-parse--state-refs p))))
+  (let* ((content (mdview-parse--content block))
+         (rest (mdview-parse--strip-references
+                content (mdview-parse--state-refs p))))
     (if (mdview-parse--blank-from-p rest 0)
         (mdview-parse--remove-block block)
-      (setf (mdview-parse--block-strings block) (list rest)))))
+      (mdview-parse--drop-prefix block (- (length content) (length rest))))))
 
 (defun mdview-parse--ends-with-blank-line-p (block)
   "Return non-nil when BLOCK, or the last descendant of a list or item, ends blank.
@@ -652,11 +709,15 @@ Trailing whitespace is removed, then an optional closing sequence of
       (mdview-parse--advance-next-nonspace p)
       (mdview-parse--advance-offset p run nil)
       (mdview-parse--close-unmatched-blocks p)
-      (let ((block (mdview-parse--add-child p 'heading)))
+      (let* ((block (mdview-parse--add-child p 'heading))
+             (offset (mdview-parse--state-offset p))
+             (text (substring line offset)))
         (setf (mdview-parse--block-level block) run
               (mdview-parse--block-strings block)
-              (list (mdview-parse--atx-content
-                     (substring line (mdview-parse--state-offset p))))))
+              (list (mdview-parse--atx-content text))
+              (mdview-parse--block-positions block)
+              (list (+ (mdview-parse--state-line-start p)
+                       (mdview-parse--skip-spaces line offset)))))
       (mdview-parse--advance-offset p (length line) nil)
       2)))
 
@@ -724,13 +785,17 @@ Return 2 on success."
       (mdview-parse--close-unmatched-blocks p)
       ;; Reference definitions at the start of the paragraph are not
       ;; heading text.
-      (let ((content (mdview-parse--strip-references
-                      (mdview-parse--content container)
-                      (mdview-parse--state-refs p))))
-        (setf (mdview-parse--block-strings container)
-              (and (> (length content) 0) (list content)))
+      (let* ((all (mdview-parse--content container))
+             (content (mdview-parse--strip-references
+                       all (mdview-parse--state-refs p))))
+        (if (> (length content) 0)
+            (mdview-parse--drop-prefix container (- (length all) (length content)))
+          (setf (mdview-parse--block-strings container) nil
+                (mdview-parse--block-positions container) nil))
         (when (> (length content) 0)
           (setf (mdview-parse--block-type container) 'heading
+                (mdview-parse--block-pos container)
+                (car (last (mdview-parse--block-positions container)))
                 (mdview-parse--block-level container) (if (eq c ?=) 1 2))
           (mdview-parse--advance-offset p (length line) nil)
           2)))))
@@ -893,30 +958,41 @@ Return 2 on success."
 ;;;; Phase 1: GFM tables
 
 (defun mdview-parse--split-row (text)
-  "Split table row TEXT into a list of trimmed cell strings.
-Leading and trailing pipes are optional; a pipe preceded by a backslash
-belongs to the cell and becomes a literal `|' (also inside code spans)."
-  (let* ((s (mdview-parse--trim text))
-         (len (length s))
-         (i 0) (start 0) (cells nil))
-    (when (and (> len 0) (eq (aref s 0) ?|))
-      (setq i 1 start 1))
-    (while (< i len)
-      (let ((c (aref s i)))
-        (cond ((and (eq c ?\\) (< (1+ i) len))
+  "Split table row TEXT into a list of trimmed cells (STRING . OFFSET).
+OFFSET is the index in TEXT of the first character of the trimmed cell
+\(where it would start, for an empty cell).  Leading and trailing pipes
+are optional; a pipe preceded by a backslash belongs to the cell and
+becomes a literal `|' (also inside code spans)."
+  (let* ((blank '(?\s ?\t ?\n ?\r))
+         (end (length text))
+         (i 0) (start 0) (ranges nil))
+    (while (and (< i end) (memq (aref text i) blank))
+      (setq i (1+ i)))
+    (while (and (> end i) (memq (aref text (1- end)) blank))
+      (setq end (1- end)))
+    (setq start i)
+    (when (and (< i end) (eq (aref text i) ?|))
+      (setq i (1+ i) start i))
+    (while (< i end)
+      (let ((c (aref text i)))
+        (cond ((and (eq c ?\\) (< (1+ i) end))
                (setq i (+ i 2)))
               ((eq c ?|)
-               (push (substring s start i) cells)
+               (push (cons start i) ranges)
                (setq i (1+ i) start i))
               (t (setq i (1+ i))))))
-    (let ((last (substring s start)))
-      ;; Everything after the last pipe is a cell unless it is only
-      ;; whitespace, which means the row ended with a pipe.
-      (unless (and cells (mdview-parse--blank-from-p last 0))
-        (push last cells)))
-    (mapcar (lambda (cell)
-              (mdview-parse--trim (string-replace "\\|" "|" cell)))
-            (nreverse cells))))
+    ;; Everything after the last pipe is a cell unless it is only
+    ;; whitespace, which means the row ended with a pipe.
+    (unless (and ranges (>= start end))
+      (push (cons start end) ranges))
+    (mapcar (lambda (range)
+              (let ((from (car range)) (to (cdr range)))
+                (while (and (< from to) (memq (aref text from) blank))
+                  (setq from (1+ from)))
+                (cons (mdview-parse--trim
+                       (string-replace "\\|" "|" (substring text from to)))
+                      from)))
+            (nreverse ranges))))
 
 (defun mdview-parse--delimiter-row (text)
   "If TEXT is a GFM table delimiter row, return its list of alignments.
@@ -924,7 +1000,7 @@ Each element is `left', `center', `right' or nil."
   (when (string-match-p "\\`[ \t|:-]+\\'" text)
     (let ((cells (mdview-parse--split-row text)) (aligns nil) (ok t))
       (dolist (cell cells)
-        (if (string-match "\\`\\(:?\\)-+\\(:?\\)\\'" cell)
+        (if (string-match "\\`\\(:?\\)-+\\(:?\\)\\'" (car cell))
             (let ((left (> (match-end 1) (match-beginning 1)))
                   (right (> (match-end 2) (match-beginning 2))))
               (push (cond ((and left right) 'center)
@@ -933,6 +1009,12 @@ Each element is `left', `center', `right' or nil."
                     aligns))
           (setq ok nil)))
       (and ok cells (nreverse aligns)))))
+
+(defun mdview-parse--shift-cells (cells start)
+  "Return CELLS of `mdview-parse--split-row' with START added to their offsets.
+The result holds cells (STRING . SOURCE-OFFSET) for a row whose text
+begins at source offset START."
+  (mapcar (lambda (cell) (cons (car cell) (+ start (cdr cell)))) cells))
 
 (defun mdview-parse--start-table-header (p container)
   "Try to turn the last line of paragraph CONTAINER into a table header.
@@ -948,21 +1030,26 @@ cells as that line.  Return 2 on success."
         ;; line is simply the head of the list; nothing is joined or
         ;; copied unless the header actually matches.
         (let* ((strings (mdview-parse--block-strings container))
+               (positions (mdview-parse--block-positions container))
+               (row-start (or (car positions) 0))
                (cells (mdview-parse--split-row (car strings))))
           (when (= (length cells) (length aligns))
             (mdview-parse--close-unmatched-blocks p)
             (let ((parent (mdview-parse--block-parent container)))
               (if (cdr strings)
                   (progn
-                    (setf (mdview-parse--block-strings container) (cdr strings))
+                    (setf (mdview-parse--block-strings container) (cdr strings)
+                          (mdview-parse--block-positions container) (cdr positions))
                     (mdview-parse--finalize p container))
                 (mdview-parse--remove-block container)
                 (setf (mdview-parse--state-tip p) parent))
               (let ((table (mdview-parse--add-child p 'table)))
                 (setf (mdview-parse--block-align table) aligns
-                      (mdview-parse--block-rows table) (list cells)
+                      (mdview-parse--block-rows table)
+                      (list (mdview-parse--shift-cells cells row-start))
                       (mdview-parse--block-line table)
-                      (1- (mdview-parse--state-line-number p)))))
+                      (1- (mdview-parse--state-line-number p))
+                      (mdview-parse--block-pos table) row-start)))
             (mdview-parse--advance-offset p (length line) nil)
             2))))))
 
@@ -971,9 +1058,11 @@ cells as that line.  Return 2 on success."
 Return 2 on success."
   (when (and (eq (mdview-parse--block-type container) 'table)
              (not (mdview-parse--state-indented p)))
-    (let ((line (mdview-parse--state-line p)))
-      (push (mdview-parse--split-row
-             (substring line (mdview-parse--state-next-nonspace p)))
+    (let ((line (mdview-parse--state-line p))
+          (ns (mdview-parse--state-next-nonspace p)))
+      (push (mdview-parse--shift-cells
+             (mdview-parse--split-row (substring line ns))
+             (+ (mdview-parse--state-line-start p) ns))
             (mdview-parse--block-rows container))
       (mdview-parse--advance-offset p (length line) nil)
       2)))
@@ -1016,10 +1105,12 @@ Return 1, 2 or nil as the start functions do."
             starts (cdr starts)))
     result))
 
-(defun mdview-parse--incorporate-line (p line)
-  "Add LINE to the block tree being built in parser state P."
+(defun mdview-parse--incorporate-line (p line &optional start)
+  "Add LINE to the block tree being built in parser state P.
+START is the source offset of the line's first character (default 0)."
   (let ((container (mdview-parse--state-doc p)))
     (setf (mdview-parse--state-oldtip p) (mdview-parse--state-tip p)
+          (mdview-parse--state-line-start p) (or start 0)
           (mdview-parse--state-offset p) 0
           (mdview-parse--state-column p) 0
           (mdview-parse--state-blank p) nil
@@ -1247,33 +1338,144 @@ That is a `key: value' mapping entry or a `#' comment."
 
 (defun mdview-parse--build-tree (string)
   "Run phase 1 over STRING and return the final parser state."
-  (let* ((text (mdview-parse--normalize-newlines string))
-         (lines (split-string text "\n"))
-         (doc (mdview-parse--make-block :type 'document :line 1 :depth 0))
+  (let* ((split (mdview-parse--split-lines string))
+         (lines (car split))
+         (starts (cdr split))
+         (doc (mdview-parse--make-block :type 'document :line 1 :pos 0 :depth 0))
          (p (mdview-parse--make-state :doc doc :tip doc
                                       :refs (make-hash-table :test #'equal)))
          (skip (mdview-parse--front-matter-lines lines)))
-    ;; A final newline produces an empty last element, not a blank line.
-    (when (string-suffix-p "\n" text)
-      (setq lines (nbutlast lines)))
     (when skip
       (setf (mdview-parse--state-line-number p) skip)
-      (setq lines (nthcdr skip lines)))
-    (dolist (line lines)
-      (mdview-parse--incorporate-line p line))
+      (setq lines (nthcdr skip lines)
+            starts (nthcdr skip starts)))
+    (while lines
+      (mdview-parse--incorporate-line p (car lines) (car starts))
+      (setq lines (cdr lines) starts (cdr starts)))
     (while (mdview-parse--state-tip p)
       (mdview-parse--finalize p (mdview-parse--state-tip p)))
     p))
 
 ;;;; Phase 2: AST construction
 
-(defun mdview-parse--inline (string refs)
+(defun mdview-parse--segments (block &optional skip)
+  "Return the segment map of the content of leaf BLOCK without SKIP characters.
+The content is `(substring (mdview-parse--content block) skip)'; the
+map is an ascending list of (CONTENT-OFFSET . SOURCE-OFFSET), one
+element per stored string of BLOCK: the offset in that content of the
+string's first character and its source offset.  A SKIP falling inside
+a string yields (0 . SOURCE) for it, SOURCE being the source offset of
+the first character kept; strings skipped entirely are left out."
+  (let ((skip (or skip 0))
+        (cum 0)
+        (map nil))
+    (cl-mapc (lambda (string position)
+               (let ((start (- cum skip)))
+                 (cond ((>= start 0) (push (cons start position) map))
+                       ((>= (+ start (length string)) 0)
+                        ;; SKIP ends inside STRING or on its newline.
+                        (push (cons 0 (- position start)) map)))
+                 (setq cum (+ cum (length string) 1))))
+             (reverse (mdview-parse--block-strings block))
+             (reverse (mdview-parse--block-positions block)))
+    (nreverse map)))
+
+(defun mdview-parse--segment-index (map content)
+  "Return the index of the last element of vector MAP at or before CONTENT.
+MAP is a segment map as a vector, CONTENT a content offset; return 0
+when CONTENT precedes every element."
+  (let ((lo 0) (hi (1- (length map))))
+    (while (< lo hi)
+      (let ((mid (/ (+ lo hi 1) 2)))
+        (if (<= (car (aref map mid)) content)
+            (setq lo mid)
+          (setq hi (1- mid)))))
+    lo))
+
+(defun mdview-parse--translate-offset (map content)
+  "Translate CONTENT, a content offset, to a source offset through vector MAP."
+  (let ((segment (aref map (mdview-parse--segment-index map content))))
+    (+ (cdr segment) (- content (car segment)))))
+
+(defun mdview-parse--translate-string (string map)
+  "Return a copy of STRING with its `mdview-pos' values translated through MAP.
+MAP is a segment map as a vector, or nil to remove the property.  A run
+whose content range crosses a segment boundary is split there, so that
+each part gets the source offset of its own first character."
+  (let* ((len (length string))
+         (i (or (text-property-not-all 0 len 'mdview-pos nil string) len))
+         (new (if (< i len) (copy-sequence string) string)))
+    (while (< i len)
+      (let ((value (get-text-property i 'mdview-pos string))
+            (next (or (next-single-property-change i 'mdview-pos string) len)))
+        (cond ((not (integerp value)))
+              ((null map) (remove-list-of-text-properties i next '(mdview-pos) new))
+              (t
+               (let ((k (mdview-parse--segment-index map value))
+                     (from i))
+                 (while (< from next)
+                   (let* ((segment (aref map k))
+                          (content (+ value (- from i)))
+                          (bound (and (< (1+ k) (length map))
+                                      (+ i (- (car (aref map (1+ k))) value))))
+                          (to (if (and bound (> bound from)) (min bound next) next)))
+                     (put-text-property from to 'mdview-pos
+                                        (+ (cdr segment) (- content (car segment)))
+                                        new)
+                     (setq from to k (1+ k)))))))
+        (setq i next)))
+    new))
+
+(defun mdview-parse--translate-node (node map)
+  "Return inline NODE with its positions translated through vector MAP.
+Strings are handled by `mdview-parse--translate-string'; for other
+nodes the `:pos' property and the `:alt' string are translated and the
+children are visited.  A nil MAP removes the positions instead."
+  (cond
+   ((stringp node) (mdview-parse--translate-string node map))
+   ((and (consp node) (listp (cadr node)))
+    (let* ((props (cadr node))
+           (pos (plist-get props :pos))
+           (alt (plist-get props :alt)))
+      (when (or (integerp pos) (stringp alt))
+        (setq props (copy-sequence props))
+        (when (integerp pos)
+          (setq props (plist-put props :pos (and map (mdview-parse--translate-offset
+                                                      map pos)))))
+        (when (stringp alt)
+          (setq props (plist-put props :alt (mdview-parse--translate-string alt map)))))
+      (cons (car node)
+            (cons props (mapcar (lambda (child)
+                                  (mdview-parse--translate-node child map))
+                                (cddr node))))))
+   (t node)))
+
+(defun mdview-parse--translate-positions (nodes segments)
+  "Translate the positions in inline NODES from content to source offsets.
+SEGMENTS is the segment map of the parsed content (see
+`mdview-parse--segments'): a content offset C becomes S + (C - C0) for
+the last element (C0 . S) with C0 <= C.  The `mdview-pos' runs of text
+nodes and of image `:alt' strings and the `:pos' of nodes are
+translated; NODES are not modified.  When SEGMENTS is nil the
+positions are removed instead, since they could not be right."
+  (let ((map (and segments (vconcat segments))))
+    (mapcar (lambda (node) (mdview-parse--translate-node node map)) nodes)))
+
+(defun mdview-parse--inline (string refs &optional segments)
   "Parse STRING into inline nodes with `mdview-inline-parse' and REFS.
-The parser must never signal, so an error inside the inline parser
-degrades to a single text node holding STRING."
-  (condition-case nil
-      (mdview-inline-parse string refs)
-    (error (list string))))
+SEGMENTS is the segment map of STRING (see `mdview-parse--segments'),
+used to turn the content offsets of the result into source offsets; when
+it is nil the positions are removed.  The parser must never signal, so
+an error inside the inline parser degrades to a single text node
+holding STRING."
+  (let ((nodes (condition-case nil
+                   (mdview-inline-parse string refs)
+                 (error (list (propertize string 'mdview-pos 0))))))
+    (condition-case nil
+        (mdview-parse--translate-positions nodes segments)
+      (error (condition-case nil
+                 (mdview-parse--translate-positions nodes nil)
+               (error nodes))))))
 
 (defun mdview-parse--unique-id (text ids)
   "Return a slug of heading TEXT not yet in hash table IDS, and register it.
@@ -1299,16 +1501,17 @@ as in issue templates, is an empty check box on GitHub too)."
     (when (and first (eq (mdview-parse--block-type first) 'paragraph))
       (let ((content (mdview-parse--content first)))
         (when (string-match "\\`\\[\\([ xX]\\)\\]\\(?:[ \t]+\\|\n\\|\\'\\)" content)
-          (setf (mdview-parse--block-strings first)
-                (list (substring content (match-end 0))))
+          (mdview-parse--drop-prefix first (match-end 0))
           (if (eq (aref content 1) ?\s) 'unchecked 'checked))))))
 
 (defun mdview-parse--pad-cells (cells count)
-  "Return CELLS adjusted to exactly COUNT strings (missing ones are empty)."
+  "Return CELLS adjusted to exactly COUNT cells (STRING . SOURCE-OFFSET).
+Missing cells are empty, with no source offset: (\"\" . nil)."
   (let ((n (length cells)))
     (cond ((= n count) cells)
           ((> n count) (seq-take cells count))
-          (t (append cells (make-list (- count n) ""))))))
+          (t (append cells (mapcar (lambda (_) (cons "" nil))
+                                   (make-list (- count n) nil)))))))
 
 (defun mdview-parse--table-node (block refs)
   "Build the `table' AST node for table BLOCK, parsing cells with REFS."
@@ -1320,12 +1523,15 @@ as in issue templates, is an empty check box on GitHub too)."
       (push (apply #'mdview-node 'table-row (list :header header)
                    (mapcar (lambda (cell)
                              (apply #'mdview-node 'table-cell nil
-                                    (mdview-parse--inline cell refs)))
+                                    (mdview-parse--inline
+                                     (car cell) refs
+                                     (and (cdr cell) (list (cons 0 (cdr cell)))))))
                            (mdview-parse--pad-cells cells count)))
             rows)
       (setq header nil))
     (apply #'mdview-node 'table
-           (list :align aligns :line (mdview-parse--block-line block))
+           (list :align aligns :line (mdview-parse--block-line block)
+                 :pos (mdview-parse--block-pos block))
            (nreverse rows))))
 
 (defun mdview-parse--children-nodes (block refs ids)
@@ -1337,25 +1543,37 @@ as in issue templates, is an empty check box on GitHub too)."
   "Convert phase-1 BLOCK into an AST node.
 REFS is the reference map handed to the inline parser and IDS the hash
 table of heading ids used so far."
-  (let ((line (mdview-parse--block-line block)))
+  (let ((line (mdview-parse--block-line block))
+        (pos (mdview-parse--block-pos block)))
     (pcase (mdview-parse--block-type block)
       ('document
        (apply #'mdview-node 'document (list :refs refs :footnotes nil)
               (mdview-parse--children-nodes block refs ids)))
       ('paragraph
-       (apply #'mdview-node 'paragraph (list :line line)
+       ;; Only right-trimmed, so the segment map needs no skip.
+       (apply #'mdview-node 'paragraph
+              (list :line line
+                    :pos (or (car (last (mdview-parse--block-positions block))) pos))
               (mdview-parse--inline
-               (mdview-parse--trim-right (mdview-parse--content block)) refs)))
+               (mdview-parse--trim-right (mdview-parse--content block)) refs
+               (mdview-parse--segments block))))
       ('heading
-       (let* ((inlines (mdview-parse--inline
-                        (mdview-parse--trim (mdview-parse--content block)) refs))
+       (let* ((content (mdview-parse--content block))
+              (skip (let ((i 0) (len (length content)))
+                      (while (and (< i len) (memq (aref content i) '(?\s ?\t ?\n ?\r)))
+                        (setq i (1+ i)))
+                      i))
+              (inlines (mdview-parse--inline
+                        (mdview-parse--trim content) refs
+                        (mdview-parse--segments block skip)))
               (id (mdview-parse--unique-id
                    (mapconcat #'mdview-node-text inlines "") ids)))
          (apply #'mdview-node 'heading
-                (list :level (mdview-parse--block-level block) :id id :line line)
+                (list :level (mdview-parse--block-level block) :id id
+                      :line line :pos pos)
                 inlines)))
       ('blockquote
-       (apply #'mdview-node 'blockquote (list :line line)
+       (apply #'mdview-node 'blockquote (list :line line :pos pos)
               (mdview-parse--children-nodes block refs ids)))
       ('list
        (let ((ordered (eq (mdview-parse--block-list-type block) 'ordered)))
@@ -1366,11 +1584,11 @@ table of heading ids used so far."
                               :marker (if ordered
                                           (mdview-parse--block-delimiter block)
                                         (mdview-parse--block-bullet-char block))
-                              :line line))
+                              :line line :pos pos))
                 (mdview-parse--children-nodes block refs ids))))
       ('item
        (let ((task (mdview-parse--take-task-marker block)))
-         (apply #'mdview-node 'item (list :task task :line line)
+         (apply #'mdview-node 'item (list :task task :line line :pos pos)
                 (mdview-parse--children-nodes block refs ids))))
       ('code-block
        (let* ((info (mdview-parse--block-info block))
@@ -1379,16 +1597,21 @@ table of heading ids used so far."
          (mdview-node 'code-block
                       (list :lang lang :info info
                             :fenced (and (mdview-parse--block-fenced block) t)
-                            :line line)
+                            :line line :pos pos
+                            :positions (reverse (mdview-parse--block-positions block)))
                       (mdview-parse--content block))))
       ('html-block
-       (mdview-node 'html-block (list :line line) (mdview-parse--content block)))
+       (mdview-node 'html-block
+                    (list :line line :pos pos
+                          :positions (reverse (mdview-parse--block-positions block)))
+                    (mdview-parse--content block)))
       ('thematic-break
-       (mdview-node 'thematic-break (list :line line)))
+       (mdview-node 'thematic-break (list :line line :pos pos)))
       ('table (mdview-parse--table-node block refs))
       ('footnote-definition
        (apply #'mdview-node 'footnote-definition
-              (list :label (mdview-parse--block-label block) :index nil :line line)
+              (list :label (mdview-parse--block-label block) :index nil
+                    :line line :pos pos)
               (mdview-parse--children-nodes block refs ids))))))
 
 ;;;; Phase 2: footnotes
@@ -1478,7 +1701,10 @@ plain text."
 The node has `:refs', a hash table from normalized link labels to
 \(URL . TITLE), and `:footnotes', the referenced footnote definitions
 in order of first reference; its children are the block nodes of
-docs/DESIGN.md section 3.  Parsing never signals an error."
+docs/DESIGN.md section 3.  Offsets into STRING are recorded as described
+there: `:pos' on every block node, `:positions' on code and HTML blocks
+and the text property `mdview-pos' on text copied from STRING.  Parsing
+never signals an error."
   ;; Nesting is capped (`mdview-parse-max-depth' for blocks,
   ;; `mdview-inline-max-depth' for inlines), so the passes below need a
   ;; few hundred frames at most; the raised limit is a safety margin.

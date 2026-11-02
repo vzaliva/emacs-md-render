@@ -809,6 +809,365 @@ lines); joining the paragraph for every candidate was cubic."
   (let ((mdview-parse-front-matter nil))
     (should (equal (mdview-parse-test--types "---\ntitle: x\n---") '(thematic-break heading)))))
 
+;;;; Source positions
+
+(defun mdview-parse-test--pos-inline (string _refs)
+  "Return the lines of STRING as text nodes separated by soft breaks.
+Each text node carries `mdview-pos', the content offset of its first
+character, as the inline parser does for its runs."
+  (let ((start 0) (nodes nil))
+    (dolist (line (split-string string "\n"))
+      (when nodes (push (mdview-node 'soft-break nil) nodes))
+      (unless (string-empty-p line)
+        (push (propertize line 'mdview-pos start) nodes))
+      (setq start (+ start (length line) 1)))
+    (nreverse nodes)))
+
+(defmacro mdview-parse-test--with-pos-inline (&rest body)
+  "Run BODY with `mdview-inline-parse' replaced by a positioned stand-in."
+  (declare (indent 0))
+  `(cl-letf (((symbol-function 'mdview-inline-parse)
+              #'mdview-parse-test--pos-inline))
+     ,@body))
+
+(defun mdview-parse-test--string-runs (string)
+  "Return the `mdview-pos' stretches of STRING as (TEXT . VALUE)."
+  (let ((i 0) (len (length string)) (runs nil))
+    (while (< i len)
+      (let ((value (get-text-property i 'mdview-pos string))
+            (next (or (next-single-property-change i 'mdview-pos string) len)))
+        (when value
+          (push (cons (substring-no-properties string i next) value) runs))
+        (setq i next)))
+    (nreverse runs)))
+
+(defun mdview-parse-test--runs (node)
+  "Return the `mdview-pos' stretches of the text inside NODE, in order."
+  (if (stringp node)
+      (mdview-parse-test--string-runs node)
+    (apply #'append (mapcar #'mdview-parse-test--runs (mdview-node-children node)))))
+
+(defun mdview-parse-test--pos-runs (markdown)
+  "Return the stretches of the first block of MARKDOWN, parsed with positions."
+  (mdview-parse-test--with-pos-inline
+    (mdview-parse-test--runs (mdview-parse-test--first markdown))))
+
+(defun mdview-parse-test--first-leaf (node)
+  "Return the first block descendant of NODE that holds no blocks."
+  (let ((child (car (mdview-node-children node))))
+    (if (and child (memq (mdview-node-type node) '(blockquote list item)))
+        (mdview-parse-test--first-leaf child)
+      node)))
+
+(ert-deftest mdview-parse-positions-paragraph-continuations ()
+  ;; Every line of a paragraph keeps its own source offset.
+  (should (equal (mdview-parse-test--pos-runs "one\n  two\nthree")
+                 '(("one" . 0) ("two" . 6) ("three" . 10))))
+  ;; Continuation lines inside a block quote and a list item.
+  (should (equal (mdview-parse-test--pos-runs "> a\n> b") '(("a" . 2) ("b" . 6))))
+  (should (equal (mdview-parse-test--pos-runs "- a\n  b") '(("a" . 2) ("b" . 6))))
+  (should (equal (mdview-parse-test--pos-runs "1. a\n   bc") '(("a" . 3) ("bc" . 8))))
+  ;; Lazy continuation lines.
+  (should (equal (mdview-parse-test--pos-runs "> a\nb") '(("a" . 2) ("b" . 4))))
+  (should (equal (mdview-parse-test--pos-runs "> > a\n  b") '(("a" . 4) ("b" . 8))))
+  ;; The paragraph's :pos is its first content character.
+  (let ((p (mdview-parse-test--first-leaf (mdview-parse-test--first "> > text"))))
+    (should (eq (mdview-node-type p) 'paragraph))
+    (should (= (mdview-node-prop p :pos) 4))))
+
+(ert-deftest mdview-parse-positions-atx-heading ()
+  (let ((h (mdview-parse-test--first "  ##   Foo bar  ##  ")))
+    (should (= (mdview-node-prop h :pos) 2))
+    (should (equal (mdview-parse-test--pos-runs "  ##   Foo bar  ##  ")
+                   '(("Foo bar" . 7)))))
+  (should (equal (mdview-parse-test--pos-runs "# Foo#") '(("Foo#" . 2))))
+  (should (equal (mdview-parse-test--pos-runs "#\tFoo") '(("Foo" . 2))))
+  (should (equal (mdview-parse-test--pos-runs "- # a") '(("a" . 4))))
+  (should-not (mdview-parse-test--pos-runs "# ##")))
+
+(ert-deftest mdview-parse-positions-setext-heading ()
+  (should (equal (mdview-parse-test--pos-runs "Foo\n  bar\n===") '(("Foo" . 0) ("bar" . 6))))
+  ;; Reference definitions before the heading text are not heading text.
+  (let ((md "[x]: /url\nFoo\n---"))
+    (should (equal (mdview-parse-test--pos-runs md) '(("Foo" . 10))))
+    (should (= (mdview-node-prop (mdview-parse-test--first md) :pos) 10)))
+  (let ((md "[x]:\n/url\n  Foo\nbar\n==="))
+    (should (equal (mdview-parse-test--pos-runs md) '(("Foo" . 12) ("bar" . 16))))
+    (should (= (mdview-node-prop (mdview-parse-test--first md) :pos) 12))))
+
+(ert-deftest mdview-parse-positions-reference-definitions ()
+  ;; Definitions stripped from the start of a paragraph shift nothing.
+  (let ((md "[a]: /a\n[b]: /b 'title'\ntext\nmore"))
+    (should (equal (mdview-parse-test--pos-runs md) '(("text" . 24) ("more" . 29))))
+    (should (= (mdview-node-prop (mdview-parse-test--first md) :pos) 24)))
+  (let ((md "> [a]:\n> /a\n> text"))
+    (should (equal (mdview-parse-test--pos-runs md) '(("text" . 14))))))
+
+(ert-deftest mdview-parse-positions-task-items ()
+  (let* ((md "- [ ] task\n  more")
+         (item (car (mdview-node-children (mdview-parse-test--first md))))
+         (p (car (mdview-node-children item))))
+    (should (eq (mdview-node-prop item :task) 'unchecked))
+    (should (= (mdview-node-prop item :pos) 0))
+    (should (= (mdview-node-prop p :pos) 6))
+    (should (equal (mdview-parse-test--pos-runs md) '(("task" . 6) ("more" . 13)))))
+  ;; A marker alone on its line drops the whole line.
+  (should (equal (mdview-parse-test--pos-runs "- [x]\n  done") '(("done" . 8)))))
+
+(ert-deftest mdview-parse-positions-container-starts ()
+  (let ((q (mdview-parse-test--first "  > quote")))
+    (should (= (mdview-node-prop q :pos) 2)))
+  (let* ((list (mdview-parse-test--first " - a\n - b"))
+         (items (mdview-node-children list)))
+    (should (= (mdview-node-prop list :pos) 1))
+    (should (equal (mapcar (lambda (i) (mdview-node-prop i :pos)) items) '(1 6))))
+  (should (equal (mapcar (lambda (b) (mdview-node-prop b :pos))
+                         (mdview-parse-test--blocks "para\n\n * * *\n\n<div>\n</div>"))
+                 '(0 7 14)))
+  (let ((def (car (mdview-node-prop (mdview-parse-test--with-fake-inline
+                                      (mdview-parse-string "x[^n]\n\n  [^n]: note"))
+                                    :footnotes))))
+    (should (= (mdview-node-prop def :pos) 9))))
+
+(ert-deftest mdview-parse-positions-fenced-code ()
+  (let ((c (mdview-parse-test--first "  ```el\n  x\n   y\n\n  ```")))
+    (should (eq (mdview-node-type c) 'code-block))
+    (should (equal (mdview-node-text c) "x\n y\n"))
+    (should (= (mdview-node-prop c :pos) 2))
+    (should (equal (mdview-node-prop c :positions) '(10 14 17))))
+  (let ((c (car (mdview-node-children (mdview-parse-test--first "> ~~~\n> a\n>  b")))))
+    (should (= (mdview-node-prop c :pos) 2))
+    (should (equal (mdview-node-prop c :positions) '(8 12))))
+  ;; No content lines, no positions.
+  (should-not (mdview-node-prop (mdview-parse-test--first "```\n```") :positions)))
+
+(ert-deftest mdview-parse-positions-indented-code ()
+  (let ((c (mdview-parse-test--first "    a\n\n      b\n\n\npara")))
+    (should (equal (mdview-node-text c) "a\n\n  b"))
+    (should (= (mdview-node-prop c :pos) 4))
+    ;; Trailing blank lines are dropped together with their positions.
+    (should (equal (mdview-node-prop c :positions) '(4 6 11))))
+  ;; A partially consumed tab: the position is that of the tab.
+  (let ((c (car (mdview-node-children (mdview-parse-test--first ">\t\tfoo")))))
+    (should (eq (mdview-node-type c) 'code-block))
+    (should (equal (mdview-node-text c) "  foo"))
+    (should (equal (mdview-node-prop c :positions) '(2)))))
+
+(ert-deftest mdview-parse-positions-html-block ()
+  (let ((h (mdview-parse-test--first "  <div>\n  hi\n</div>")))
+    (should (eq (mdview-node-type h) 'html-block))
+    (should (= (mdview-node-prop h :pos) 2))
+    ;; HTML lines keep their indentation, so they start at the margin.
+    (should (equal (mdview-node-prop h :positions) '(0 8 13))))
+  (let ((h (car (mdview-node-children (mdview-parse-test--first "> <!--\n> x -->")))))
+    (should (equal (mdview-node-prop h :positions) '(2 9)))))
+
+(ert-deftest mdview-parse-positions-table-cells ()
+  (let* ((md "| a |  bb  |\n|---|---|\n|x \\| y|  `c`|\n| only")
+         (table (mdview-parse-test--first md)))
+    (should (= (mdview-node-prop table :pos) 0))
+    (should (= (length (mdview-node-children table)) 3))
+    (mdview-parse-test--with-pos-inline
+      (let* ((table (mdview-parse-test--first md))
+             (cells (mapcar #'mdview-node-children (mdview-node-children table))))
+        (should (equal (mapcar #'mdview-parse-test--runs (nth 0 cells))
+                       '((("a" . 2)) (("bb" . 7)))))
+        ;; The escaped pipe shortens the cell by one character; accepted.
+        (should (equal (mapcar #'mdview-parse-test--runs (nth 1 cells))
+                       '((("x | y" . 24)) (("`c`" . 33)))))
+        ;; A padding cell has no position.
+        (should (equal (mapcar #'mdview-parse-test--runs (nth 2 cells))
+                       '((("only" . 40)) nil))))))
+  ;; No outer pipes, leading spaces, a table after a paragraph line.
+  (mdview-parse-test--with-pos-inline
+    (let* ((blocks (mdview-parse-test--blocks "intro\n  a|b \n --|-- \n  c |d"))
+           (table (cadr blocks)))
+      (should (= (mdview-node-prop table :pos) 8))
+      (should (equal (mapcar #'mdview-parse-test--runs
+                             (apply #'append (mapcar #'mdview-node-children
+                                                     (mdview-node-children table))))
+                     '((("a" . 8)) (("b" . 10)) (("c" . 23)) (("d" . 26))))))))
+
+(ert-deftest mdview-parse-positions-line-endings ()
+  ;; Offsets count the characters of the original string, CRs included.
+  (should (equal (mdview-parse-test--pos-runs "a\r\nb\r\n") '(("a" . 0) ("b" . 3))))
+  (should (equal (mdview-parse-test--pos-runs "a\rb") '(("a" . 0) ("b" . 2))))
+  (let ((blocks (mdview-parse-test--blocks "a\r\n\r\n# h\r\n```\r\nx\r\n```\r\n")))
+    (should (equal (mapcar (lambda (b) (mdview-node-prop b :pos)) blocks) '(0 5 10)))
+    (should (equal (mdview-node-prop (nth 2 blocks) :positions) '(15))))
+  (mdview-parse-test--with-pos-inline
+    (should (equal (mdview-parse-test--runs
+                    (cadr (mdview-parse-test--blocks "a\r\n\r\n# h\r\n")))
+                   '(("h" . 7))))))
+
+(ert-deftest mdview-parse-positions-tab-after-list-marker ()
+  (should (equal (mdview-parse-test--pos-runs "-\tfoo\n\tbar") '(("foo" . 2) ("bar" . 7))))
+  (should (equal (mdview-parse-test--pos-runs "1.\tfoo") '(("foo" . 3)))))
+
+(ert-deftest mdview-parse-positions-front-matter ()
+  (let* ((md "---\ntitle: x\n---\n\n# Hi\n\nhello")
+         (blocks (mdview-parse-test--blocks md)))
+    (should (equal (mapcar (lambda (b) (mdview-node-prop b :pos)) blocks) '(18 24)))
+    (should (equal (mapcar (lambda (b) (mdview-node-prop b :line)) blocks) '(5 7)))
+    (mdview-parse-test--with-pos-inline
+      (should (equal (mapcar #'mdview-parse-test--runs (mdview-parse-test--blocks md))
+                     '((("Hi" . 20)) (("hello" . 24))))))))
+
+(ert-deftest mdview-parse-positions-segments ()
+  (let ((block (mdview-parse--make-block :type 'paragraph
+                                         :strings '("cd" "" "ab")
+                                         :positions '(20 15 10))))
+    ;; Content "ab\n\ncd": segments start at 0, 3 and 4.
+    (should (equal (mdview-parse--segments block) '((0 . 10) (3 . 15) (4 . 20))))
+    (should (equal (mdview-parse--segments block 1) '((0 . 11) (2 . 15) (3 . 20))))
+    ;; A skip ending on a newline maps to that newline; whole segments go.
+    (should (equal (mdview-parse--segments block 2) '((0 . 12) (1 . 15) (2 . 20))))
+    (should (equal (mdview-parse--segments block 4) '((0 . 20)))))
+  (should-not (mdview-parse--segments (mdview-parse--make-block :type 'paragraph))))
+
+(ert-deftest mdview-parse-positions-drop-prefix ()
+  (let ((block (mdview-parse--make-block :type 'paragraph
+                                         :strings '("ghi" "def" "abc")
+                                         :positions '(20 10 0))))
+    (mdview-parse--drop-prefix block 5)
+    (should (equal (mdview-parse--content block) "ef\nghi"))
+    (should (equal (mdview-parse--block-strings block) '("ghi" "ef")))
+    (should (equal (mdview-parse--block-positions block) '(20 11)))
+    (mdview-parse--drop-prefix block 3)
+    (should (equal (mdview-parse--block-strings block) '("ghi")))
+    (should (equal (mdview-parse--block-positions block) '(20)))
+    (mdview-parse--drop-prefix block 0)
+    (should (equal (mdview-parse--block-positions block) '(20)))))
+
+(ert-deftest mdview-parse-positions-translation ()
+  (let* ((segments '((0 . 100) (4 . 200)))
+         (nodes (list (propertize "ab" 'mdview-pos 0)
+                      (mdview-node 'code (list :pos 5) "x")
+                      (mdview-node 'emphasis nil
+                                   (mdview-node 'strong nil
+                                                (propertize "yz" 'mdview-pos 6)))
+                      (mdview-node 'image (list :url "u" :alt (propertize "q" 'mdview-pos 7))
+                                   (propertize "q" 'mdview-pos 7))
+                      (concat (propertize "a" 'mdview-pos 1)
+                              (propertize "bcd" 'mdview-pos 2 'face 'bold))
+                      (mdview-node 'soft-break nil)))
+         (out (mdview-parse--translate-positions nodes segments)))
+    (should (equal (mdview-parse-test--string-runs (nth 0 out)) '(("ab" . 100))))
+    (should (= (mdview-node-prop (nth 1 out) :pos) 201))
+    (should (equal (mdview-parse-test--runs (nth 2 out)) '(("yz" . 202))))
+    (should (equal (mdview-parse-test--runs (nth 3 out)) '(("q" . 203))))
+    (should (equal (mdview-parse-test--string-runs (mdview-node-prop (nth 3 out) :alt))
+                   '(("q" . 203))))
+    ;; A run crossing a segment boundary is split; the face is kept.
+    (should (equal (mdview-parse-test--string-runs (nth 4 out))
+                   '(("a" . 101) ("bc" . 102) ("d" . 200))))
+    (should (eq (get-text-property 3 'face (nth 4 out)) 'bold))
+    (should (equal (nth 5 out) '(soft-break nil)))
+    ;; The input is not modified.
+    (should (= (get-text-property 0 'mdview-pos (nth 0 nodes)) 0))
+    (should (= (mdview-node-prop (nth 1 nodes) :pos) 5))
+    ;; Without a map the positions are removed.
+    (let ((bare (mdview-parse--translate-positions nodes nil)))
+      (should-not (mdview-parse-test--runs (mdview-node 'paragraph nil bare)))
+      (should-not (mdview-node-prop (nth 1 bare) :pos))
+      (should-not (mdview-parse-test--string-runs (mdview-node-prop (nth 3 bare) :alt))))))
+
+(ert-deftest mdview-parse-positions-inline-stub ()
+  ;; A stand-in inline parser reporting content offsets for text, a code
+  ;; span and nested emphasis: the block parser turns them into source
+  ;; offsets.
+  (cl-letf (((symbol-function 'mdview-inline-parse)
+             (lambda (string _refs)
+               (should (equal string "ab `c`\n*d*"))
+               (list (propertize "ab " 'mdview-pos 0)
+                     (mdview-node 'code (list :pos 4) "c")
+                     (mdview-node 'soft-break nil)
+                     (mdview-node 'emphasis nil (propertize "d" 'mdview-pos 8))))))
+    (let ((p (car (mdview-node-children (mdview-parse-test--first "> ab `c`\n> *d*")))))
+      (should (equal (mdview-parse-test--runs p) '(("ab " . 2) ("d" . 12))))
+      (should (= (mdview-node-prop (nth 1 (mdview-node-children p)) :pos) 6))))
+  ;; A padding cell is parsed without a map: its positions are removed.
+  (cl-letf (((symbol-function 'mdview-inline-parse)
+             (lambda (string _refs)
+               (list (propertize (concat "<" string ">") 'mdview-pos 0)))))
+    (let* ((table (mdview-parse-test--first "| a | b |\n|---|---|\n| c"))
+           (cells (mdview-node-children (nth 1 (mdview-node-children table)))))
+      (should (equal (mdview-parse-test--runs (car cells)) '(("<c>" . 22))))
+      (should (equal (mdview-node-text (cadr cells)) "<>"))
+      (should-not (mdview-parse-test--runs (cadr cells)))))
+  ;; An error in the inline parser degrades to the text, still positioned.
+  (cl-letf (((symbol-function 'mdview-inline-parse)
+             (lambda (_string _refs) (error "Boom"))))
+    (let ((p (car (mdview-node-children (mdview-parse-test--first "> ab\n> cd")))))
+      (should (equal (mdview-node-children p) '("ab\ncd")))
+      (should (equal (mdview-parse-test--runs p) '(("ab\n" . 2) ("cd" . 7)))))))
+
+(defun mdview-parse-test--check-positions (source doc)
+  "Check the positions in DOC, the parse of SOURCE, against SOURCE.
+Every block must have a `:pos' on a plausible character, every line of
+a code or HTML block and every `mdview-pos' run of a paragraph, heading
+or table cell must read the same as SOURCE at its offset (except where
+SOURCE holds a tab or a backslash there).  Return the list of failure
+descriptions, nil when everything matches."
+  (let ((failures nil))
+    (cl-labels
+        ((fail (fmt &rest args) (push (apply #'format fmt args) failures))
+         (slice (pos len) (substring source (min pos (length source))
+                                     (min (+ pos len) (length source))))
+         (same-p (text pos)
+           (let ((there (slice pos (length text))))
+             (or (equal text there) (string-match-p "[\\\t]" there))))
+         (check-pos (type pos)
+           (let ((c (and (integerp pos) (< pos (length source)) (aref source pos)))
+                 (expected (pcase type
+                             ('blockquote "[>]")
+                             ((or 'list 'item) "[-*+0-9]")
+                             ('footnote-definition "\\[")
+                             ('html-block "<")
+                             ('thematic-break "[-*_]")
+                             (_ "[^ \t\r\n]"))))
+             (unless (and c (string-match-p expected (string c)))
+               (fail "%s :pos %S at %S" type pos c))))
+         (walk (n)
+           (unless (stringp n)
+             (let ((type (mdview-node-type n)))
+               (when (memq type '(paragraph heading blockquote list item code-block
+                                  html-block thematic-break table footnote-definition))
+                 (check-pos type (mdview-node-prop n :pos)))
+               (when (memq type '(code-block html-block))
+                 (let ((positions (mdview-node-prop n :positions))
+                       (lines (split-string (car (mdview-node-children n)) "\n")))
+                   (when positions
+                     (unless (= (length lines) (length positions))
+                       (fail "%s: %d lines, %d positions"
+                             type (length lines) (length positions)))
+                     (cl-mapc (lambda (line pos)
+                                (unless (same-p line pos)
+                                  (fail "%s line %S at %d" type line pos)))
+                              lines positions))))
+               (when (memq type '(paragraph heading table-cell))
+                 (dolist (run (mdview-parse-test--runs n))
+                   (unless (same-p (car run) (cdr run))
+                     (fail "run %S at %d reads %S" (car run) (cdr run)
+                           (slice (cdr run) (length (car run)))))))
+               (mapc #'walk (mdview-node-children n))))))
+      (walk doc)
+      (mapc #'walk (mdview-node-prop doc :footnotes)))
+    (nreverse failures)))
+
+(ert-deftest mdview-parse-positions-oracle-fixtures ()
+  "Every position in the parse of each fixture points at its source text.
+The fixtures are checked as they are and with CRLF line endings."
+  (dolist (file (directory-files (mdview-parse-test--path "test/fixtures") t "\\.md\\'"))
+    (let ((source (with-temp-buffer
+                    (insert-file-contents file)
+                    (buffer-string))))
+      (dolist (variant (list source (string-replace "\n" "\r\n" source)))
+        (let ((doc (mdview-parse-test--with-pos-inline (mdview-parse-string variant))))
+          (should (equal (cons (file-name-nondirectory file)
+                               (mdview-parse-test--check-positions variant doc))
+                         (list (file-name-nondirectory file)))))))))
+
 ;;;; Fixtures
 
 (ert-deftest mdview-parse-fixture-minimal ()
