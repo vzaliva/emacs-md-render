@@ -30,6 +30,13 @@
 ;; cached per URL in `mdview-image-cache' so that a re-rendered view
 ;; shows remote images immediately.
 ;;
+;; Images follow the size of the text (`mdview-image-scale'): the
+;; renderer passes the factor of `mdview-image-scale-factor', which
+;; compares the height of the buffer's default face -- the frame's font,
+;; enlarged or shrunk by `text-scale-mode' -- with the base height of
+;; `mdview-image-base-height', so that zooming the frame or the buffer
+;; scales the images along with the text.
+;;
 ;; Everything degrades to placeholders in `emacs -nw' and `--batch': no
 ;; display-dependent primitive (`image-size', `frame-char-width',
 ;; `frame-pixel-height') runs unless the display is graphical.
@@ -46,6 +53,7 @@
 
 (defvar url-http-response-status)       ; url-http.el, local to responses
 (defvar mdview-mode)                    ; mdview.el, on in rendered buffers
+(defvar global-text-scale-adjust--default-height) ; face-remap.el
 
 ;;;; Options
 
@@ -79,6 +87,34 @@ Images are always limited to the content width; this option lowers that
 limit further."
   :type '(choice (const :tag "Content width" nil)
                  (integer :tag "Pixels"))
+  :group 'mdview)
+
+(defcustom mdview-image-scale 'text
+  "How displayed images are scaled.
+`text' means that images follow the size of the text: an image is shown
+at its natural size when the buffer's text has its base size (see
+`mdview-image-base-height') and grows or shrinks with the text, whether
+the frame's font is changed (`set-frame-font', `global-text-scale-adjust',
+zoom-frm's commands) or the buffer is scaled with `text-scale-mode'.  A
+number is a fixed factor; 1.0 shows images at their natural size.  nil
+leaves the scaling to Emacs (`image-scaling-factor').  The content width
+and `mdview-image-max-height' limit the displayed size in every case."
+  :type '(choice (const :tag "Follow the size of the text" text)
+                 (number :tag "Fixed factor")
+                 (const :tag "Emacs default (`image-scaling-factor')" nil))
+  :group 'mdview)
+
+(defcustom mdview-image-base-height nil
+  "Height of the text at which images are shown at their natural size.
+The value is in units of 1/10 point, like the `:height' attribute of
+faces (120 means 12 pt).  nil means the height the text had before any
+zooming: the height `global-text-scale-adjust' resets to once it has
+been used, otherwise the height of the `default' face for new frames
+when the configuration sets one, otherwise the height of the frame's
+default face the first time an image is scaled in the session.  Only
+used when `mdview-image-scale' is `text'."
+  :type '(choice (const :tag "Automatic" nil)
+                 (integer :tag "Height in 1/10 pt"))
   :group 'mdview)
 
 (defcustom mdview-image-timeout 10
@@ -132,10 +168,20 @@ work from a timer rather than inline.")
   "Session cache of remote images: URL → raw image bytes (a unibyte string).
 Filled by successful fetches; `mdview-image-clear-cache' empties it.")
 
+(cl-defstruct (mdview-image--fit (:constructor mdview-image--make-fit)
+                                 (:copier nil))
+  "How an image is to be displayed: its size limits, scale and column width."
+  (max-width nil :documentation "Pixel width limit, or nil.")
+  (max-height nil :documentation "Pixel height limit, or nil.")
+  (inline nil :documentation "Non-nil centres the image on its text line.")
+  (scale nil :documentation "Factor on the natural size; nil: Emacs's default.")
+  (char-width nil :documentation "Pixels per text column; nil: `frame-char-width'."))
+
 (cl-defstruct (mdview-image--job (:constructor mdview-image--make-job)
                                  (:copier nil))
-  "A placeholder waiting for the bytes of a remote image."
-  id url alt overlay max-width max-height inline)
+  "A placeholder waiting for the bytes of a remote image.
+FIT is the `mdview-image--fit' the image is displayed with."
+  id url alt overlay fit)
 
 (defvar mdview-image--pending (make-hash-table)
   "Pending remote images: identifier → `mdview-image--job'.")
@@ -166,6 +212,10 @@ entries, so that it never grows without bound.")
 
 (defconst mdview-image--size-cache-limit 512
   "Number of entries at which `mdview-image--size-cache' is emptied.")
+
+(defvar mdview-image--base-height-seen nil
+  "Height of the default face first seen by `mdview-image-base-height'.
+In 1/10 pt; the session's base height when nothing else defines one.")
 
 (defconst mdview-image--unavailable-note " (unavailable)"
   "Suffix added to the `help-echo' of a placeholder whose fetch failed.")
@@ -342,34 +392,123 @@ WIDTH is the width available for the image in pixels, or nil;
       (min width mdview-image-max-width)
     (or width mdview-image-max-width)))
 
+;;;; The size of the text
+
+(defun mdview-image--positive-integer (value)
+  "Return VALUE when it is a positive integer, else nil."
+  (and (integerp value) (> value 0) value))
+
+(defun mdview-image--face-height (frame)
+  "Return the height of the `default' face on FRAME in 1/10 pt, or nil.
+FRAME may be t for the default of new frames.  Only an absolute height
+\(a positive integer) counts."
+  (mdview-image--positive-integer (face-attribute 'default :height frame)))
+
+(defun mdview-image-base-height (&optional frame)
+  "Return the height of the text, in 1/10 pt, at which images are not scaled.
+This is `mdview-image-base-height' when set; otherwise the height that
+`global-text-scale-adjust' resets to, once it has been used; otherwise
+the height of the `default' face for new frames, when the configuration
+specifies one; otherwise the height of the default face of FRAME
+\(default: the selected frame) the first time this function needs it,
+remembered for the session.  Return nil when none of these is known."
+  (or (mdview-image--positive-integer mdview-image-base-height)
+      (mdview-image--positive-integer
+       (bound-and-true-p global-text-scale-adjust--default-height))
+      (mdview-image--face-height t)
+      mdview-image--base-height-seen
+      (setq mdview-image--base-height-seen
+            (mdview-image--face-height (or frame (selected-frame))))))
+
+(defun mdview-image--font-size (window height)
+  "Return the pixel width, or with HEIGHT non-nil the height, of the text.
+The text is that of the current buffer's `default' face, as remapped by
+`text-scale-mode': measured in WINDOW when it shows the current buffer
+\(`window-font-width'), else on the selected frame (`default-font-width')."
+  (if (and window (eq (window-buffer window) (current-buffer)))
+      (if height
+          (window-font-height window 'default)
+        (window-font-width window 'default))
+    (if height (default-font-height) (default-font-width))))
+
+(defun mdview-image-char-width (&optional window)
+  "Return the width in pixels of a column of text in the current buffer, or nil.
+This is the width of the buffer's `default' face, which `text-scale-mode'
+may have changed, measured in WINDOW when it shows the buffer and on the
+selected frame otherwise.  Return nil without a graphical display."
+  (let ((frame (if window (window-frame window) (selected-frame))))
+    (and (display-graphic-p frame)
+         (mdview-image--positive-integer
+          (mdview-image--font-size window nil)))))
+
+(defun mdview-image-scale-factor (&optional window)
+  "Return the factor applied to the natural size of images, or nil.
+With `mdview-image-scale' set to `text' the factor follows the size of
+the text in the current buffer: the height of its `default' face -- the
+frame's font, enlarged or shrunk by `text-scale-mode' -- divided by the
+base height of `mdview-image-base-height', rounded to three decimals,
+and 1.0 without a graphical display.  The text is measured in WINDOW
+when it shows the buffer and on the selected frame otherwise.  A number
+in `mdview-image-scale' is returned as is, and nil means that Emacs's
+own `image-scaling-factor' applies."
+  (cond ((numberp mdview-image-scale) mdview-image-scale)
+        ((eq mdview-image-scale 'text) (mdview-image--text-scale window))
+        (t nil)))
+
+(defun mdview-image--text-scale (window)
+  "Return the size of the text in the current buffer relative to its base size.
+See `mdview-image-scale-factor'; WINDOW is as there."
+  (let ((frame (if window (window-frame window) (selected-frame))))
+    (if (not (display-graphic-p frame))
+        1.0
+      (let* ((base (mdview-image-base-height frame))
+             (height (mdview-image--face-height frame))
+             (char-height (mdview-image--positive-integer
+                           (frame-char-height frame)))
+             (text-height (mdview-image--positive-integer
+                           (mdview-image--font-size window t)))
+             (factor (* (if (and base height) (/ (float height) base) 1.0)
+                        (if (and char-height text-height)
+                            (/ (float text-height) char-height)
+                          1.0))))
+        (max 0.001 (/ (round (* factor 1000)) 1000.0))))))
+
 ;;;; Creating and inserting images
 
-(defun mdview-image--create (source type data-p max-width max-height inline)
+(defun mdview-image--create (source type data-p fit)
   "Return an image spec for SOURCE, a file name or (when DATA-P) raw bytes.
-TYPE is the image type, or nil to let Emacs detect it.  MAX-WIDTH and
-MAX-HEIGHT limit the displayed size in pixels when non-nil.  Non-nil
-INLINE centres the image vertically on the text line."
-  (apply #'create-image source type data-p
-         (append (and max-width (list :max-width max-width))
-                 (and max-height (list :max-height max-height))
-                 (and inline (list :ascent 'center)))))
+TYPE is the image type, or nil to let Emacs detect it.  FIT is a
+`mdview-image--fit': its scale, when non-nil, multiplies the natural
+size of the image (nil leaves the scaling to Emacs's
+`image-scaling-factor'), its limits then bound the displayed size in
+pixels, and its inline flag centres the image vertically on the line."
+  (let ((max-width (mdview-image--fit-max-width fit))
+        (max-height (mdview-image--fit-max-height fit))
+        (scale (mdview-image--fit-scale fit)))
+    (apply #'create-image source type data-p
+           (append (and max-width (list :max-width max-width))
+                   (and max-height (list :max-height max-height))
+                   (and scale (list :scale scale))
+                   (and (mdview-image--fit-inline fit)
+                        (list :ascent 'center))))))
 
-(defun mdview-image--from-data (data max-width max-height inline)
+(defun mdview-image--from-data (data fit)
   "Return an image spec for the raw bytes DATA, or nil if they are no image.
-MAX-WIDTH, MAX-HEIGHT and INLINE are as in `mdview-image--create'."
+FIT is as in `mdview-image--create'."
   (let ((type (image-type-from-data data)))
     (and type
          (image-type-available-p type)
          (ignore-errors
-           (mdview-image--create data type t max-width max-height inline)))))
+           (mdview-image--create data type t fit)))))
 
-(defun mdview-image--columns (image)
+(defun mdview-image--columns (image &optional char-width)
   "Return the number of text columns IMAGE occupies on the selected frame.
-Signal an error when IMAGE cannot be loaded or the frame has no window
-system.  The size of a given image spec is memoized for a while in
+A column is CHAR-WIDTH pixels wide (default `frame-char-width').  Signal
+an error when IMAGE cannot be loaded or the frame has no window system.
+The size of a given image spec is memoized for a while in
 `mdview-image--size-cache', because a document repeating the same image
 hundreds of times would otherwise pay for `image-size' every time."
-  (let* ((char-width (frame-char-width))
+  (let* ((char-width (or char-width (frame-char-width)))
          (key (cons char-width image))
          (hit (gethash key mdview-image--size-cache))
          (now (float-time)))
@@ -383,14 +522,15 @@ hundreds of times would otherwise pay for `image-size' every time."
         (puthash key (cons now columns) mdview-image--size-cache)
         columns))))
 
-(defun mdview-image--insert-image (image url alt)
+(defun mdview-image--insert-image (image url alt &optional char-width)
   "Insert IMAGE at point and return the number of columns it occupies.
-The underlying text is the label of URL and ALT, so copying the region
+A column is CHAR-WIDTH pixels wide (default `frame-char-width').  The
+underlying text is the label of URL and ALT, so copying the region
 yields the alt text.  The text gets `mdview-link', `mdview-image-url'
 \(both URL), `help-echo' and `mouse-face'; the `keymap' that
 `insert-image' adds is removed so that the mode's own bindings apply on
 images."
-  (let ((columns (mdview-image--columns image))
+  (let ((columns (mdview-image--columns image char-width))
         (label (mdview-image-label url alt))
         (start (point)))
     (insert-image image (if (string-empty-p label) " " label))
@@ -405,14 +545,15 @@ images."
            'mouse-face 'highlight))
     columns))
 
-(defun mdview-image--try-insert (image url alt)
+(defun mdview-image--try-insert (image url alt &optional char-width)
   "Insert IMAGE for URL and ALT at point; return (COLUMNS . image) or nil.
-IMAGE may be nil.  Any error (unsupported data, no window system, ...)
-yields nil and leaves the buffer unchanged."
+IMAGE may be nil.  CHAR-WIDTH is as in `mdview-image--insert-image'.
+Any error (unsupported data, no window system, ...) yields nil and
+leaves the buffer unchanged."
   (when image
     (let ((start (point)))
       (condition-case nil
-          (cons (mdview-image--insert-image image url alt) 'image)
+          (cons (mdview-image--insert-image image url alt char-width) 'image)
         (error (delete-region start (point)) nil)))))
 
 (defun mdview-image--insert-placeholder (url alt)
@@ -421,35 +562,39 @@ yields nil and leaves the buffer unchanged."
     (insert text)
     (cons (string-width text) 'placeholder)))
 
-(defun mdview-image--insert-local (file type url alt max-width max-height
-                                        inline)
+(defun mdview-image--insert-local (file type url alt fit)
   "Insert the local image FILE of image TYPE; return (COLUMNS . image) or nil.
-URL is the image's URL in the document.  ALT, MAX-WIDTH, MAX-HEIGHT and
-INLINE are as in `mdview-image-insert'."
+URL is the image's URL in the document and ALT its alt text; FIT is the
+`mdview-image--fit' to display it with."
   (mdview-image--try-insert
-   (ignore-errors
-     (mdview-image--create file type nil max-width max-height inline))
-   url alt))
+   (ignore-errors (mdview-image--create file type nil fit))
+   url alt (mdview-image--fit-char-width fit)))
 
-(defun mdview-image--insert-remote (url alt max-width max-height inline)
+(defun mdview-image--insert-remote (url alt fit)
   "Insert the remote image URL from the cache, or a placeholder awaiting it.
 Return (COLUMNS . image), (COLUMNS . pending), or nil when the cached
-data cannot be displayed.  ALT, MAX-WIDTH, MAX-HEIGHT and INLINE are as
-in `mdview-image-insert'."
+data cannot be displayed.  ALT and FIT are as in
+`mdview-image--insert-local'."
   (let ((data (gethash url mdview-image-cache)))
     (if data
-        (mdview-image--try-insert
-         (mdview-image--from-data data max-width max-height inline) url alt)
-      (mdview-image--insert-pending url alt max-width max-height inline))))
+        (mdview-image--try-insert (mdview-image--from-data data fit) url alt
+                                  (mdview-image--fit-char-width fit))
+      (mdview-image--insert-pending url alt fit))))
 
 (cl-defun mdview-image-insert (url alt &key base-dir max-width-px
-                                   max-height-px inline)
+                                   max-height-px inline scale char-width)
   "Insert the image URL with ALT text at point, or a placeholder for it.
 Relative URLs resolve against BASE-DIR (default `default-directory').
 MAX-WIDTH-PX and MAX-HEIGHT-PX limit the displayed size in pixels; the
 height defaults to `mdview-image-max-height' and the width is further
 limited by `mdview-image-max-width'.  Non-nil INLINE marks an image
-inside running text, which is vertically centred on its line.
+inside running text, which is vertically centred on its line.  SCALE
+multiplies the natural size of the image before the limits apply (see
+`mdview-image-scale-factor'); nil leaves the scaling to Emacs
+\(`image-scaling-factor').  CHAR-WIDTH is the width in pixels of a text
+column where the rendering is shown (see `mdview-image-char-width'),
+which decides how many columns an image counts for; nil means
+`frame-char-width'.
 
 Local images that are displayable (see `mdview-image-displayable-p') are
 inserted immediately.  Remote images are inserted as a placeholder that
@@ -463,22 +608,22 @@ was inserted and KIND is `image', `placeholder' or `pending'."
          (alt (or alt ""))
          (how (mdview-image--displayable url base-dir)))
     (or (and how
-             (let ((max-width (mdview-image-max-width-px max-width-px))
-                   (max-height (mdview-image-max-height-px max-height-px)))
+             (let ((fit (mdview-image--make-fit
+                         :max-width (mdview-image-max-width-px max-width-px)
+                         :max-height (mdview-image-max-height-px max-height-px)
+                         :inline inline :scale scale :char-width char-width)))
                (if (consp how)
-                   (mdview-image--insert-local (car how) (cdr how) url alt
-                                               max-width max-height inline)
-                 (mdview-image--insert-remote url alt
-                                              max-width max-height inline))))
+                   (mdview-image--insert-local (car how) (cdr how) url alt fit)
+                 (mdview-image--insert-remote url alt fit))))
         (mdview-image--insert-placeholder url alt))))
 
 ;;;; Remote images: placeholders awaiting data
 
-(defun mdview-image--insert-pending (url alt max-width max-height inline)
+(defun mdview-image--insert-pending (url alt fit)
   "Insert a placeholder for the remote image URL and start fetching it.
-ALT, MAX-WIDTH, MAX-HEIGHT and INLINE are as in `mdview-image-insert' and
-are remembered for the eventual display.  Return (COLUMNS . pending),
-or (COLUMNS . placeholder) when the fetch fails before this returns."
+ALT is the alt text and FIT the `mdview-image--fit' remembered for the
+eventual display.  Return (COLUMNS . pending), or (COLUMNS . placeholder)
+when the fetch fails before this returns."
   (let* ((id (cl-incf mdview-image--counter))
          (text (propertize (mdview-image-placeholder url alt)
                            'mdview-image-pending id))
@@ -487,13 +632,12 @@ or (COLUMNS . placeholder) when the fetch fails before this returns."
     (let ((overlay (make-overlay start (point))))
       (overlay-put overlay 'mdview-image-id id)
       (overlay-put overlay 'mdview-image-url url)
-      (overlay-put overlay 'mdview-image-max-width max-width)
-      (overlay-put overlay 'mdview-image-max-height max-height)
+      (overlay-put overlay 'mdview-image-max-width
+                   (mdview-image--fit-max-width fit))
+      (overlay-put overlay 'mdview-image-max-height
+                   (mdview-image--fit-max-height fit))
       (puthash id (mdview-image--make-job :id id :url url :alt alt
-                                          :overlay overlay
-                                          :max-width max-width
-                                          :max-height max-height
-                                          :inline inline)
+                                          :overlay overlay :fit fit)
                mdview-image--pending))
     (mdview-image--fetch url)
     (cons (string-width text)
@@ -575,19 +719,19 @@ inserted; when the data cannot be displayed the placeholder is left
 alone and nil is returned."
   (pcase-let ((`(,buffer ,start ,end) region))
     (with-current-buffer buffer
-      (let ((image (mdview-image--from-data data
-                                            (mdview-image--job-max-width job)
-                                            (mdview-image--job-max-height job)
-                                            (mdview-image--job-inline job)))
-            (props (mdview-image--foreign-properties start))
-            (old-columns (string-width (buffer-substring-no-properties start end))))
+      (let* ((fit (mdview-image--job-fit job))
+             (image (mdview-image--from-data data fit))
+             (props (mdview-image--foreign-properties start))
+             (old-columns (string-width
+                           (buffer-substring-no-properties start end))))
         (when image
           (with-silent-modifications
             (save-excursion
               (goto-char start)
               (let ((result (mdview-image--try-insert
                              image (mdview-image--job-url job)
-                             (mdview-image--job-alt job))))
+                             (mdview-image--job-alt job)
+                             (mdview-image--fit-char-width fit))))
                 (when result
                   (let ((new-end (point)))
                     (delete-region new-end (+ new-end (- end start)))

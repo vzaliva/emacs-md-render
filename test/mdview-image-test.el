@@ -16,6 +16,8 @@
 (require 'cl-lib)
 (require 'timer)
 (require 'url-queue)
+;; For `global-text-scale-adjust--default-height', bound by a test below.
+(require 'face-remap)
 (require 'mdview-image)
 
 (defconst mdview-image-test-dir
@@ -110,7 +112,7 @@ the replacement of placeholders can be exercised without a display."
   `(cl-letf (((symbol-function 'mdview-image--from-data)
               (lambda (&rest _) '(image :type png :data "fake")))
              ((symbol-function 'mdview-image--columns)
-              (lambda (_image) ,columns)))
+              (lambda (_image &optional _char-width) ,columns)))
      ,@body))
 
 ;;;; Options and faces
@@ -126,10 +128,13 @@ the replacement of placeholders can be exercised without a display."
   (should (null mdview-image-captions))
   (should (null mdview-image-placeholder-format))
   (should (null mdview-image-update-functions))
+  (should (eq mdview-image-scale 'text))
+  (should (null mdview-image-base-height))
   (dolist (option '(mdview-display-images mdview-display-remote-images
                     mdview-image-max-height mdview-image-max-width
                     mdview-image-timeout mdview-image-max-parallel
-                    mdview-image-captions mdview-image-placeholder-format))
+                    mdview-image-captions mdview-image-placeholder-format
+                    mdview-image-scale mdview-image-base-height))
     (should (custom-variable-p option))
     (should (assq option (get 'mdview 'custom-group))))
   (should (facep 'mdview-image-placeholder))
@@ -337,6 +342,92 @@ the replacement of placeholders can be exercised without a display."
     (should (equal (mdview-image-max-width-px 300) 300))
     (should (equal (mdview-image-max-width-px nil) 400))))
 
+(ert-deftest mdview-image-base-height-resolution ()
+  "The base height: option, global zooming, default face, else the frame."
+  (cl-letf (((symbol-function 'mdview-image--face-height)
+             (lambda (frame) (if (eq frame t) nil 130))))
+    (let ((mdview-image-base-height nil)
+          (mdview-image--base-height-seen nil)
+          (global-text-scale-adjust--default-height nil))
+      ;; Nothing configured: the frame's height when first asked, kept.
+      (should (= (mdview-image-base-height) 130))
+      (should (= mdview-image--base-height-seen 130))
+      (cl-letf (((symbol-function 'mdview-image--face-height)
+                 (lambda (frame) (if (eq frame t) nil 200))))
+        (should (= (mdview-image-base-height) 130)))
+      ;; The height of the default face for new frames wins over that.
+      (cl-letf (((symbol-function 'mdview-image--face-height)
+                 (lambda (frame) (if (eq frame t) 110 130))))
+        (should (= (mdview-image-base-height) 110))
+        ;; The height `global-text-scale-adjust' resets to wins over both.
+        (let ((global-text-scale-adjust--default-height 100))
+          (should (= (mdview-image-base-height) 100))
+          ;; And the option over everything.
+          (let ((mdview-image-base-height 95))
+            (should (= (mdview-image-base-height) 95))))))))
+
+(ert-deftest mdview-image-scale-factor-follows-text ()
+  "With `text', the factor is the text height relative to the base height."
+  (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+            ((symbol-function 'frame-char-height) (lambda (&optional _) 14))
+            ((symbol-function 'default-font-height) (lambda () 14))
+            ((symbol-function 'mdview-image--face-height)
+             (lambda (frame) (if (eq frame t) 120 180))))
+    (let ((mdview-image-scale 'text)
+          (mdview-image-base-height nil)
+          (mdview-image--base-height-seen nil)
+          (global-text-scale-adjust--default-height nil))
+      ;; The frame's font went from 12 pt to 18 pt.
+      (should (equal (mdview-image-scale-factor) 1.5))
+      ;; `text-scale-mode' enlarged the text from 14 to 20 pixels on top.
+      (cl-letf (((symbol-function 'default-font-height) (lambda () 20)))
+        (should (equal (mdview-image-scale-factor) 2.143)))
+      ;; The window showing the buffer is measured when given.
+      (cl-letf (((symbol-function 'window-font-height) (lambda (&optional _w _f) 7)))
+        (with-current-buffer (window-buffer (selected-window))
+          (should (equal (mdview-image-scale-factor (selected-window)) 0.75)))
+        (with-temp-buffer
+          (should (equal (mdview-image-scale-factor (selected-window)) 1.5))))
+      ;; A base height of the user's choosing.
+      (let ((mdview-image-base-height 90))
+        (should (equal (mdview-image-scale-factor) 2.0))))
+    (let ((mdview-image-scale 2.5))
+      (should (equal (mdview-image-scale-factor) 2.5)))
+    (let ((mdview-image-scale nil))
+      (should (null (mdview-image-scale-factor)))))
+  ;; Without a graphical display the text has its base size.
+  (let ((mdview-image-scale 'text))
+    (should (equal (mdview-image-scale-factor) 1.0))))
+
+(ert-deftest mdview-image-char-width-measures-the-text ()
+  "The column width is that of the remapped default face; nil without graphics."
+  (should (null (mdview-image-char-width)))
+  (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+            ((symbol-function 'default-font-width) (lambda () 10))
+            ((symbol-function 'window-font-width) (lambda (&optional _w _f) 12)))
+    (should (= (mdview-image-char-width) 10))
+    ;; A window showing the buffer is measured; one showing another is not.
+    (with-current-buffer (window-buffer (selected-window))
+      (should (= (mdview-image-char-width (selected-window)) 12)))
+    (with-temp-buffer
+      (should (= (mdview-image-char-width (selected-window)) 10)))))
+
+(ert-deftest mdview-image-create-spec-carries-scale-and-limits ()
+  "The image spec gets the scale and limits of the fit, and nothing else."
+  (let (seen)
+    (cl-letf (((symbol-function 'create-image)
+               (lambda (source type data-p &rest props)
+                 (setq seen (list source type data-p props))
+                 '(image :type png))))
+      (mdview-image--create "/f.png" 'png nil
+                            (mdview-image--make-fit :max-width 640 :max-height 300
+                                                    :inline t :scale 1.5))
+      (should (equal seen '("/f.png" png nil
+                            (:max-width 640 :max-height 300 :scale 1.5
+                                        :ascent center))))
+      (mdview-image--create "bytes" 'png t (mdview-image--make-fit))
+      (should (equal seen '("bytes" png t nil))))))
+
 ;;;; Insertion
 
 (ert-deftest mdview-image-insert-placeholder-in-batch ()
@@ -455,6 +546,43 @@ In batch `image-size' signals, so the fallback path is exercised."
                                      (mdview-image--jobs-for
                                       mdview-image-test-url))
                              #'<)))))))
+
+(ert-deftest mdview-image-pending-job-remembers-fit ()
+  "A pending placeholder keeps how its image is to be displayed."
+  (mdview-image-test-with-graphics
+    (with-temp-buffer
+      (let ((mdview-image-max-height 300))
+        (mdview-image-insert mdview-image-test-url "Photo" :max-width-px 640
+                             :inline t :scale 1.5 :char-width 9))
+      (let* ((job (car (mdview-image--jobs-for mdview-image-test-url)))
+             (fit (mdview-image--job-fit job)))
+        (should (equal (mdview-image--fit-max-width fit) 640))
+        (should (equal (mdview-image--fit-max-height fit) 300))
+        (should (eq (mdview-image--fit-inline fit) t))
+        (should (equal (mdview-image--fit-scale fit) 1.5))
+        (should (equal (mdview-image--fit-char-width fit) 9))))))
+
+(ert-deftest mdview-image-replacement-uses-remembered-fit ()
+  "The arriving image is created with the fit and measured in its columns."
+  (mdview-image-test-with-graphics
+    (with-temp-buffer
+      (mdview-image-insert mdview-image-test-url "Photo" :max-width-px 640
+                           :scale 2.0 :char-width 9)
+      (let (seen-fit seen-width)
+        (cl-letf (((symbol-function 'mdview-image--from-data)
+                   (lambda (_data fit)
+                     (setq seen-fit fit)
+                     '(image :type png :data "fake")))
+                  ((symbol-function 'mdview-image--columns)
+                   (lambda (_image &optional char-width)
+                     (setq seen-width char-width)
+                     4)))
+          (mdview-image-test-respond mdview-image-test-url
+                                     (mdview-image-test-png-bytes)))
+        (should (equal (mdview-image--fit-scale seen-fit) 2.0))
+        (should (equal (mdview-image--fit-max-width seen-fit) 640))
+        (should (equal seen-width 9))
+        (should (get-text-property 1 'display))))))
 
 (ert-deftest mdview-image-pending-ids-unique ()
   "Every pending placeholder gets its own identifier."
@@ -879,7 +1007,8 @@ option at 5 seconds."
 
 (ert-deftest mdview-image-insert-image-help-echo-single-line-alt ()
   "The help-echo of a displayed image uses the alt text on one line."
-  (cl-letf (((symbol-function 'mdview-image--columns) (lambda (_image) 3)))
+  (cl-letf (((symbol-function 'mdview-image--columns)
+             (lambda (_image &optional _char-width) 3)))
     (with-temp-buffer
       (should (= (mdview-image--insert-image '(image :type png :data "fake")
                                              "x.png" "a  \nb")
@@ -934,15 +1063,20 @@ option at 5 seconds."
         (cl-letf (((symbol-function 'frame-char-width) (lambda (&optional _) 10)))
           (should (= (mdview-image--columns spec) 15)))
         (should (= calls 3))
+        ;; An explicit column width replaces the frame's and shares the memo.
+        (should (= (mdview-image--columns spec 10) 15))
+        (should (= calls 3))
+        (should (= (mdview-image--columns spec 29) 5))
+        (should (= calls 4))
         ;; Stale entries are refreshed and the cache can be emptied.
         (puthash (cons 7 spec) (cons (- (float-time) 1000) 99)
                  mdview-image--size-cache)
         (should (= (mdview-image--columns spec) 21))
-        (should (= calls 4))
+        (should (= calls 5))
         (mdview-image-clear-cache)
         (should (zerop (hash-table-count mdview-image--size-cache)))
         (should (= (mdview-image--columns spec) 21))
-        (should (= calls 5))))))
+        (should (= calls 6))))))
 
 ;;;; Cancelling and the cache
 

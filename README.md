@@ -65,7 +65,7 @@ found in real READMEs (centered blocks, `<details>`/`<summary>`, `<kbd>`,
 HTML headings and images), images (inline in graphical Emacs, local and
 asynchronous remote, placeholders in text mode), and the `mdview-mode`
 commands: in-place toggle with position sync, links and anchors, headings
-and imenu, history, image toggling, auto-refit on resize, re-rendering
+and imenu, history, image toggling, auto-refit on resize and zoom, re-rendering
 after a save, and following auto-revert (`global-auto-revert-mode`) in
 either state.
 The parser and renderer are fuzzed and bounded (nesting caps, linear
@@ -165,7 +165,9 @@ Keys in the rendered buffer (`mdview-mode`):
 | `<` / `>` | Beginning / end of the document |
 | `C-c C-v` | Back to the source (`mdview-toggle`) |
 
-The view re-flows when the window width changes (`mdview-auto-refit`).
+The view re-flows when the window width or the text size changes
+(`mdview-auto-refit`): zooming the frame (`C-x C-M-+`, zoom-frm) or the
+buffer (`C-x C-+`) re-wraps the text and scales the images with it.
 Saving while rendered writes the Markdown source (save hooks such as
 formatters see the source) and shows the rendering again; a revert,
 including auto-revert, re-renders the reloaded file; changing the major
@@ -225,6 +227,12 @@ View and layout:
 Images:
 
 - `mdview-display-images`, `mdview-display-remote-images` (default `t`).
+- `mdview-image-scale` (default `text`): images follow the size of the
+  text, so zooming scales them; a number is a fixed factor and `nil`
+  leaves the scaling to Emacs's `image-scaling-factor`.
+  `mdview-image-base-height` (default `nil`, automatic): the height of
+  the text, in 1/10 pt like face heights, at which images have their
+  natural size.
 - `mdview-image-max-height` (default 0.6 of the frame height, or pixels),
   `mdview-image-max-width` (default `nil`), `mdview-image-timeout`
   (default 10 s per remote fetch), `mdview-image-max-parallel` (default

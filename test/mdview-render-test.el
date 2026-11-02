@@ -611,6 +611,33 @@
                  (cons 12 'image)))))
      ,@body))
 
+(ert-deftest mdview-render-images-get-text-measures ()
+  "The column width and image scale of the caller reach every image."
+  (let (seen)
+    (cl-letf (((symbol-function 'mdview-image-insert)
+               (cl-function
+                (lambda (url _alt &key max-width-px scale char-width
+                             &allow-other-keys)
+                  (push (list url max-width-px scale char-width) seen)
+                  (insert "[i]")
+                  (cons 3 'image)))))
+      (let ((doc (mdview-render-test--doc
+                  (mdview-node 'paragraph '(:line 1)
+                               (mdview-node 'image '(:url "block.png" :alt "b")))
+                  (mdview-render-test--para
+                   "see " (mdview-node 'image '(:url "inline.png" :alt "i"))))))
+        (with-temp-buffer
+          (mdview-render-document doc :width 40 :char-width 7 :image-scale 1.5))
+        (should (equal (sort (copy-sequence seen)
+                             (lambda (a b) (string< (car a) (car b))))
+                       '(("block.png" 280 1.5 7) ("inline.png" 280 1.5 7))))
+        ;; The defaults are the current buffer's measures: in batch no
+        ;; column width, and text at its base size.
+        (setq seen nil)
+        (with-temp-buffer
+          (mdview-render-document doc :width 40))
+        (should (equal (mapcar #'cdr seen) '((nil 1.0 nil) (nil 1.0 nil))))))))
+
 (ert-deftest mdview-render-block-image-detection ()
   (let ((calls nil))
     (mdview-render-test--with-image-stub calls

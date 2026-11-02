@@ -95,6 +95,8 @@ SUFFIX; BG paints the padding."
   (in-list nil :documentation "Non-nil inside a list item.")
   (images t :documentation "Whether real images may be produced.")
   (base-dir nil :documentation "Directory resolving relative paths, or nil.")
+  (char-width nil :documentation "Pixels per text column of the display, or nil.")
+  (image-scale nil :documentation "Factor on images' natural size, or nil.")
   (parent nil :documentation "The enclosing context, or nil."))
 
 (cl-defun mdview-render--ctx-child (ctx &key (addition "") (first-addition addition)
@@ -109,7 +111,8 @@ ADDITION is appended to the prefix of CTX and FIRST-ADDITION (default
 ADDITION) to the prefix of the first line; SUFFIX-ADDITION is prepended
 to the suffix.  The width shrinks by the widths of ADDITION and
 SUFFIX-ADDITION.  BG, TIGHT, QUOTE-LEVEL, BULLET-DEPTH and IN-LIST
-default to the values of CTX; images and base-dir are inherited."
+default to the values of CTX; images, base-dir, the column width and
+the image scale are inherited."
   (let ((parent-first (mdview-render-ctx-first-prefix ctx))
         (prefix (mdview-render-ctx-prefix ctx)))
     (mdview-render--ctx-make
@@ -126,6 +129,8 @@ default to the values of CTX; images and base-dir are inherited."
      :in-list in-list
      :images (mdview-render-ctx-images ctx)
      :base-dir (mdview-render-ctx-base-dir ctx)
+     :char-width (mdview-render-ctx-char-width ctx)
+     :image-scale (mdview-render-ctx-image-scale ctx)
      :parent ctx)))
 
 (defun mdview-render--with-bg (string bg)
@@ -355,10 +360,12 @@ and a frame row (docs/DESIGN.md section 6, \"Boxes\")."
   (let ((left (/ (- width (mdview-render--string-width string)) 2)))
     (if (> left 0) (concat (make-string left ?\s) string) string)))
 
-(defun mdview-render--max-width-px (width)
-  "Return the pixel width of WIDTH columns on a graphical display, else nil."
-  (when (display-graphic-p)
-    (* width (frame-char-width))))
+(defun mdview-render--max-width-px (width ctx)
+  "Return the pixel width of WIDTH columns in CTX, or nil without a display.
+A column is as wide as the `char-width' of CTX says; nil (no graphical
+display, or a caller that did not measure the text) gives nil."
+  (let ((char-width (mdview-render-ctx-char-width ctx)))
+    (and char-width (* width char-width))))
 
 ;;;; Inline rendering
 
@@ -423,8 +430,10 @@ with `mdview-nobreak' so that a badge's text is not split over lines."
                         url alt
                         :base-dir (mdview-render-ctx-base-dir ctx)
                         :max-width-px (mdview-render--max-width-px
-                                       (mdview-render-ctx-width ctx))
-                        :inline t))
+                                       (mdview-render-ctx-width ctx) ctx)
+                        :inline t
+                        :scale (mdview-render-ctx-image-scale ctx)
+                        :char-width (mdview-render-ctx-char-width ctx)))
                (token (buffer-string))
                (cols (car-safe result)))
           (cond
@@ -730,8 +739,10 @@ image must stay on one line and is truncated instead."
                        (mdview-image-insert
                         url alt
                         :base-dir (mdview-render-ctx-base-dir ctx)
-                        :max-width-px (mdview-render--max-width-px width)
-                        :inline nil)
+                        :max-width-px (mdview-render--max-width-px width ctx)
+                        :inline nil
+                        :scale (mdview-render-ctx-image-scale ctx)
+                        :char-width (mdview-render-ctx-char-width ctx))
                      (insert (mdview-image-placeholder url alt))
                      (cons nil 'placeholder)))
            (kind (cdr-safe result)))
@@ -1301,16 +1312,26 @@ Falls back to the stripped rendering when libxml is unavailable."
 
 ;;;; Document
 
-(cl-defun mdview-render-document (doc &key (width 80) base-dir)
+(cl-defun mdview-render-document (doc &key (width 80) base-dir
+                                      (char-width (mdview-image-char-width))
+                                      (image-scale (mdview-image-scale-factor)))
   "Insert the rendering of the document node DOC at point.
 WIDTH is the content width in columns and BASE-DIR the directory against
-which relative image paths are resolved.  The derived faces are
-remapped in the current buffer first.  Footnote definitions listed in
-the `:footnotes' property of DOC are rendered at the end after a thin
-rule.  The output ends with exactly one newline (nothing is inserted for
-an empty document)."
+which relative image paths are resolved.  CHAR-WIDTH is the width in
+pixels of a text column where the rendering will be shown, or nil, and
+IMAGE-SCALE the factor applied to the natural size of images, or nil;
+both default to the measures of the current buffer (see
+`mdview-image-char-width' and `mdview-image-scale-factor'), which a
+viewer rendering into a hidden buffer overrides with those of the buffer
+that will display the text.  The derived faces are remapped in the
+current buffer first.  Footnote definitions listed in the `:footnotes'
+property of DOC are rendered at the end after a thin rule.  The output
+ends with exactly one newline (nothing is inserted for an empty
+document)."
   (let* ((ctx (mdview-render--ctx-make :width (max 1 (or width 80))
-                                       :base-dir base-dir))
+                                       :base-dir base-dir
+                                       :char-width char-width
+                                       :image-scale image-scale))
          (blocks (mdview-render--expand-blocks (mdview-node-children doc)))
          (footnotes (mdview-node-prop doc :footnotes))
          ;; Resolve the glyph profile once rather than per glyph, and

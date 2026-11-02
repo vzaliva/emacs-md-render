@@ -184,16 +184,22 @@ The renderer writes into the current buffer (the caller erases it first)
 with `mdview-render-document`:
 
 ```elisp
-(mdview-render-document DOC &key width base-dir)
+(mdview-render-document DOC &key width base-dir char-width image-scale)
 ```
 
 `width` is the content width in columns (the caller computes it from the
 window, margins and `mdview-max-width`).  `base-dir` resolves relative
-image and link paths.  Everything is laid out in **columns of the
-`default` face**: text is hard-wrapped at render time, boxes are padded
-with spaces to exactly `width`, and backgrounds come from faces on those
-characters — never from `:extend`-dependent behaviour alone — so GUI and
-terminal agree and the result is independent of `visual-line-mode`.
+image and link paths.  `char-width` is the pixel width of a text column
+where the rendering will be shown and `image-scale` the factor applied
+to the natural size of images (§9); both default to the measures of the
+current buffer, and the viewer, which renders into a hidden buffer,
+passes those of the buffer that will display the text.  Everything is
+laid out in **columns of the `default` face** (as scaled by
+`text-scale-mode` in the displaying buffer): text is hard-wrapped at
+render time, boxes are padded with spaces to exactly `width`, and
+backgrounds come from faces on those characters — never from
+`:extend`-dependent behaviour alone — so GUI and terminal agree and the
+result is independent of `visual-line-mode`.
 `string-width` (not `length`) measures text; `truncate-lines` is `t` in
 the view so code lines never wrap.
 
@@ -208,7 +214,10 @@ Blocks render recursively with a context carrying:
 - `bg`: face (or nil) painting the padding to the right edge, so nested
   quote backgrounds extend to the block's right edge;
 - `tight`: whether paragraphs inside the current list item drop their
-  bottom margin.
+  bottom margin;
+- `char-width`, `image-scale`: the pixel width of a text column and the
+  factor applied to images where the rendering is shown (§9), inherited
+  unchanged by nested contexts.
 
 `(mdview-render--emit-line STRING CTX)` inserts prefix + string + padding
 spaces to `width` (padding gets `bg`) + newline.  A blank line inside a
@@ -509,8 +518,9 @@ same stripping rules.
 
 Block image = a paragraph whose only content is one image, optionally
 wrapped in a link.  Rendered on its own line at column 0 (not centered,
-unless from an HTML block with `align=center`), scaled to fit W columns of
-pixels and `mdview-image-max-height`.  Optional caption below (alt text,
+unless from an HTML block with `align=center`), at its natural size times
+the scale of the text (§9), limited to W columns of pixels and
+`mdview-image-max-height`.  Optional caption below (alt text,
 `mdview-image-caption` face, muted italic; `mdview-image-captions` default
 nil).  Inline images (badges) are displayed inline and count as a wrapped
 token.  Whenever an image is not displayed (text mode, `mdview-display-
@@ -618,7 +628,8 @@ Faces may appear as lists or anonymous plists; handle `(face1 face2)`,
 ## 9. Images (`mdview-image.el`)
 
 ```elisp
-(mdview-image-insert URL ALT &key base-dir max-width-px max-height-px inline)
+(mdview-image-insert URL ALT &key base-dir max-width-px max-height-px inline
+                             scale char-width)
 ```
 
 - Display only when `(display-graphic-p)` and `(image-type-available-p)`
@@ -629,11 +640,29 @@ Faces may appear as lists or anonymous plists; handle `(face1 face2)`,
 - Local paths resolve against `base-dir` (the Markdown file's directory,
   or `default-directory`); `file://` URLs are local.  Absolute paths and
   `~` work.
-- Scaling: `create-image` with `:max-width` = min(content width in
-  pixels, `mdview-image-max-width` if set) and `:max-height` =
-  `mdview-image-max-height` (default: 60 % of `frame-pixel-height`), using
-  Emacs's native scaling (no ImageMagick).  SVG via the `svg` image type;
-  for SVG pass `:width` when the intrinsic size is unavailable.
+- Scaling: images follow the text (`mdview-image-scale`, default `text`).
+  `create-image` gets `:scale` = `scale`, which the renderer takes from
+  `mdview-image-scale-factor`: the height of the displaying buffer's
+  `default` face — the frame's font, enlarged or shrunk by
+  `text-scale-mode` — divided by the base height, in 1/10 pt, of
+  `mdview-image-base-height` (the user's value; else the height
+  `global-text-scale-adjust` resets to once it has been used; else the
+  `default` face's height for new frames when the configuration sets one;
+  else the frame's height the first time the session measures it), so
+  that zooming the frame (`C-x C-M-+`, `set-frame-font`, zoom-frm) or the
+  buffer (`C-x C-+`) scales the images along with the text.  A number in
+  `mdview-image-scale` is a fixed factor; nil leaves `:scale` out, so
+  Emacs's `image-scaling-factor` applies.  Then `:max-width` =
+  min(content width in pixels, i.e. W × `char-width`,
+  `mdview-image-max-width` if set) and `:max-height` =
+  `mdview-image-max-height` (default: 60 % of `frame-pixel-height`) bound
+  the result, using Emacs's native scaling (no ImageMagick).
+  `char-width`, from `mdview-image-char-width` (the width of the
+  displaying buffer's `default` face, measured in its window), is also
+  the unit in which an image's columns are counted; a pending remote
+  image remembers scale and column width together with its limits.  SVG
+  via the `svg` image type; for SVG pass `:width` when the intrinsic size
+  is unavailable.
 - Remote (`http(s)`) images: when `mdview-display-remote-images` (default
   t), insert the placeholder immediately and fetch asynchronously with
   `url-retrieve` through the module's own queue (at most
@@ -863,14 +892,25 @@ The buffer-local hooks are installed on the first rendering and stay
   re-flow around inline images.
 - Refit: `mdview-auto-refit` (default t) re-renders via a 0.2 s idle
   timer from the buffer-local `window-size-change-functions` and
-  `window-buffer-change-functions` when the effective width changed.  The
+  `window-buffer-change-functions` when the effective width or the image
+  scale changed.  The buffer-local `text-scale-mode-hook` schedules the
+  same refit, and a change of the frame's font arrives through
+  `window-size-change-functions` because it changes the windows' size in
+  columns, so zooming the frame or the buffer re-flows the text and
+  rescales the images (§9); the rendering kept for the next toggle is
+  reused only at the same width, image setting and scale.  The
   render runs inside `while-no-input` (the commit after it does not); when
   the user types it is abandoned and rescheduled, and a render error is
   reported once with `message` (the width is recorded so it is not
   retried on every resize).
 - Width: `W = min(window-body-width + margins − 2·margin − 1,
-  mdview-max-width or ∞)`, at least 20; `mdview-center-content` (default
-  nil) enlarges the left margin to center the content.
+  mdview-max-width or ∞)`, at least 20, in columns of the buffer's text:
+  under `text-scale-mode` the window's frame columns are divided by the
+  ratio of the scaled to the frame's character width
+  (`mdview--column-scale`), and the display margins (`mdview-margin` text
+  columns each) are converted back to frame columns, rounding down, so
+  the content always fits.  `mdview-center-content` (default nil)
+  enlarges the left margin to center the content.
 - Initial state: `mdview-initial-view` (`edit`, default, or `view`) decides
   whether a visited file whose major mode derives from one of
   `mdview-markdown-modes` (default `markdown-mode`, `gfm-mode`, `md-mode`,
@@ -1091,15 +1131,18 @@ frame the same happens when the font does not draw the glyph exactly
 
 ;; mdview-image.el
 (mdview-image-displayable-p URL &optional BASE-DIR)   ; nil in batch / text mode
-(mdview-image-insert URL ALT &key base-dir max-width-px max-height-px inline)
+(mdview-image-insert URL ALT &key base-dir max-width-px max-height-px inline scale char-width)
                                            ; inserts image or placeholder at point, returns (COLUMNS . KIND)
                                            ; KIND ∈ image, placeholder, pending
+(mdview-image-scale-factor &optional WINDOW)   ; factor on images for the current buffer's text size, or nil
+(mdview-image-char-width &optional WINDOW)     ; pixel width of a text column of the current buffer, or nil
 (mdview-image-placeholder URL ALT)         ; → propertized placeholder string
 (mdview-image-cancel-pending &optional BUFFER KILL)   ; stop waiting for BUFFER's placeholders
 (mdview-image-clear-cache)
 mdview-image-update-functions              ; abnormal hook, called with the rendering's buffer after a
                                            ; placeholder was replaced (from the retrieval callback)
-;; options: mdview-image-timeout, mdview-image-max-parallel, mdview-image-max-height/-width, …
+;; options: mdview-image-timeout, mdview-image-max-parallel, mdview-image-max-height/-width,
+;;          mdview-image-scale, mdview-image-base-height, …
 
 ;; mdview-table.el
 (mdview-table-layout TABLE-NODE INNER-WIDTH RENDER-CELL-FN WRAP-FN &key expand)
@@ -1109,7 +1152,7 @@ mdview-image-update-functions              ; abnormal hook, called with the rend
    ;;    header line(s) (bold), rule line, body lines; no frame, no blank edge rows
 
 ;; mdview-render.el
-(mdview-render-document DOC &key width base-dir)   ; insert at point in current buffer
+(mdview-render-document DOC &key width base-dir char-width image-scale)   ; insert at point in current buffer
 (mdview-render-inlines INLINES &optional CTX)      ; → propertized string (images → placeholder/inline)
 (mdview-wrap STRING WIDTH)                         ; → list of propertized lines
 ;; options: mdview-html-renderer, mdview-min-content-width (nesting floor, §6)

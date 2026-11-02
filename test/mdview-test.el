@@ -155,6 +155,7 @@ window, and BODY runs with it current; it is killed afterwards."
       (should (memq #'mdview--before-save before-save-hook))
       (should (memq #'mdview--before-revert before-revert-hook))
       (should (memq #'mdview--window-size-changed window-size-change-functions))
+      (should (memq #'mdview--text-scale-changed text-scale-mode-hook))
       (should (string-match-p "Title" (buffer-string)))
       (should-not (string-match-p "#" (buffer-string)))
       (should (buffer-live-p mdview--twin))
@@ -167,6 +168,7 @@ window, and BODY runs with it current; it is killed afterwards."
       (should (memq left-margin-width '(nil 0)))
       (should (equal (window-margins (selected-window)) '(nil)))
       (should-not (memq #'mdview--window-size-changed window-size-change-functions))
+      (should-not (memq #'mdview--text-scale-changed text-scale-mode-hook))
       (should-not (local-variable-p 'fontification-functions))
       (should-not (local-variable-p 'syntax-propertize-function))
       ;; The rendering is kept for the next toggle.
@@ -534,7 +536,18 @@ window, and BODY runs with it current; it is killed afterwards."
           (let ((mdview-max-width 30))
             (mdview-toggle))
           (should (= renders 3))
-          (should (= mdview--last-width 30)))))))
+          (should (= mdview--last-width 30))
+          ;; Back and forth at the width of the kept rendering reuses it;
+          ;; a new image scale renders again.
+          (let ((mdview-max-width 30))
+            (mdview-toggle)
+            (mdview-toggle)
+            (should (= renders 3))
+            (mdview-toggle)
+            (cl-letf (((symbol-function 'mdview--image-scale) (lambda () 2.0)))
+              (mdview-toggle))
+            (should (= renders 4))
+            (should (equal mdview--last-scale 2.0))))))))
 
 (ert-deftest mdview-test-view-only-commands ()
   (mdview-test-with-source (source "Text\n")
@@ -734,7 +747,13 @@ window, and BODY runs with it current; it is killed afterwards."
           (should (= (mdview--content-width) 31))))
       (cl-letf (((symbol-function 'window-body-width) (lambda (&rest _) 12)))
         (let ((mdview-max-width 100))
-          (should (= (mdview--content-width) 20)))))))
+          (should (= (mdview--content-width) 20))))
+      ;; Text enlarged by `text-scale-mode' to 1.5 frame columns per
+      ;; column: 80 text columns fit in 120 frame columns.
+      (cl-letf (((symbol-function 'window-body-width) (lambda (&rest _) 120))
+                ((symbol-function 'mdview--column-scale) (lambda (_window) 1.5)))
+        (let ((mdview-max-width 100))
+          (should (= (mdview--content-width) 71)))))))
 
 (ert-deftest mdview-test-content-width-adds-back-margins ()
   ;; `window-body-width' excludes the margins already applied to the window.
@@ -755,7 +774,19 @@ window, and BODY runs with it current; it is killed afterwards."
         (let ((mdview-center-content t))
           (mdview--apply-margins 100)
           (should (= left-margin-width (+ 4 (/ 91 2))))
-          (should (= right-margin-width 4)))))))
+          (should (= right-margin-width 4)))
+        ;; With the text 1.5 times as wide as a frame column the margins
+        ;; of 4 text columns take 6 frame columns, and centering counts
+        ;; in text columns: 133 fit, 24 are left over, 12 go to the left.
+        (cl-letf (((symbol-function 'mdview--column-scale) (lambda (_window) 1.5)))
+          (let ((mdview-center-content nil))
+            (mdview--apply-margins 100)
+            (should (= left-margin-width 6))
+            (should (= right-margin-width 6)))
+          (let ((mdview-center-content t))
+            (mdview--apply-margins 100)
+            (should (= left-margin-width 24))
+            (should (= right-margin-width 6))))))))
 
 (ert-deftest mdview-test-refit-only-when-width-changes ()
   (mdview-test-with-source (source "Some text\n")
@@ -772,7 +803,33 @@ window, and BODY runs with it current; it is killed afterwards."
             (should (mdview--refit source))
             (should (= mdview--last-width 31))
             (should (/= tick (buffer-chars-modified-tick)))
-            (should-not (buffer-modified-p))))))))
+            (should-not (buffer-modified-p))
+            ;; A new image scale alone renders again as well.
+            (should-not (mdview--refit source))
+            (cl-letf (((symbol-function 'mdview--image-scale) (lambda () 2.0)))
+              (should (mdview--refit source))
+              (should (equal mdview--last-scale 2.0)))))))))
+
+(ert-deftest mdview-test-text-scale-change-schedules-refit ()
+  ;; `text-scale-mode' changes the size of the text, hence the number of
+  ;; columns that fit and the scale of the images: a refit follows.
+  (mdview-test-with-source (source "Some text\n")
+    (with-current-buffer source
+      (mdview-mode 1)
+      (unwind-protect
+          (progn
+            (let ((mdview-auto-refit t))
+              (text-scale-increase 1)
+              (should (timerp mdview--refit-timer))
+              (mdview--cancel-refit))
+            (let ((mdview-auto-refit nil))
+              (text-scale-increase 1)
+              (should (null mdview--refit-timer)))
+            (mdview-mode -1)
+            (let ((mdview-auto-refit t))
+              (text-scale-increase 1)
+              (should (null mdview--refit-timer))))
+        (text-scale-set 0)))))
 
 (ert-deftest mdview-test-window-size-change-schedules-timer ()
   (mdview-test-with-source (source "Some text\n")

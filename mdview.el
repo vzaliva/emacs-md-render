@@ -41,6 +41,7 @@
 (require 'imenu)
 (require 'browse-url)
 (require 'text-property-search)
+(require 'face-remap)                   ; text-scale-mode-hook
 (require 'url-parse)
 (require 'url-util)
 (require 'mdview-ast)
@@ -164,6 +165,9 @@ while the buffer is rendered: nothing can change the source then).")
 (defvar-local mdview--last-width nil
   "The content width used by the current rendering.")
 
+(defvar-local mdview--last-scale nil
+  "The image scale factor of the current rendering (`mdview--image-scale').")
+
 (defvar-local mdview--images-enabled 'unset
   "Non-nil means this buffer's rendering displays images.
 The value `unset' means `mdview-display-images' has not been consulted
@@ -279,12 +283,37 @@ rendered in place.
 
 ;;;; Width and margins
 
+(defun mdview--column-scale (window)
+  "Return the width of a column of text in WINDOW relative to a frame column.
+The text is that of the current buffer, which WINDOW normally shows:
+the ratio is 1.0 unless `text-scale-mode' (or another remapping of the
+`default' face) changes the size of its text, and always 1.0 without a
+graphical display."
+  (let ((frame (window-frame window)))
+    (if (display-graphic-p frame)
+        (let ((frame-width (frame-char-width frame))
+              (text-width (mdview-image-char-width window)))
+          (if (and text-width (> frame-width 0))
+              (/ (float text-width) frame-width)
+            1.0))
+      1.0)))
+
 (defun mdview--window-columns (window)
-  "Return the width of WINDOW's body plus its display margins, in columns."
+  "Return the width of WINDOW's body plus its display margins, in text columns.
+Text columns are those of the current buffer's `default' face: when
+`text-scale-mode' enlarges it, fewer of them fit in WINDOW than the
+frame's columns (see `mdview--column-scale')."
   (let ((margins (window-margins window)))
-    (+ (window-body-width window)
-       (or (car margins) 0)
-       (or (cdr margins) 0))))
+    (floor (+ (window-body-width window)
+              (or (car margins) 0)
+              (or (cdr margins) 0))
+           (mdview--column-scale window))))
+
+(defun mdview--image-scale ()
+  "Return the factor applied to images in a rendering of the current buffer.
+See `mdview-image-scale-factor'; the text is measured in a window
+showing the buffer when there is one."
+  (mdview-image-scale-factor (mdview--view-window)))
 
 (defun mdview--view-window ()
   "Return a window showing the current buffer, else the selected window."
@@ -311,14 +340,19 @@ would also reset the window's start and point."
 (defun mdview--apply-margins (width)
   "Set the display margins of the rendering for content WIDTH.
 With `mdview-center-content', the left margin absorbs the space left over
-by `mdview-max-width'.  The windows showing the buffer are updated."
+by `mdview-max-width'.  The margins are `mdview-margin' columns of the
+buffer's text, converted to the frame columns that display margins are
+measured in (`mdview--column-scale').  The windows showing the buffer
+are updated."
   (let* ((windows (get-buffer-window-list (current-buffer) nil t))
-         (columns (mdview--window-columns (or (car windows) (selected-window))))
+         (window (or (car windows) (selected-window)))
+         (columns (mdview--window-columns window))
+         (scale (mdview--column-scale window))
          (extra (if mdview-center-content
                     (max 0 (- columns 1 (* 2 mdview-margin) width))
                   0)))
-    (setq left-margin-width (+ mdview-margin (/ extra 2))
-          right-margin-width mdview-margin)
+    (setq left-margin-width (floor (* (+ mdview-margin (/ extra 2)) scale))
+          right-margin-width (floor (* mdview-margin scale)))
     (mdview--set-window-margins)))
 
 ;;;; The source text and the rendering pipeline
@@ -368,16 +402,21 @@ KILL-FETCHES non-nil also aborts retrievals nobody else waits for."
     (mdview-image-cancel-pending buffer kill-fetches)
     (kill-buffer buffer)))
 
-(defun mdview--render-to-buffer (document width images base-dir)
+(defun mdview--render-to-buffer (document width images base-dir &optional scale)
   "Render DOCUMENT into a new hidden buffer and return the buffer.
-WIDTH is the content width, IMAGES non-nil displays images and BASE-DIR
-resolves relative image paths.  The new buffer belongs to the current
+WIDTH is the content width, IMAGES non-nil displays images, BASE-DIR
+resolves relative image paths and SCALE is the factor applied to images
+\(see `mdview--image-scale').  The width of a text column is measured in
+the window showing the current buffer, like SCALE is, because the
+hidden buffer has neither the window nor the text scaling of the buffer
+that will show the rendering.  The new buffer belongs to the current
 buffer (`mdview--owner'), has undo disabled and its text is marked as
 fontified, so that jit-lock never touches it.  Garbage collection is
 made less eager meanwhile (`mdview--render-gc-threshold').  On any
 non-local exit, including `while-no-input' giving up, the buffer is
 killed and nothing else has changed."
   (let ((owner (current-buffer))
+        (char-width (mdview-image-char-width (mdview--view-window)))
         (buffer (generate-new-buffer " *mdview-render*"))
         (done nil))
     (unwind-protect
@@ -389,7 +428,9 @@ killed and nothing else has changed."
           (let ((gc-cons-threshold (max gc-cons-threshold mdview--render-gc-threshold))
                 (gc-cons-percentage (max gc-cons-percentage 0.5))
                 (mdview-display-images images))
-            (mdview-render-document document :width width :base-dir base-dir))
+            (mdview-render-document document :width width :base-dir base-dir
+                                    :char-width char-width
+                                    :image-scale scale))
           ;; The renderer remaps the derived faces in the buffer it
           ;; renders into; the buffer that displays the text does that.
           (mdview-faces-unremap)
@@ -684,7 +725,8 @@ ignores buffers that are not rendered."
   (mdview--apply-margins width)
   (mdview-faces-remap)
   (add-hook 'window-size-change-functions #'mdview--window-size-changed nil t)
-  (add-hook 'window-buffer-change-functions #'mdview--window-size-changed nil t))
+  (add-hook 'window-buffer-change-functions #'mdview--window-size-changed nil t)
+  (add-hook 'text-scale-mode-hook #'mdview--text-scale-changed nil t))
 
 (defun mdview--swap (other)
   "Exchange the text of the current buffer with that of OTHER.
@@ -718,18 +760,19 @@ screen row (see `mdview--apply-capture')."
   (mdview--check-swappable)
   (let* ((source (current-buffer))
          (width (mdview--content-width))
+         (scale (mdview--image-scale))
          (images (if (eq mdview--images-enabled 'unset)
                      mdview-display-images
                    mdview--images-enabled))
          (base-dir (mdview--compute-base-dir))
          (reuse (and (buffer-live-p mdview--twin)
                      mdview--twin-key
-                     (equal mdview--twin-key (list width images))
+                     (equal mdview--twin-key (list width images scale))
                      (mdview--source-unchanged-p)))
          (capture (mdview--capture))
          (fresh (unless reuse
                   (mdview--render-to-buffer (mdview--source-document)
-                                            width images base-dir)))
+                                            width images base-dir scale)))
          ;; From here on nothing may interrupt: the texts get exchanged.
          (throw-on-input nil)
          (inhibit-quit t))
@@ -749,7 +792,8 @@ screen row (see `mdview--apply-capture')."
     (setq mdview--rendered t
           mdview--source-key (mdview--current-source-key)
           mdview--twin-key nil
-          mdview--last-width width)
+          mdview--last-width width
+          mdview--last-scale scale)
     (setq mdview-mode t)
     (condition-case err
         (progn
@@ -785,12 +829,14 @@ suspended modes are not switched back on."
     (mdview--cancel-image-update)
     (remove-hook 'window-size-change-functions #'mdview--window-size-changed t)
     (remove-hook 'window-buffer-change-functions #'mdview--window-size-changed t)
+    (remove-hook 'text-scale-mode-hook #'mdview--text-scale-changed t)
     (mdview-faces-unremap)
     (mdview--restore-settings)
     (mdview--swap mdview--twin)
     (setq mdview--rendered nil
           mdview--source-key (mdview--current-source-key)
-          mdview--twin-key (list mdview--last-width mdview--images-enabled))
+          mdview--twin-key (list mdview--last-width mdview--images-enabled
+                                 mdview--last-scale))
     (setq mdview-mode nil)
     (syntax-ppss-flush-cache (point-min))
     (setq mdview--memory (mdview--apply-capture capture mdview--memory))
@@ -921,7 +967,8 @@ while it lives the base buffer cannot swap its source back (see
                      (change-major-mode-hook . mdview--on-change-major-mode)
                      (kill-buffer-hook . mdview--on-kill)
                      (window-size-change-functions . mdview--window-size-changed)
-                     (window-buffer-change-functions . mdview--window-size-changed)))
+                     (window-buffer-change-functions . mdview--window-size-changed)
+                     (text-scale-mode-hook . mdview--text-scale-changed)))
       (remove-hook (car entry) (cdr entry) t))))
 
 (defun mdview--kill-twin ()
@@ -973,8 +1020,9 @@ giving up, leaves the old rendering in place."
            (line (or line (mdview--source-line-at (mdview--view-point))))
            (starts (mdview--window-starts buffer))
            (width (mdview--content-width))
+           (scale (mdview--image-scale))
            (fresh (mdview--render-to-buffer document width mdview--images-enabled
-                                            mdview--base-dir))
+                                            mdview--base-dir scale))
            ;; The rendering is done; exchanging it must not be interrupted.
            (throw-on-input nil)
            (inhibit-quit t))
@@ -984,6 +1032,7 @@ giving up, leaves the old rendering in place."
       ;; FRESH now holds the old rendering; forget its pending images.
       (mdview--kill-hidden fresh)
       (setq mdview--last-width width
+            mdview--last-scale scale
             imenu--index-alist nil
             mdview--memory nil)
       (mdview--apply-margins width)
@@ -1000,21 +1049,36 @@ giving up, leaves the old rendering in place."
     (cancel-timer mdview--refit-timer)
     (setq mdview--refit-timer nil)))
 
+(defun mdview--schedule-refit (buffer)
+  "Schedule a refit of the rendering in BUFFER once Emacs has been idle.
+Nothing happens when `mdview-auto-refit' is off or BUFFER is not rendered."
+  (when (mdview--view-p buffer)
+    (with-current-buffer buffer
+      (when mdview-auto-refit
+        (mdview--cancel-refit)
+        (setq mdview--refit-timer
+              (run-with-idle-timer mdview-refit-delay nil
+                                   #'mdview--refit buffer))))))
+
 (defun mdview--window-size-changed (object)
   "Schedule a refit of the rendering shown in OBJECT, a window or a frame.
 Runs from the buffer-local `window-size-change-functions' and
-`window-buffer-change-functions' of a rendered buffer."
-  (let ((buffer (if (windowp object) (window-buffer object) (current-buffer))))
-    (when (mdview--view-p buffer)
-      (with-current-buffer buffer
-        (when mdview-auto-refit
-          (mdview--cancel-refit)
-          (setq mdview--refit-timer
-                (run-with-idle-timer mdview-refit-delay nil
-                                     #'mdview--refit buffer)))))))
+`window-buffer-change-functions' of a rendered buffer.  A change of the
+frame's font (`set-frame-font', `global-text-scale-adjust', zoom-frm)
+arrives here as well, since it changes the size of the windows in
+columns."
+  (mdview--schedule-refit
+   (if (windowp object) (window-buffer object) (current-buffer))))
+
+(defun mdview--text-scale-changed ()
+  "Schedule a refit after `text-scale-mode' changed the size of the text.
+Runs from the buffer-local `text-scale-mode-hook' of a rendered buffer:
+the number of columns of the scaled text that fit the window and the
+scale of the images both follow the text."
+  (mdview--schedule-refit (current-buffer)))
 
 (defun mdview--refit (buffer &optional line)
-  "Render BUFFER again if its content width changed.
+  "Render BUFFER again if its content width or the scale of its images changed.
 Point goes to the block of source LINE, or stays on the current block
 when LINE is nil.  The rendering is abandoned as soon as the user types
 and rescheduled for the next idle period (with LINE remembered), so a
@@ -1026,7 +1090,9 @@ completed."
       (setq mdview--refit-timer nil)
       (let ((window (get-buffer-window buffer t)))
         (when (and window
-                   (not (eql (mdview--content-width window) mdview--last-width)))
+                   (not (and (eql (mdview--content-width window)
+                                  mdview--last-width)
+                             (eql (mdview--image-scale) mdview--last-scale))))
           (let ((line (or line (mdview--source-line-at (mdview--view-point)))))
             (condition-case err
                 (if (while-no-input (mdview--render-into buffer line) nil)
@@ -1037,8 +1103,9 @@ completed."
                       nil)
                   t)
               (error
-               ;; Do not retry at this width on every subsequent resize.
-               (setq mdview--last-width (mdview--content-width window))
+               ;; Do not retry at this size on every subsequent resize.
+               (setq mdview--last-width (mdview--content-width window)
+                     mdview--last-scale (mdview--image-scale))
                (message "mdview: %s" (error-message-string err))
                nil))))))))
 
