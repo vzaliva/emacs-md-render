@@ -141,6 +141,28 @@ fresh string."
     (add-face-text-property 0 (length string) bg t string))
   string)
 
+;;;; Source positions
+
+(defun mdview-render--trim (string)
+  "Return STRING without leading and trailing whitespace, offsets kept.
+Like `string-trim', except that the result is cut with
+`mdview-ast-substring', so the source offsets carried by the text
+property `mdview-pos' stay exact when leading characters are removed."
+  (let ((start 0) (end (length string)))
+    (while (and (< start end) (memq (aref string start) '(?\s ?\t ?\n ?\r)))
+      (setq start (1+ start)))
+    (while (and (> end start) (memq (aref string (1- end)) '(?\s ?\t ?\n ?\r)))
+      (setq end (1- end)))
+    (if (and (zerop start) (= end (length string)))
+        string
+      (mdview-ast-substring string start end))))
+
+(defun mdview-render--without-positions (string)
+  "Return a copy of STRING without the text property `mdview-pos'."
+  (let ((copy (copy-sequence string)))
+    (remove-text-properties 0 (length copy) '(mdview-pos nil) copy)
+    copy))
+
 ;;;; Line emission
 
 (defun mdview-render--take-prefix (ctx)
@@ -221,7 +243,10 @@ with the text property `mdview-columns' (an inline image) counts as
 that many columns and is never split.  A span with the text property
 `mdview-nobreak' (an image placeholder) moves to the next line as a
 whole when it does not fit; it is broken at its inner spaces only when
-it is wider than WIDTH by itself."
+it is wider than WIDTH by itself.  Lines are cut with
+`mdview-ast-substring', so a line starting inside a run of the text
+property `mdview-pos' keeps exact source offsets (docs/DESIGN.md
+section 3)."
   (let ((pos start)
         (atoms (text-property-not-all start end 'mdview-columns nil string))
         (nobreak (text-property-not-all start end 'mdview-nobreak nil string))
@@ -256,7 +281,7 @@ it is wider than WIDTH by itself."
             (while (and (> e line-start)
                         (mdview-render--plain-space-p string (1- e) atoms))
               (setq e (1- e)))
-            (push (substring string line-start e) lines)
+            (push (mdview-ast-substring string line-start e) lines)
             (setq count (1+ count)))
           (setq pos line-end))))
     (if (zerop count) (cons "" lines) lines)))
@@ -271,7 +296,9 @@ removed.  Widths are measured with `string-width', except that a span
 with the text property `mdview-columns' (an inline image) counts as that
 many columns and is never split; a span with `mdview-nobreak' (an image
 placeholder) is kept on one line unless it is wider than WIDTH.  Text
-properties are preserved because lines are substrings of STRING."
+properties are preserved because lines are substrings of STRING; the
+source offsets of `mdview-pos' are re-based where a line starts inside
+a run (see `mdview-ast-substring')."
   (let ((width (max 1 width))
         (string (if (string-search "\t" string)
                     (subst-char-in-string ?\t ?\s string)
@@ -398,15 +425,18 @@ exhaust `max-lisp-eval-depth'; the enclosing faces still apply.")
          (text (let ((mdview-render--inline-depth (1+ mdview-render--inline-depth)))
                  (mdview-render-inlines (mdview-node-children node) ctx))))
     (when (string-empty-p text)
-      (setq text (copy-sequence url)))
+      (setq text (mdview-render--without-positions url)))
     (add-face-text-property 0 (length text) 'mdview-link t text)
     (add-text-properties 0 (length text)
                          (mdview-render--link-properties url title) text)
     text))
 
 (defun mdview-render--image-alt (node)
-  "Return the alt text of the image NODE."
-  (or (mdview-node-prop node :alt) (mdview-node-text node)))
+  "Return the alt text of the image NODE.
+The text carries no `mdview-pos': image placeholders and captions stand
+for the image, not for source text (docs/DESIGN.md section 3)."
+  (mdview-render--without-positions
+   (or (mdview-node-prop node :alt) (mdview-node-text node))))
 
 (defun mdview-render--nobreak (string)
   "Mark STRING, modified in place, as a span that `mdview-wrap' does not split."
@@ -528,6 +558,16 @@ of any depth; breaks become a space or a newline."
          (t (setq stack (append (mdview-node-children n) stack))))))
     (apply #'concat (nreverse parts))))
 
+(defun mdview-render--inline-code (node)
+  "Render the `code' NODE: its text in `mdview-inline-code'.
+When NODE has a `:pos' (the source offset of its first character) the
+whole text is one run of `mdview-pos' with that value."
+  (let ((text (mdview-node-text node))
+        (pos (mdview-node-prop node :pos)))
+    (if pos
+        (propertize text 'face 'mdview-inline-code 'mdview-pos pos)
+      (propertize text 'face 'mdview-inline-code))))
+
 (defun mdview-render--inline (node ctx)
   "Render the inline NODE in CTX to a propertized string.
 Container nodes nested deeper than `mdview-render--max-inline-depth'
@@ -542,7 +582,7 @@ are rendered as their plain text."
       ('emphasis (mdview-render--inline-faced node 'mdview-emphasis ctx))
       ('strong (mdview-render--inline-faced node 'mdview-strong ctx))
       ('strikethrough (mdview-render--inline-faced node 'mdview-strikethrough ctx))
-      ('code (propertize (mdview-node-text node) 'face 'mdview-inline-code))
+      ('code (mdview-render--inline-code node))
       ('link (mdview-render--inline-link node ctx))
       ('image (mdview-render--inline-image node ctx))
       ('hard-break "\n")
@@ -800,7 +840,7 @@ align=\"center\") has every line centered; one with `:summary' (an HTML
                    (mdview-render-inlines (mdview-node-children node) ctx)
                    "\n+")))
         (when (mdview-node-prop node :summary)
-          (setq text (string-trim text))
+          (setq text (mdview-render--trim text))
           (add-face-text-property 0 (length text) 'mdview-summary t text)
           (setq text (concat (propertize (mdview-glyph 'summary)
                                          'face 'mdview-summary)
@@ -858,7 +898,7 @@ NODE with the marker removed.  Return nil for an ordinary quote."
                (string-match "\\`\\[!\\([A-Za-z]+\\)\\][ \t]*\\(?:\n\\|\\'\\)" head))
       (let ((kind (assoc (downcase (match-string 1 head))
                          mdview-render--alert-kinds))
-            (rest (substring head (match-end 0)))
+            (rest (mdview-ast-substring head (match-end 0)))
             (tail (cdr inlines)))
         (when kind
           (when (and (string-empty-p rest) tail
@@ -1014,19 +1054,52 @@ background shows under them.  Rows wider than WIDTH are not truncated."
     (add-face-text-property 0 (length row) 'mdview-code-block t row)
     row))
 
+(defun mdview-render--code-line-positions (line raw pos)
+  "Return a copy of the code LINE carrying source offsets in `mdview-pos'.
+LINE was made from the source line RAW, which starts at source offset
+POS, by `mdview-render--expand-tabs' and the indentation guides (both
+keep the characters one-to-one, except that a tab becomes
+`mdview-code-tab-width' spaces).  The stretch of RAW between two tabs is
+one run, and so are the spaces standing for each tab, valued at the
+offset of the tab.  Characters of LINE beyond those standing for RAW (the
+guides drawn into a blank line) get no offset."
+  (let ((line (copy-sequence line))
+        (len (length line))
+        (n (length raw))
+        (k 0) (j 0))
+    (while (and (< k n) (< j len))
+      (let ((tab (or (string-search "\t" raw k) n)))
+        (if (> tab k)
+            (let ((end (min len (+ j (- tab k)))))
+              (put-text-property j end 'mdview-pos (+ pos k) line)
+              (setq j end k tab))
+          (let ((end (min len (+ j (max 0 mdview-code-tab-width)))))
+            (when (> end j)
+              (put-text-property j end 'mdview-pos (+ pos k) line))
+            (setq j end k (1+ k))))))
+    line))
+
 (defun mdview-render--code-block (node ctx)
-  "Render the code block NODE in CTX (docs/DESIGN.md section 6, \"Code blocks\")."
+  "Render the code block NODE in CTX (docs/DESIGN.md section 6, \"Code blocks\").
+When NODE has `:positions', the source offsets of its lines, each line
+of code carries them in `mdview-pos'."
   (let* ((code (or (car (mdview-node-children node)) ""))
          (lang (mdview-node-prop node :lang))
          (width (mdview-render-ctx-width ctx))
+         (positions (mdview-node-prop node :positions))
          (text (condition-case nil
                    (mdview-code-fontify code lang)
                  (error (substring-no-properties code))))
-         (lines (split-string (if (stringp text) text code) "\n")))
+         (lines (split-string (if (stringp text) text code) "\n"))
+         (raws lines))
     (mdview-render--emit-line (mdview-render--code-row "" width) ctx)
     (dolist (line (mdview-code-indent-guides-lines
                    (mapcar #'mdview-render--expand-tabs lines)))
-      (mdview-render--emit-line (mdview-render--code-row line width) ctx))
+      (let ((raw (pop raws))
+            (pos (pop positions)))
+        (when (and (natnump pos) (stringp raw))
+          (setq line (mdview-render--code-line-positions line raw pos)))
+        (mdview-render--emit-line (mdview-render--code-row line width) ctx)))
     (mdview-render--emit-line (mdview-render--code-row "" width) ctx)))
 
 (defun mdview-render--table (node ctx)
@@ -1070,10 +1143,20 @@ real images, and wrapped with `mdview-wrap'."
   (mdview-render--blocks definitions ctx))
 
 (defun mdview-render--mark-source-line (node start)
-  "Record the `:line' of NODE on the character at START, the block's first."
-  (let ((line (mdview-node-prop node :line)))
-    (when (and line (< start (point)))
-      (put-text-property start (1+ start) 'mdview-source-line line))))
+  "Record the source location of NODE on the character at START.
+START is the block's first rendered character.  It gets the `:line' of
+NODE as the text property `mdview-source-line' and the `:pos' of NODE
+\(the source offset of the block's first character) as
+`mdview-source-pos', each when present.  Blocks are marked after their
+children, so a container sharing its first character with its first
+child overrides the child's values."
+  (when (< start (point))
+    (let ((line (mdview-node-prop node :line))
+          (pos (mdview-node-prop node :pos)))
+      (when line
+        (put-text-property start (1+ start) 'mdview-source-line line))
+      (when pos
+        (put-text-property start (1+ start) 'mdview-source-pos pos)))))
 
 (defun mdview-render--block (node ctx)
   "Render the block NODE in CTX and mark its source line."
@@ -1205,30 +1288,36 @@ Markers are those of `mdview-render--html-tag-pieces'; comments,
   "Return TEXT with every run of whitespace replaced by one space."
   (replace-regexp-in-string "[ \t\n\r]+" " " text t t))
 
-(defun mdview-render--html-paragraph (inlines line center summary)
+(defun mdview-render--html-paragraph (inlines line center summary &optional pos)
   "Return a paragraph node at LINE for INLINES, or nil when they are blank.
-CENTER marks the paragraph for centering and SUMMARY as a <summary>."
+CENTER marks the paragraph for centering and SUMMARY as a <summary>.
+POS, when non-nil, becomes the node's `:pos'."
   (unless (seq-every-p #'mdview-render--blank-inline-p inlines)
     (apply #'mdview-node 'paragraph
            (append (list :line line)
+                   (when pos (list :pos pos))
                    (when center (list :center t))
                    (when summary (list :summary t)))
            inlines)))
 
-(defun mdview-render--html-heading (inlines line level)
-  "Return a heading node of LEVEL at LINE for INLINES, or nil when blank."
+(defun mdview-render--html-heading (inlines line level &optional pos)
+  "Return a heading node of LEVEL at LINE for INLINES, or nil when blank.
+POS, when non-nil, becomes the node's `:pos'."
   (unless (seq-every-p #'mdview-render--blank-inline-p inlines)
     (let ((text (string-trim (mapconcat #'mdview-node-text inlines ""))))
       (apply #'mdview-node 'heading
-             (list :level level :id (mdview-slug text) :line line)
+             (append (list :level level :id (mdview-slug text) :line line)
+                     (when pos (list :pos pos)))
              inlines))))
 
-(defun mdview-render--html-blocks-from-pieces (pieces line)
+(defun mdview-render--html-blocks-from-pieces (pieces line &optional pos)
   "Turn PIECES of `mdview-render--html-pieces' into blocks at source LINE.
 Block-level tags end the paragraph being collected, <h1> .. <h6> become
 headings, <summary> a paragraph with `:summary', text inside <kbd> a
 `code' node, and paragraphs collected inside an element with
-align=\"center\" get `:center'."
+align=\"center\" get `:center'.  Every block gets `:line' LINE and,
+when POS is non-nil, `:pos' POS: the location of the HTML block they
+come from."
   (let ((blocks nil) (inlines nil) (text nil)
         (center nil) (heading nil) (summary nil) (kbd nil))
     (cl-flet* ((flush-text ()
@@ -1245,9 +1334,9 @@ align=\"center\" get `:center'."
                  (flush-text)
                  (let ((block (if heading
                                   (mdview-render--html-heading
-                                   (nreverse inlines) line heading)
+                                   (nreverse inlines) line heading pos)
                                 (mdview-render--html-paragraph
-                                 (nreverse inlines) line center summary))))
+                                 (nreverse inlines) line center summary pos))))
                    (when block (push block blocks)))
                  (setq inlines nil)))
       (dolist (piece pieces)
@@ -1256,7 +1345,9 @@ align=\"center\" get `:center'."
           (`(break) (flush-text) (push (mdview-node 'hard-break nil) inlines))
           (`(image ,node) (flush-text) (push node inlines))
           (`(hr) (flush-paragraph)
-           (push (mdview-node 'thematic-break (list :line line)) blocks))
+           (push (mdview-node 'thematic-break
+                              (append (list :line line) (when pos (list :pos pos))))
+                 blocks))
           (`(block) (flush-paragraph))
           (`(center ,flag) (setq center flag))
           (`(heading ,level) (flush-paragraph) (setq heading level))
@@ -1269,10 +1360,16 @@ align=\"center\" get `:center'."
     (nreverse blocks)))
 
 (defun mdview-render--html-block-blocks (node)
-  "Return the blocks replacing the `html-block' NODE under the strip renderer."
+  "Return the blocks replacing the `html-block' NODE under the strip renderer.
+The text of the blocks carries no `mdview-pos': collapsing white space
+and decoding entities change it too much for exact source offsets, so
+the raw HTML is stripped of them first.  The blocks get the `:line' and
+`:pos' of NODE."
   (mdview-render--html-blocks-from-pieces
-   (mdview-render--html-pieces (or (car (mdview-node-children node)) ""))
-   (mdview-node-prop node :line)))
+   (mdview-render--html-pieces
+    (mdview-render--without-positions (or (car (mdview-node-children node)) "")))
+   (mdview-node-prop node :line)
+   (mdview-node-prop node :pos)))
 
 (defun mdview-render--expand-blocks (blocks)
   "Return BLOCKS with every `html-block' replaced by its stripped blocks.

@@ -1279,5 +1279,292 @@
        20)
       (should (= probes 1)))))
 
+;;;; Source positions
+
+(defvar mdview-render-test--source nil
+  "The Markdown source the runs of a position test are taken from.")
+
+(defvar mdview-render-test--runs nil
+  "The (OFFSET . PIECE) runs made by `mdview-render-test--run' so far.")
+
+(defun mdview-render-test--run (piece)
+  "Return PIECE carrying its offset in `mdview-render-test--source'.
+PIECE must occur exactly once in the source.  The run is recorded in
+`mdview-render-test--runs' for `mdview-render-test--check-covered'."
+  (let ((offset (string-search piece mdview-render-test--source)))
+    (should offset)
+    (should-not (string-search piece mdview-render-test--source (1+ offset)))
+    (push (cons offset piece) mdview-render-test--runs)
+    (propertize piece 'mdview-pos offset)))
+
+(defun mdview-render-test--check-oracle (text source)
+  "Check every character of TEXT carrying `mdview-pos' against SOURCE.
+The source character at the offset `mdview-ast-pos-at' computes must be
+the rendered character.  Return a hash table of the offsets seen."
+  (let ((covered (make-hash-table)))
+    (dotimes (i (length text))
+      (let ((offset (mdview-ast-pos-at i text)))
+        (when offset
+          (should (equal (list i (and (< offset (length source))
+                                      (string (aref source offset))))
+                         (list i (string (aref text i)))))
+          (puthash offset t covered))))
+    covered))
+
+(defun mdview-render-test--check-covered (covered runs)
+  "Check that every non-blank character of RUNS has its offset in COVERED.
+RUNS is a list of (OFFSET . PIECE)."
+  (pcase-dolist (`(,offset . ,piece) runs)
+    (dotimes (k (length piece))
+      (unless (memq (aref piece k) '(?\s ?\n))
+        (should (equal (list piece k (gethash (+ offset k) covered))
+                       (list piece k t)))))))
+
+(ert-deftest mdview-render-wrap-rebases-positions ()
+  (let* ((string (propertize "alpha beta gamma delta epsilon" 'mdview-pos 100))
+         (lines (mdview-wrap string 11)))
+    (should (equal lines '("alpha beta" "gamma delta" "epsilon")))
+    (should (equal (mapcar (lambda (line) (get-text-property 0 'mdview-pos line))
+                           lines)
+                   '(100 111 123)))
+    ;; a run stays one stretch on its line
+    (should (equal (mdview-ast-pos-at 6 (nth 1 lines)) 117)))
+  ;; a word broken at the width
+  (let ((lines (mdview-wrap (propertize "abcdefghij" 'mdview-pos 7) 4)))
+    (should (equal lines '("abcd" "efgh" "ij")))
+    (should (equal (mapcar (lambda (line) (get-text-property 0 'mdview-pos line))
+                           lines)
+                   '(7 11 15))))
+  ;; a line starting after a forced newline, and two runs on one line
+  (let* ((string (concat (propertize "one two" 'mdview-pos 0) "\n"
+                         (propertize "three " 'mdview-pos 20)
+                         (propertize "four" 'mdview-pos 40)))
+         (lines (mdview-wrap string 7)))
+    (should (equal lines '("one two" "three" "four")))
+    (should (equal (mdview-ast-pos-at 4 (nth 0 lines)) 4))
+    (should (equal (mdview-ast-pos-at 0 (nth 1 lines)) 20))
+    (should (equal (mdview-ast-pos-at 2 (nth 2 lines)) 42)))
+  ;; text without positions stays without them
+  (should-not (text-properties-at 0 (cadr (mdview-wrap "aaa bbb" 3)))))
+
+(ert-deftest mdview-render-inline-code-carries-pos ()
+  (let ((text (mdview-render-inlines
+               (list (propertize "a " 'mdview-pos 0)
+                     (mdview-node 'code '(:pos 3) "x y")
+                     (mdview-node 'code nil "z")))))
+    (should (equal (substring-no-properties text) "a x yz"))
+    (should (equal (mdview-ast-pos-at 4 text) 5))
+    (should (memq 'mdview-inline-code (mdview-render-test--faces text 2)))
+    (should-not (get-text-property 5 'mdview-pos text))))
+
+(ert-deftest mdview-render-positions-map-back-to-source ()
+  (let* ((mdview-render-test--source
+          (concat "Lorem ipsum dolor sit amet, *consectetur* adipiscing"
+                  " `elit sed` do eiusmod.\n\n"
+                  "# Big\\\ntitle\n\n"
+                  "> quoted words that wrap around\n\n"
+                  "- item text that wraps too\n\n"
+                  "> [!NOTE]\nBe careful here\n\n"
+                  "[^1]: note body text\n"))
+         (source mdview-render-test--source)
+         (mdview-render-test--runs nil)
+         (code-pos (string-search "elit sed" source))
+         (alert-pos (string-search "[!NOTE]" source))
+         (doc (mdview-node
+               'document
+               (list :refs nil
+                     :footnotes
+                     (list (mdview-node
+                            'footnote-definition '(:label "1" :index 1)
+                            (mdview-render-test--para
+                             (mdview-render-test--run "note body text")))))
+               (mdview-render-test--para
+                (mdview-render-test--run "Lorem ipsum dolor sit amet, ")
+                (mdview-node 'emphasis nil (mdview-render-test--run "consectetur"))
+                (mdview-render-test--run " adipiscing ")
+                (mdview-node 'code (list :pos code-pos) "elit sed")
+                (mdview-render-test--run " do eiusmod."))
+               (mdview-node 'heading '(:level 1 :id "big-title")
+                            (mdview-render-test--run "Big")
+                            (mdview-node 'hard-break nil)
+                            (mdview-render-test--run "title"))
+               (mdview-node 'blockquote nil
+                            (mdview-render-test--para
+                             (mdview-render-test--run "quoted words that wrap around")))
+               (mdview-render-test--list
+                t (mdview-node 'item nil
+                               (mdview-render-test--para
+                                (mdview-render-test--run "item text that wraps too"))))
+               ;; an alert whose marker and text share one run
+               (mdview-node 'blockquote nil
+                            (mdview-render-test--para
+                             (propertize "[!NOTE]\nBe careful here"
+                                         'mdview-pos alert-pos)))))
+         (text (mdview-render-test--render doc 14))
+         (covered (mdview-render-test--check-oracle text source)))
+    (mdview-render-test--check-covered
+     covered
+     (append (list (cons code-pos "elit sed")
+                   (cons (string-search "Be careful" source) "Be careful here"))
+             mdview-render-test--runs))
+    ;; the alert marker itself is not shown
+    (should-not (gethash alert-pos covered))))
+
+(ert-deftest mdview-render-boxed-heading-positions ()
+  (let* ((text (mdview-render-test--render
+                (mdview-render-test--doc
+                 (mdview-node 'heading '(:level 2 :id "h")
+                              (propertize "alpha beta gamma" 'mdview-pos 3)))
+                12))
+         (beta (string-search "beta" text))
+         (gamma (string-search "gamma" text)))
+    ;; text width 8: one word per centred line
+    (should (equal (mdview-ast-pos-at beta text) 9))
+    (should (equal (mdview-ast-pos-at (+ beta 3) text) 12))
+    (should (equal (mdview-ast-pos-at gamma text) 14))
+    ;; the frame and the centring spaces carry no position
+    (should-not (mdview-ast-pos-at (1- beta) text))
+    (should-not (mdview-ast-pos-at (mdview-render-test--line-pos text 3) text))))
+
+(ert-deftest mdview-render-aligned-table-cells-keep-positions ()
+  (let* ((mdview-render-test--source
+          (concat "| Right | Center |\n|---:|:---:|\n"
+                  "| alpha beta gamma | delta epsilon zeta |\n"))
+         (mdview-render-test--runs nil)
+         (cell (lambda (piece)
+                 (mdview-node 'table-cell nil (mdview-render-test--run piece))))
+         (table (mdview-node 'table '(:align (right center))
+                             (mdview-node 'table-row '(:header t)
+                                          (funcall cell "Right")
+                                          (funcall cell "Center"))
+                             (mdview-node 'table-row nil
+                                          (funcall cell "alpha beta gamma")
+                                          (funcall cell "delta epsilon zeta"))))
+         (text (mdview-render-test--render (mdview-render-test--doc table) 20))
+         (lines (split-string (substring-no-properties text) "\n")))
+    ;; the cells wrap, and are aligned
+    (should (seq-some (lambda (line) (string-match-p "  gamma" line)) lines))
+    (mdview-render-test--check-covered
+     (mdview-render-test--check-oracle text mdview-render-test--source)
+     mdview-render-test--runs)))
+
+(ert-deftest mdview-render-code-block-positions ()
+  (let* ((source "~~~\nfoo\n\tbar\n\n\tqux\n  baz\n~~~\n")
+         (positions (list 4 8 13 14 19))
+         (mdview-code-tab-width 4)
+         (mdview-code-indent-guides t)
+         (mdview-code-indent-guide-width 4)
+         (text (cl-letf (((symbol-function 'mdview-code-fontify)
+                          (lambda (code _lang)
+                            (propertize (substring-no-properties code)
+                                        'face 'font-lock-string-face))))
+                 (mdview-render-test--render
+                  (mdview-render-test--doc
+                   (mdview-node 'code-block (list :lang "x" :positions positions)
+                                "foo\n\tbar\n\n\tqux\n  baz"))
+                  12)))
+         (line (lambda (n) (mdview-render-test--line-pos text n))))
+    ;; rows: blank, foo, bar, (guides), qux, baz, blank
+    (should (equal (mdview-ast-pos-at (+ (funcall line 1) 2) text) 4))
+    (should (equal (mdview-ast-pos-at (+ (funcall line 1) 4) text) 6))
+    ;; the spaces standing for the tab start at the tab (the inside of
+    ;; the tab is approximate), the text after it is exact
+    (should (equal (mdview-ast-pos-at (+ (funcall line 2) 2) text) 8))
+    (should (eq (get-text-property (+ (funcall line 2) 5) 'mdview-pos text) 8))
+    (should (equal (mdview-ast-pos-at (+ (funcall line 2) 6) text) 9))
+    (should (equal (mdview-ast-pos-at (+ (funcall line 2) 8) text) 11))
+    ;; the guides drawn into the empty line stand for nothing
+    (should-not (text-property-not-all (funcall line 3) (funcall line 4)
+                                       'mdview-pos nil text))
+    (should (equal (mdview-ast-pos-at (+ (funcall line 4) 6) text) 15))
+    (should (equal (mdview-ast-pos-at (+ (funcall line 5) 4) text) 21))
+    ;; the padding of the rows carries nothing
+    (should-not (mdview-ast-pos-at (funcall line 1) text))
+    (should-not (mdview-ast-pos-at (+ (funcall line 1) 5) text))
+    ;; every position is right outside the expanded tabs
+    (dolist (n '(1 5))
+      (let ((start (funcall line n)))
+        (dotimes (k 12)
+          (let ((offset (mdview-ast-pos-at (+ start k) text)))
+            (when offset
+              (should (eq (aref source offset) (aref text (+ start k)))))))))))
+
+(ert-deftest mdview-render-code-block-without-positions ()
+  (let ((text (cl-letf (((symbol-function 'mdview-code-fontify)
+                         (lambda (code _lang) code)))
+                (mdview-render-test--render
+                 (mdview-render-test--doc (mdview-node 'code-block nil "a\nb"))
+                 8))))
+    (should-not (text-property-not-all 0 (length text) 'mdview-pos nil text))))
+
+(ert-deftest mdview-render-source-pos-on-block-starts ()
+  (let* ((mdview-html-renderer 'strip)
+         (text (cl-letf (((symbol-function 'mdview-code-fontify) (lambda (c _) c)))
+                 (mdview-render-test--render
+                  (mdview-render-test--doc
+                   (mdview-node 'paragraph '(:line 1 :pos 0) "p")
+                   (mdview-node 'list '(:ordered nil :tight t :marker ?- :line 3 :pos 10)
+                                (mdview-node 'item '(:line 3 :pos 10)
+                                             (mdview-node 'paragraph '(:line 3 :pos 12) "a"))
+                                (mdview-node 'item '(:line 4 :pos 15)
+                                             (mdview-node 'paragraph '(:line 4 :pos 17) "b")))
+                   (mdview-node 'blockquote '(:line 6 :pos 20)
+                                (mdview-node 'paragraph '(:line 6 :pos 22) "q"))
+                   (mdview-node 'code-block '(:line 8 :pos 30) "c")
+                   (mdview-node 'thematic-break '(:line 10 :pos 40))
+                   (mdview-node 'html-block '(:line 12 :pos 50) "<p>x</p><p>y</p>")
+                   (mdview-node 'paragraph '(:line 14) "no pos"))
+                  10)))
+         (found nil))
+    (dotimes (pos (length text))
+      (let ((value (get-text-property pos 'mdview-source-pos text)))
+        (when value (push (cons pos value) found))))
+    (setq found (nreverse found))
+    ;; a container overrides the first child sharing its first character;
+    ;; both paragraphs of the stripped HTML block carry the block's offset
+    (should (equal (mapcar #'cdr found) '(0 10 15 20 30 40 50 50)))
+    (dolist (entry found)
+      (should (or (zerop (car entry)) (eq (aref text (1- (car entry))) ?\n)))
+      (should (get-text-property (car entry) 'mdview-source-line text)))))
+
+(ert-deftest mdview-render-html-strip-leaves-no-positions ()
+  (let* ((mdview-html-renderer 'strip)
+         (html (propertize (concat "<p>Hello <b>world</b> &amp; <kbd>C-x</kbd></p>"
+                                   "<h2>Head</h2><summary>More</summary>"
+                                   "<img src=\"a.png\" alt=\"pic\"><br>")
+                           'mdview-pos 0))
+         (node (mdview-node 'html-block '(:line 1 :pos 0) html))
+         (text (mdview-render-test--render (mdview-render-test--doc node) 30)))
+    (should (string-search "Hello world & C-x" text))
+    (should (string-search "More" text))
+    (should-not (text-property-not-all 0 (length text) 'mdview-pos nil text))
+    ;; the AST is left alone
+    (should (eq (get-text-property 5 'mdview-pos html) 0))))
+
+(ert-deftest mdview-render-image-text-carries-no-positions ()
+  (let* ((mdview-image-captions t)
+         (alt (propertize "picture" 'mdview-pos 2))
+         (text (mdview-render-test--render
+                (mdview-render-test--doc
+                 (mdview-render-test--para
+                  (mdview-node 'image (list :url "missing.png" :alt alt) alt))
+                 (mdview-render-test--para
+                  (propertize "see " 'mdview-pos 30)
+                  (mdview-node 'image (list :url "m.png" :alt alt) alt)))
+                40))
+         (see (string-search "see" text)))
+    (should (string-search "picture" text))
+    (should (equal (mdview-ast-pos-at see text) 30))
+    (should-not (text-property-not-all (+ see 4) (length text) 'mdview-pos nil text))
+    (should-not (text-property-not-all 0 see 'mdview-pos nil text))))
+
+(ert-deftest mdview-render-trim-rebases ()
+  (let ((trimmed (mdview-render--trim (propertize "  ab \n" 'mdview-pos 5))))
+    (should (equal trimmed "ab"))
+    (should (equal (mdview-ast-pos-at 0 trimmed) 7)))
+  (let ((string (propertize "ab" 'mdview-pos 1)))
+    (should (eq (mdview-render--trim string) string)))
+  (should (equal (mdview-render--trim " \t ") "")))
+
 (provide 'mdview-render-test)
 ;;; mdview-render-test.el ends here

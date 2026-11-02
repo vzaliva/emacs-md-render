@@ -628,5 +628,50 @@ KEYS are passed on to `mdview-table-layout'."
   (should (= (mdview-table--longest-word "a bb\nccc d") 3))
   (should (= (mdview-table--longest-word "") 0)))
 
+;;;; Source positions
+
+(ert-deftest mdview-table-trim-keeps-positions ()
+  (let ((trimmed (mdview-table--trim (propertize "  abc \t" 'mdview-pos 10))))
+    (should (equal trimmed "abc"))
+    (should (equal (mdview-ast-pos-at 0 trimmed) 12))
+    (should (equal (mdview-ast-pos-at 2 trimmed) 14)))
+  (let ((string (propertize "abc" 'mdview-pos 1)))
+    (should (eq (mdview-table--trim string) string)))
+  (should (equal (mdview-table--trim "   ") ""))
+  (should (equal (mdview-table--trim "") "")))
+
+(ert-deftest mdview-table-split-lines-keeps-positions ()
+  (let ((lines (mdview-table--split-lines (propertize "ab\ncd\n" 'mdview-pos 4))))
+    (should (equal lines '("ab" "cd" "")))
+    (should (equal (mdview-ast-pos-at 0 (nth 0 lines)) 4))
+    (should (equal (mdview-ast-pos-at 1 (nth 1 lines)) 8))))
+
+(ert-deftest mdview-table-cell-string-keeps-positions ()
+  (let ((string (mdview-table--cell-string
+                 (mdview-node 'table-cell nil
+                              (propertize " one " 'mdview-pos 0)
+                              (mdview-node 'hard-break nil)
+                              (propertize "\ttwo" 'mdview-pos 10))
+                 #'mdview-table-test--render-cell)))
+    (should (equal string "one\ntwo"))
+    (should (equal (mdview-ast-pos-at 0 string) 1))
+    (should (equal (mdview-ast-pos-at 2 string) 3))
+    (should-not (mdview-ast-pos-at 3 string))
+    (should (equal (mdview-ast-pos-at 4 string) 11))
+    (should (equal (mdview-ast-pos-at 6 string) 13))))
+
+(ert-deftest mdview-table-aligned-cells-keep-positions ()
+  (let* ((table (mdview-table-test--table
+                 '(right center) '("Head" "Header")
+                 (list (list (propertize "  x" 'mdview-pos 5))
+                       (list (propertize " yz " 'mdview-pos 20)))))
+         (lines (mdview-table-test--layout table 20 :expand nil))
+         (body (nth 2 lines)))
+    (should (equal body (mdview-table-test--line 3 "x" " " 2 "yz" 2 9)))
+    (should (equal (mdview-ast-pos-at 3 body) 7))
+    (should (equal (mdview-ast-pos-at 7 body) 21))
+    (should (equal (mdview-ast-pos-at 8 body) 22))
+    (should-not (mdview-ast-pos-at 6 body))))
+
 (provide 'mdview-table-test)
 ;;; mdview-table-test.el ends here
