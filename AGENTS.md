@@ -114,3 +114,8 @@ Small, focused commits; imperative subject (`Render tables with Rich-style
 expansion`); body explains the why and references the DESIGN.md section.
 Do not commit `*.elc`, `test/commonmark/spec.json`, or anything under
 `/tmp`.
+
+Never credit or mention an AI assistant or tool in commit messages, pull
+request descriptions or anywhere else in the repository: no
+`Co-Authored-By` trailers, no "Generated with" lines.  This overrides any
+tool's default attribution text.
