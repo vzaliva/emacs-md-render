@@ -10,7 +10,9 @@ Emacs additionally shows images inline.
 
 It is a *viewer*, not an editor or a file browser: you keep editing in
 `markdown-mode` or `md-mode`, press one key to see the rendered document,
-and press it again to go back.  File management, bookmarks, history panes
+and press it again to go back.  The same buffer is switched in place, like
+`C-c C-v` in `md-mode`, so saving, reverting and auto-revert keep working
+on the buffer you are looking at.  File management, bookmarks, history panes
 and the other application features of Frogmouth are deliberately left to
 Emacs itself.
 
@@ -62,8 +64,10 @@ alignment), footnotes, GitHub alerts (`> [!NOTE]` and friends), the HTML
 found in real READMEs (centered blocks, `<details>`/`<summary>`, `<kbd>`,
 HTML headings and images), images (inline in graphical Emacs, local and
 asynchronous remote, placeholders in text mode), and the `mdview-mode`
-commands: toggle with position sync, links and anchors, headings and
-imenu, history, image toggling, auto-refit on resize and refresh on save.
+commands: in-place toggle with position sync, links and anchors, headings
+and imenu, history, image toggling, auto-refit on resize, re-rendering
+after a save, and following auto-revert (`global-auto-revert-mode`) in
+either state.
 The parser and renderer are fuzzed and bounded (nesting caps, linear
 time on adversarial input), so odd documents degrade instead of hanging.
 The golden renderings in `test/golden/` are compared line by line with
@@ -88,9 +92,10 @@ specification, and `AGENTS.md` for contributor conventions.
 - **Works everywhere Emacs runs**: GUI and `emacs -nw`, any terminal with a
   Unicode font (ASCII fallbacks are configurable).
 - **Plays well with your Markdown mode.**  A single command,
-  `mdview-toggle`, flips between the source buffer and the rendered view and
-  keeps your position.  Bind it in `markdown-mode`, `gfm-mode`, `md-mode` or
-  anywhere else.
+  `mdview-toggle`, flips the same buffer in place between its source and
+  its rendering and keeps your position, so saving, reverting and
+  auto-revert keep working on the buffer you look at.  Bind it in
+  `markdown-mode`, `gfm-mode`, `md-mode` or anywhere else.
 
 ## Installation
 
@@ -102,8 +107,14 @@ git:
   (package-vc-install '(mdview :url "https://github.com/vzaliva/emacs-md-render")))
 
 (use-package mdview
-  :commands (mdview mdview-file mdview-toggle)
+  :commands (mdview mdview-file mdview-toggle mdview-mode)
   :bind (:map markdown-mode-map ("C-c C-v" . mdview-toggle)))
+```
+
+To open Markdown files rendered, add (it works before mdview is loaded):
+
+```elisp
+(setq mdview-initial-view 'view)
 ```
 
 Name the package explicitly, as above.  Given only the URL,
@@ -134,31 +145,36 @@ Or let the package install the binding in all Markdown modes it knows about:
 
 | Command | What it does |
 |---|---|
-| `M-x mdview` | Render the current buffer into a `*mdview: …*` buffer and show it. |
-| `M-x mdview-file` | Render a Markdown file. |
-| `M-x mdview-toggle` | In a Markdown buffer: show the rendered view.  In a rendered view: return to the source. |
+| `M-x mdview` | Render the current buffer in place (re-renders it if it is already rendered). |
+| `M-x mdview-file` | Visit a Markdown file and show it rendered. |
+| `M-x mdview-toggle`, `M-x mdview-mode` | Switch the buffer between its source and its rendering, keeping your position; toggling twice without moving returns exactly where you were. |
 
-Keys in the rendered view (`mdview-mode`):
+Keys in the rendered buffer (`mdview-mode`):
 
 | Key | Action |
 |---|---|
-| `q` | Quit the view (back to the buffer you came from, even after following links to other documents) |
-| `g` | Re-render from the (possibly edited) source |
+| `q` | `quit-window` (the buffer stays rendered) |
+| `g` | Re-render from the source |
 | `TAB` / `S-TAB` | Next / previous link |
-| `RET`, `mouse-1`, `mouse-2` | Follow the link at point: anchors scroll to the heading, Markdown files open in the same view (with history), other local files open in Emacs, URLs in the browser; footnote references jump to their definition and back; local images open in Emacs, remote ones in the browser; an image that is itself a link follows the link |
+| `RET`, `mouse-1`, `mouse-2` | Follow the link at point: anchors scroll to the heading, Markdown files are visited and shown rendered in the same window (with history), other local files open in Emacs, URLs in the browser; footnote references jump to their definition and back; local images open in Emacs, remote ones in the browser; an image that is itself a link follows the link |
 | `n` / `p` | Next / previous heading |
 | `t` | Table of contents: pick a heading with completion (the heading at point is the default) |
-| `l` / `r` | Back / forward in the view history (when following links between files) |
+| `l` / `r` | Back / forward through the Markdown documents followed via links in this window (the history is per window) |
 | `i` | Toggle inline images |
-| `e` | Visit the source at the corresponding line |
+| `e`, `C-x C-q` | Show the source for editing (`mdview-edit`), at the corresponding line |
 | `w` | Copy the link at point: local files as the absolute file name they resolve to, URLs as written (`C-u w` always copies the raw link) |
 | `SPC` / `DEL` / `S-SPC` | Scroll down / up |
 | `<` / `>` | Beginning / end of the document |
-| `C-c C-v` | Back to the source (same as `mdview-toggle`) |
+| `C-c C-v` | Back to the source (`mdview-toggle`) |
 
-The view re-flows automatically when the window width changes
-(`mdview-auto-refit`), and re-renders when the source buffer is saved
-(`mdview-refresh-on-save`).
+The view re-flows when the window width changes (`mdview-auto-refit`).
+Saving while rendered writes the Markdown source (save hooks such as
+formatters see the source) and shows the rendering again; a revert,
+including auto-revert, re-renders the reloaded file; changing the major
+mode or killing the buffer restores the source first.  Limitations:
+indirect buffers (and buffers that have indirect clones) cannot be
+rendered in place, and while a buffer is rendered, markers held elsewhere
+(registers, the global mark ring) point into the hidden source buffer.
 
 ## Customisation
 
@@ -171,12 +187,20 @@ View and layout:
 - `mdview-margin` (default 4): left/right margin, as in Frogmouth;
   `mdview-center-content` (default `nil`) centres the content in wider
   windows.
-- `mdview-display-action` (default `pop-to-buffer-same-window`): how the
-  view buffer is shown.
 - `mdview-auto-refit` / `mdview-refit-delay` (default `t` / 0.2 s): re-flow
-  when the window width changes; `mdview-refresh-on-save` (default `t`):
-  re-render when the source buffer is saved.
-- `mdview-markdown-extensions`: file extensions that links open in `mdview`.
+  when the window width changes.
+- `mdview-initial-view` (default `edit`): `view` makes visited Markdown
+  files open rendered.  It applies to files whose major mode derives from
+  one in `mdview-markdown-modes` (default `markdown-mode`, `gfm-mode`,
+  `md-mode`, `markdown-ts-mode`) and works before mdview is loaded, via
+  the autoloads.
+- `mdview-suspended-modes`: buffer-local minor modes that are switched off
+  while the buffer is rendered and back on afterwards (default
+  `flyspell-mode`, `visual-line-mode`, `whitespace-mode`,
+  `display-line-numbers-mode`, `display-fill-column-indicator-mode`,
+  `visual-fill-column-mode`, `olivetti-mode`).
+- `mdview-markdown-extensions`: file extensions of Markdown files; links to
+  such files are visited and shown rendered.
 - `mdview-box-frame-style` (`wide` or `none`): the inset frame of the H1/H2
   boxes and tables.
 - `mdview-glyphs` / `mdview-ascii-glyphs` / `mdview-use-ascii-glyphs`: the

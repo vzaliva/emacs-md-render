@@ -11,18 +11,24 @@
 
 ;;; Commentary:
 
-;; mdview renders a Markdown buffer or file into a read-only view buffer
-;; laid out in the visual style of Frogmouth (docs/DESIGN.md).  This file
-;; is the user-facing part of the package: the commands (`mdview',
-;; `mdview-file', `mdview-toggle'), the major mode `mdview-mode' with its
-;; keymap, link following, the view history, automatic re-flow when the
-;; window width changes, re-rendering when the source is saved, and the
-;; integration with Markdown editing modes (`mdview-install-keybinding').
+;; mdview renders a Markdown buffer in place, read-only, laid out in the
+;; visual style of Frogmouth (docs/DESIGN.md).  This file is the
+;; user-facing part of the package: the minor mode `mdview-mode', which
+;; switches a buffer between its Markdown source and the rendering, the
+;; commands (`mdview', `mdview-file', `mdview-toggle'), the keymap, link
+;; following, the per-window history, automatic re-flow when the window
+;; width changes, the hooks that keep a rendered buffer correct across
+;; saving, reverting and major-mode changes, and the integration with
+;; Markdown editing modes (`mdview-install-keybinding',
+;; `mdview-initial-view').
 ;;
-;; A view buffer (named *mdview: NAME*) remembers its source: the buffer
-;; it was rendered from and/or the file.  The renderer marks the first
-;; line of every block with the text property `mdview-source-line', which
-;; the view uses to keep point in sync with the source in both directions.
+;; The rendering never edits the source text.  It is built in a hidden
+;; buffer and exchanged with the source text by `buffer-swap-text'; the
+;; source text waits in a hidden twin buffer, with its markers, overlays,
+;; text properties, undo list and modified state, until it is swapped
+;; back (docs/DESIGN.md section 10).  The renderer marks the first line
+;; of every block with the text property `mdview-source-line', which keeps
+;; point on the same block in both directions.
 ;;
 ;; Everything degrades gracefully without a display, so the package works
 ;; in `emacs -nw' and its tests run under `emacs --batch'.
@@ -52,7 +58,7 @@
 ;;;; Options
 
 (defcustom mdview-max-width 100
-  "Maximum content width of a view in columns, or nil for no limit.
+  "Maximum content width of a rendering in columns, or nil for no limit.
 The content width is the window width minus the margins, capped at this
 value (docs/DESIGN.md section 10)."
   :type '(choice (const :tag "Unlimited" nil)
@@ -60,7 +66,7 @@ value (docs/DESIGN.md section 10)."
   :group 'mdview)
 
 (defcustom mdview-margin 4
-  "Width in columns of the left and right margins of a view."
+  "Width in columns of the left and right margins of a rendering."
   :type 'integer
   :group 'mdview)
 
@@ -71,63 +77,111 @@ in the middle of the window."
   :type 'boolean
   :group 'mdview)
 
-(defcustom mdview-display-action #'pop-to-buffer-same-window
-  "Function called with the view buffer to display it.
-The default shows the view in the selected window, replacing the source,
-so that `mdview-toggle' flips between the two.  Use `pop-to-buffer' to
-show the view in another window instead."
-  :type '(choice (const :tag "Same window" pop-to-buffer-same-window)
-                 (const :tag "Other window" pop-to-buffer)
-                 (function :tag "Custom function"))
-  :group 'mdview)
-
 (defcustom mdview-auto-refit t
-  "Non-nil means re-render a view when the width of its window changes.
+  "Non-nil means re-render when the width of the buffer's window changes.
 The re-rendering happens after `mdview-refit-delay' seconds of idle time
 and only when the effective content width actually changed."
   :type 'boolean
   :group 'mdview)
 
 (defcustom mdview-refit-delay 0.2
-  "Idle time in seconds before a view is re-rendered after a resize."
+  "Idle time in seconds before a rendering is redone after a resize."
   :type 'number
-  :group 'mdview)
-
-(defcustom mdview-refresh-on-save t
-  "Non-nil means re-render the views of a source buffer when it is saved."
-  :type 'boolean
   :group 'mdview)
 
 (defcustom mdview-markdown-extensions '("md" "markdown" "mdown" "mkd" "mkdn")
   "File name extensions (lower case, without the dot) of Markdown files.
-Links to such files are rendered inside the view; links to other local
+Links to such files are visited and shown rendered; links to other local
 files are visited with `find-file-other-window'."
   :type '(repeat string)
   :group 'mdview)
 
-;;;; Buffer-local state of a view
+;;;###autoload
+(defcustom mdview-initial-view 'edit
+  "How a Markdown file is shown when it is visited.
+`edit' shows the Markdown source, as Emacs always does; `view' turns on
+`mdview-mode' so that the file opens rendered (\\[mdview-toggle] or `e'
+switches to the source).  A file counts as Markdown when its major mode
+derives from one of `mdview-markdown-modes'."
+  :type '(choice (const :tag "Markdown source (edit)" edit)
+                 (const :tag "Rendered (view)" view))
+  :group 'mdview)
 
-(defvar-local mdview--source-buffer nil
-  "The buffer this view was rendered from, or nil.")
+(defcustom mdview-markdown-modes '(markdown-mode gfm-mode md-mode markdown-ts-mode)
+  "Major modes whose files `mdview-initial-view' applies to.
+Modes derived from these count as well."
+  :type '(repeat symbol)
+  :group 'mdview)
 
-(defvar-local mdview--source-file nil
-  "The absolute file name of this view's source, or nil.")
+(defcustom mdview-suspended-modes
+  '(flyspell-mode visual-line-mode whitespace-mode display-line-numbers-mode
+    display-fill-column-indicator-mode visual-fill-column-mode olivetti-mode)
+  "Buffer-local minor modes that are switched off while a buffer is rendered.
+These modes act on the text of the buffer or on its windows in ways
+that make no sense for the rendering (spell-checking it, numbering its
+lines, wrapping lines the renderer already laid out, setting margins of
+their own).  A mode
+in this list that is on when `mdview-mode' renders the buffer is turned
+off, and turned on again when the buffer returns to its source.  Modes
+that are not loaded are ignored.  Do not list global minor modes."
+  :type '(repeat symbol)
+  :group 'mdview)
+
+;;;; Buffer-local state
+
+(defvar-local mdview--rendered nil
+  "Non-nil when the text of this buffer is currently its rendering.
+`mdview-mode' follows this flag; the internal functions test this one,
+which is only ever set together with an actual swap of the text.")
+
+(defvar-local mdview--twin nil
+  "The hidden buffer holding this buffer's other text, or nil.
+While the buffer is rendered the twin holds the Markdown source; while
+it shows the source the twin may hold the last rendering, which is
+reused when nothing changed (see `mdview--twin-key').")
+
+(defvar-local mdview--owner nil
+  "In a hidden twin or render buffer: the buffer it works for.")
+
+(defvar-local mdview--source-key nil
+  "A value identifying the source text as it was after the last swap.
+See `mdview--current-source-key'.  The parsed document and a rendering
+held by the twin are valid while the key of the source still matches.")
+
+(defvar-local mdview--twin-key nil
+  "The (WIDTH IMAGES) of the rendering held by the twin, or nil.
+Only meaningful while the buffer shows its source; nil when the twin
+holds no usable rendering.")
+
+(defvar-local mdview--document nil
+  "The parsed source of this buffer, or nil.
+It is valid while `mdview--source-key' matches the source text (always,
+while the buffer is rendered: nothing can change the source then).")
 
 (defvar-local mdview--base-dir nil
   "The directory against which relative links and images resolve.")
 
 (defvar-local mdview--last-width nil
-  "The content width used by the last rendering of this view.")
+  "The content width used by the current rendering.")
 
-(defvar-local mdview--history nil
-  "The documents shown in this view: a list of (FILE-OR-BUFFER . POINT).
-The oldest entry comes first; `mdview--history-index' is the current one.")
+(defvar-local mdview--images-enabled 'unset
+  "Non-nil means this buffer's rendering displays images.
+The value `unset' means `mdview-display-images' has not been consulted
+yet.  See `mdview-toggle-images'.")
+(put 'mdview--images-enabled 'permanent-local t)
 
-(defvar-local mdview--history-index -1
-  "Index into `mdview--history' of the document currently shown.")
+(defvar-local mdview--saved nil
+  "Settings replaced while the buffer is rendered: (VAR LOCAL-P VALUE)...")
 
-(defvar-local mdview--images-enabled nil
-  "Non-nil means this view displays images (see `mdview-toggle-images').")
+(defvar-local mdview--suspended nil
+  "The minor modes of `mdview-suspended-modes' that rendering switched off.")
+
+(defvar-local mdview--memory nil
+  "Where the last swap put point and the windows, and where they were.
+A list of (WINDOW SET-POINT OLD-POINT OLD-START); WINDOW nil stands for
+the buffer's own point.  When the next swap brings back the text that
+the last one put away and a window's point is still SET-POINT, that
+window gets OLD-POINT and OLD-START back exactly.")
 
 (defvar-local mdview--refit-timer nil
   "The idle timer scheduled by `mdview--window-size-changed', or nil.")
@@ -135,27 +189,36 @@ The oldest entry comes first; `mdview--history-index' is the current one.")
 (defvar-local mdview--image-update-timer nil
   "The idle timer scheduled by `mdview--on-images-updated', or nil.")
 
-(defvar-local mdview--source-window nil
-  "The window in which this view replaced its source buffer, or nil.
-`mdview-quit' switches that window back to `mdview--origin-buffer'.")
+(defvar-local mdview--resume-after-save nil
+  "Non-nil while a save of the rendered buffer has put its source back.")
 
-(defvar-local mdview--origin-buffer nil
-  "The buffer this view replaced in `mdview--source-window', or nil.
-It is the buffer the view was opened from and stays the same when links
-to other documents are followed, so that `mdview-quit' returns there.")
+(defvar-local mdview--narrowing nil
+  "The source's restriction as (START . END) markers during a save, or nil.")
 
-(defvar-local mdview--document nil
-  "The parsed source of this view as (KEY . DOCUMENT), or nil.
-KEY identifies the source text (see `mdview--source-key'); while it still
-matches, re-rendering for a new width or image setting reuses DOCUMENT
-instead of parsing again.")
+(defvar-local mdview--resume-after-revert nil
+  "Non-nil while a revert of the rendered buffer has put its source back.
+Permanent, because a revert may change the major mode in between.")
+(put 'mdview--resume-after-revert 'permanent-local t)
 
 (defvar mdview--render-gc-threshold (* 64 1024 1024)
-  "Value `gc-cons-threshold' is raised to while a view is rendered.
+  "Value `gc-cons-threshold' is raised to while a document is rendered.
 The renderer allocates many short-lived strings and lists; with the
 default threshold a large document triggers hundreds of collections,
-each re-marking the intervals of every open view, and the collections
-dominate the rendering time.")
+each re-marking the intervals of every open rendering, and the
+collections dominate the rendering time.")
+
+(defconst mdview--overridden-settings
+  '(buffer-read-only truncate-lines word-wrap
+    left-margin-width right-margin-width
+    fontification-functions jit-lock-mode jit-lock-functions
+    jit-lock-context-unfontify-pos
+    font-lock-fontify-region-function font-lock-unfontify-region-function
+    syntax-propertize-function
+    imenu-create-index-function imenu--index-alist
+    buffer-auto-save-file-name mark-ring
+    window-configuration-change-hook)
+  "Buffer settings that a rendering replaces and leaving it restores.
+See `mdview--apply-view-settings' for the values used while rendered.")
 
 ;;;; Keymap and mode
 
@@ -175,7 +238,7 @@ dominate the rendering time.")
     (define-key map (kbd "l") #'mdview-history-back)
     (define-key map (kbd "r") #'mdview-history-forward)
     (define-key map (kbd "i") #'mdview-toggle-images)
-    (define-key map (kbd "e") #'mdview-visit-source)
+    (define-key map (kbd "e") #'mdview-edit)
     (define-key map (kbd "w") #'mdview-copy-link)
     (define-key map (kbd "SPC") #'scroll-up-command)
     (define-key map (kbd "DEL") #'scroll-down-command)
@@ -183,36 +246,39 @@ dominate the rendering time.")
     (define-key map (kbd "<") #'beginning-of-buffer)
     (define-key map (kbd ">") #'end-of-buffer)
     (define-key map (kbd "C-c C-v") #'mdview-toggle)
+    (define-key map [remap read-only-mode] #'mdview-edit)
     map)
-  "Keymap of `mdview-mode'.")
+  "Keymap of `mdview-mode', active while a buffer is rendered.")
 
 ;;;###autoload
-(define-derived-mode mdview-mode special-mode "mdview"
-  "Major mode for viewing Markdown rendered by mdview.
-The buffer is read-only; lines are never wrapped (the renderer lays the
-text out at render time).  Headings are indexed for `imenu'.
+(define-minor-mode mdview-mode
+  "Show the Markdown in the current buffer rendered, in place.
+When enabled, the text of the buffer is replaced by its rendering in
+the style of Frogmouth, read-only; when disabled, the Markdown source
+comes back exactly as it was (point, mark, markers, overlays, undo
+history and fontification included) at the line of the block that
+point was on.  The buffer keeps its major mode, file and name, so
+saving, reverting and auto-revert keep working: a save writes the
+source, and a revert renders the reloaded text.
+
+The source is never edited by the rendering: it is kept in a hidden
+buffer while the buffer is rendered (see docs/DESIGN.md section 10).
+Indirect buffers, and buffers that have indirect buffers, cannot be
+rendered in place.
 
 \\{mdview-mode-map}"
+  :lighter " mdview"
+  :keymap mdview-mode-map
   :group 'mdview
-  (setq truncate-lines t)
-  (setq buffer-read-only t)
-  ;; The view is rewritten wholesale on every render; undo records of
-  ;; that are useless in a read-only buffer and would retain the whole
-  ;; previous rendering.
-  (buffer-disable-undo)
-  (setq-local imenu-create-index-function #'mdview--imenu-create-index)
-  (setq-local revert-buffer-function #'mdview--revert-buffer)
-  (setq left-margin-width mdview-margin
-        right-margin-width mdview-margin)
-  (setq mdview--images-enabled mdview-display-images)
-  (mdview-faces-remap)
-  (add-hook 'kill-buffer-hook #'mdview--on-kill nil t)
-  (add-hook 'window-size-change-functions #'mdview--window-size-changed nil t)
-  ;; Refresh-on-save is a global hook filtered by source buffer, so that a
-  ;; mode change in the source (`kill-all-local-variables') cannot lose it.
-  (add-hook 'after-save-hook #'mdview--after-save)
-  ;; Remote images that arrive after the rendering re-flow the view.
-  (add-hook 'mdview-image-update-functions #'mdview--on-images-updated))
+  (if mdview-mode
+      (unless mdview--rendered
+        (condition-case err
+            (mdview--enter)
+          (error
+           (setq mdview-mode nil)
+           (signal (car err) (cdr err)))))
+    (when mdview--rendered
+      (mdview--leave))))
 
 ;;;; Width and margins
 
@@ -230,17 +296,25 @@ text out at render time).  Headings are indexed for `imenu'.
       (selected-window)))
 
 (defun mdview--content-width (&optional window)
-  "Return the content width for the view in WINDOW (default: its window).
-This is the window width minus the margins and one column, limited by
+  "Return the content width for a rendering in WINDOW.
+WINDOW defaults to a window showing the current buffer.  This is the
+window width minus the margins and one column, limited by
 `mdview-max-width', and never less than 20 (docs/DESIGN.md section 10)."
   (let* ((columns (mdview--window-columns (or window (mdview--view-window))))
          (available (- columns (* 2 mdview-margin) 1)))
     (max 20 (if mdview-max-width (min available mdview-max-width) available))))
 
+(defun mdview--set-window-margins ()
+  "Give every window showing the current buffer the buffer's margins.
+`set-window-margins' is used rather than `set-window-buffer', which
+would also reset the window's start and point."
+  (dolist (window (get-buffer-window-list (current-buffer) nil t))
+    (set-window-margins window left-margin-width right-margin-width)))
+
 (defun mdview--apply-margins (width)
-  "Set the display margins of the view for content WIDTH and update windows.
+  "Set the display margins of the rendering for content WIDTH.
 With `mdview-center-content', the left margin absorbs the space left over
-by `mdview-max-width'."
+by `mdview-max-width'.  The windows showing the buffer are updated."
   (let* ((windows (get-buffer-window-list (current-buffer) nil t))
          (columns (mdview--window-columns (or (car windows) (selected-window))))
          (extra (if mdview-center-content
@@ -248,56 +322,103 @@ by `mdview-max-width'."
                   0)))
     (setq left-margin-width (+ mdview-margin (/ extra 2))
           right-margin-width mdview-margin)
-    ;; Margins take effect when the window is (re)assigned its buffer,
-    ;; which also resets the window's start; only do it when they changed.
-    (dolist (window windows)
-      (let ((margins (window-margins window)))
-        (unless (and (eql (or (car margins) 0) left-margin-width)
-                     (eql (or (cdr margins) 0) right-margin-width))
-          (set-window-buffer window (current-buffer)))))))
+    (mdview--set-window-margins)))
 
-;;;; Source access and the rendering pipeline
+;;;; The source text and the rendering pipeline
+
+(defun mdview--source-holder ()
+  "Return the buffer whose text is the Markdown source of this buffer."
+  (if mdview--rendered mdview--twin (current-buffer)))
+
+(defun mdview--current-source-key ()
+  "Return a value identifying the source text as it is now.
+It combines `buffer-chars-modified-tick' with the accessible portion of
+the buffer holding the source.  Each swap of the text changes the tick,
+so the key is recorded right after every swap."
+  (with-current-buffer (mdview--source-holder)
+    (list (buffer-chars-modified-tick) (point-min) (point-max))))
+
+(defun mdview--source-unchanged-p ()
+  "Return non-nil when the source text is as it was after the last swap."
+  (or mdview--rendered
+      (equal (mdview--current-source-key) mdview--source-key)))
 
 (defun mdview--source-text ()
-  "Return the Markdown text of this view's source as a string.
-The live source buffer wins; otherwise the source file is read."
-  (let ((buffer mdview--source-buffer)
-        (file mdview--source-file))
-    (cond ((buffer-live-p buffer)
-           (with-current-buffer buffer
-             (buffer-substring-no-properties (point-min) (point-max))))
-          ((and file (file-readable-p file))
-           (with-temp-buffer
-             (insert-file-contents file)
-             (buffer-string)))
-          (t (user-error "The source of this view no longer exists")))))
+  "Return the accessible portion of the Markdown source as a string."
+  (with-current-buffer (mdview--source-holder)
+    (buffer-substring-no-properties (point-min) (point-max))))
 
-(defun mdview--source-key ()
-  "Return a value identifying the current text of this view's source.
-A live source buffer is identified by its `buffer-chars-modified-tick',
-a file by its modification time and size.  Return nil when there is no
-readable source."
-  (let ((buffer mdview--source-buffer)
-        (file mdview--source-file))
-    (cond ((buffer-live-p buffer)
-           (list buffer (buffer-chars-modified-tick buffer)))
-          ((and file (file-readable-p file))
-           (let ((attributes (file-attributes file)))
-             (list file
-                   (file-attribute-modification-time attributes)
-                   (file-attribute-size attributes)))))))
+(defun mdview--source-document (&optional force)
+  "Return the parsed document of the source, parsing when needed.
+The document is cached in `mdview--document' and reused while the source
+text is unchanged, so re-rendering for a new width or image setting
+skips the parser.  FORCE non-nil parses again regardless."
+  (if (and (not force) mdview--document (mdview--source-unchanged-p))
+      mdview--document
+    (setq mdview--document (mdview-parse-string (mdview--source-text)))))
 
-(defun mdview--source-document ()
-  "Return the parsed document of this view's source, parsing when needed.
-The result is cached in `mdview--document' together with the key of the
-source text (`mdview--source-key'), so re-rendering an unchanged source
-for a new width or image setting skips the parser."
-  (let ((key (mdview--source-key)))
-    (if (and key mdview--document (equal key (car mdview--document)))
-        (cdr mdview--document)
-      (let ((document (mdview-parse-string (mdview--source-text))))
-        (setq mdview--document (and key (cons key document)))
-        document))))
+(defun mdview--compute-base-dir ()
+  "Return the directory relative links and images of this buffer resolve in."
+  (let ((file (buffer-file-name (or (buffer-base-buffer) (current-buffer)))))
+    (if file
+        (file-name-directory (expand-file-name file))
+      (expand-file-name default-directory))))
+
+(defun mdview--kill-hidden (buffer &optional kill-fetches)
+  "Kill the hidden BUFFER, forgetting the remote images it waits for.
+KILL-FETCHES non-nil also aborts retrievals nobody else waits for."
+  (when (buffer-live-p buffer)
+    (mdview-image-cancel-pending buffer kill-fetches)
+    (kill-buffer buffer)))
+
+(defun mdview--render-to-buffer (document width images base-dir)
+  "Render DOCUMENT into a new hidden buffer and return the buffer.
+WIDTH is the content width, IMAGES non-nil displays images and BASE-DIR
+resolves relative image paths.  The new buffer belongs to the current
+buffer (`mdview--owner'), has undo disabled and its text is marked as
+fontified, so that jit-lock never touches it.  Garbage collection is
+made less eager meanwhile (`mdview--render-gc-threshold').  On any
+non-local exit, including `while-no-input' giving up, the buffer is
+killed and nothing else has changed."
+  (let ((owner (current-buffer))
+        (buffer (generate-new-buffer " *mdview-render*"))
+        (done nil))
+    (unwind-protect
+        (with-current-buffer buffer
+          (buffer-disable-undo)
+          (setq mdview--owner owner
+                default-directory base-dir)
+          (add-hook 'kill-buffer-query-functions #'mdview--twin-kill-query nil t)
+          (let ((gc-cons-threshold (max gc-cons-threshold mdview--render-gc-threshold))
+                (gc-cons-percentage (max gc-cons-percentage 0.5))
+                (mdview-display-images images))
+            (mdview-render-document document :width width :base-dir base-dir))
+          ;; The renderer remaps the derived faces in the buffer it
+          ;; renders into; the buffer that displays the text does that.
+          (mdview-faces-unremap)
+          (put-text-property (point-min) (point-max) 'fontified t)
+          (goto-char (point-min))
+          (set-buffer-modified-p nil)
+          (setq done t)
+          buffer)
+      (unless done
+        (let ((inhibit-quit t)
+              (throw-on-input nil))
+          (mdview--kill-hidden buffer))))))
+
+(defun mdview-render-string (string &optional width base-dir)
+  "Render the Markdown STRING and return the result as a propertized string.
+WIDTH is the content width in columns (default: `mdview-max-width' or
+80); BASE-DIR resolves relative image paths (default: `default-directory')."
+  (let ((base-dir (or base-dir default-directory)))
+    (with-temp-buffer
+      (setq default-directory base-dir)
+      (mdview-render-document (mdview-parse-string string)
+                              :width (or width mdview-max-width 80)
+                              :base-dir base-dir)
+      (buffer-string))))
+
+;;;; Mapping positions between the source and the rendering
 
 (defun mdview--block-at (&optional pos)
   "Return (LINE . START) for the block at or before POS (default: point).
@@ -317,7 +438,7 @@ property, or nil when there is none."
   (car (mdview--block-at pos)))
 
 (defun mdview--block-starts ()
-  "Return the blocks of the view as a list of (SOURCE-LINE . POSITION)."
+  "Return the blocks of the rendering as a list of (SOURCE-LINE . POSITION)."
   (let ((pos (point-min))
         (result nil))
     (while pos
@@ -344,15 +465,91 @@ without any block, `point-min'."
 When every block starts before LINE, move to the last block."
   (goto-char (mdview--source-line-position line)))
 
+(defun mdview--line-of (pos)
+  "Return the source line that POS in the current text stands for.
+In the source that is the line of POS (counted in the accessible
+portion); in the rendering, the line of the block at or before POS."
+  (if mdview--rendered
+      (or (mdview--source-line-at pos) 1)
+    (line-number-at-pos pos)))
+
+(defun mdview--position-of (line)
+  "Return the position in the current text that stands for source LINE."
+  (if mdview--rendered
+      (mdview--source-line-position line)
+    (save-excursion
+      (goto-char (point-min))
+      (forward-line (1- line))
+      (point))))
+
+(defun mdview--window-row (window)
+  "Return the screen row of WINDOW's point, counted from its start."
+  (let ((start (window-start window))
+        (point (window-point window)))
+    (if (< point start)
+        0
+      (min (max 0 (1- (window-body-height window)))
+           (save-excursion
+             (goto-char point)
+             (count-screen-lines start (line-beginning-position) nil window))))))
+
+(defun mdview--capture ()
+  "Record point and the windows showing the buffer before a swap.
+Return a list of (WINDOW POINT START ROW LINE): POINT, START and ROW are
+the window's point, start and the screen row of point, LINE the source
+line point stands for.  The first element has WINDOW nil and describes
+the buffer's own point."
+  (cons (list nil (point) nil 0 (mdview--line-of (point)))
+        (mapcar (lambda (window)
+                  (let ((point (window-point window)))
+                    (list window point (window-start window)
+                          (mdview--window-row window)
+                          (mdview--line-of point))))
+                (get-buffer-window-list (current-buffer) nil t))))
+
+(defun mdview--start-for (pos row window)
+  "Return the window start that puts POS on screen ROW of WINDOW."
+  (save-excursion
+    (goto-char pos)
+    ;; Not `with-selected-window': selecting a window loads and stores
+    ;; window points, which would undo the `set-window-point' just done.
+    (vertical-motion (- row) window)
+    (point)))
+
+(defun mdview--apply-capture (capture memory)
+  "Put point and the windows on the text swapped in, after CAPTURE.
+CAPTURE comes from `mdview--capture' before the swap.  MEMORY is the
+`mdview--memory' of the previous swap when the text now current is the
+text that swap put away, else nil: a window whose point did not move
+since then gets its old point and start back exactly.  Other windows get
+the position standing for the same source line, at the same screen row.
+Return the new memory."
+  (let ((new nil))
+    (pcase-dolist (`(,window ,point ,start ,row ,line) capture)
+      (let* ((remembered (assq window memory))
+             (exact (and remembered (eql (nth 1 remembered) point)))
+             (target (min (point-max)
+                          (if exact (nth 2 remembered) (mdview--position-of line)))))
+        (push (list window target point start) new)
+        (cond ((null window) (goto-char target))
+              ((and (window-live-p window) (eq (window-buffer window) (current-buffer)))
+               (set-window-point window target)
+               (set-window-start window
+                                 (if (and exact (nth 3 remembered))
+                                     (min (point-max) (nth 3 remembered))
+                                   (mdview--start-for target row window))
+                                 t)))))
+    (nreverse new)))
+
 (defun mdview--view-point ()
-  "Return point as seen in the window showing the view, else `point'."
+  "Return point as seen in the window showing the buffer, else `point'."
   (let ((window (get-buffer-window (current-buffer) t)))
     (if (and window (not (eq window (selected-window))))
         (window-point window)
       (point))))
 
 (defun mdview--window-starts (buffer)
-  "Return the scroll positions of the windows showing BUFFER.
+  "Return the scroll positions of the windows showing the rendered BUFFER.
 Each element is (WINDOW LINE OFFSET): the source line of the block at
 the top of WINDOW and the number of lines between that block's first
 line and the window start.  Windows above the first block are omitted."
@@ -380,211 +577,436 @@ still scroll to keep point visible."
         (forward-line offset)
         (set-window-start window (point) t)))))
 
-(defun mdview--render-into (buffer &optional line)
-  "Render the source of the view BUFFER into it and restore the position.
+;;;; Entering and leaving the rendering
+
+(defun mdview--ignore-fontification (&rest _)
+  "Do nothing; the font-lock functions of a rendered buffer."
+  nil)
+
+(defun mdview--check-swappable ()
+  "Signal a `user-error' unless the current buffer can be rendered in place."
+  (when mdview--owner
+    (user-error "This is an internal mdview buffer"))
+  (when (or (buffer-base-buffer)
+            (seq-some (lambda (buffer) (eq (buffer-base-buffer buffer) (current-buffer)))
+                      (buffer-list)))
+    (user-error "Cannot render an indirect buffer, or one with indirect buffers, in place")))
+
+(defun mdview--suspend-modes ()
+  "Switch off the modes of `mdview-suspended-modes' that are on."
+  (setq mdview--suspended nil)
+  (dolist (mode mdview-suspended-modes)
+    (when (and (boundp mode) (symbol-value mode) (fboundp mode))
+      (condition-case err
+          (progn (funcall mode -1)
+                 (push mode mdview--suspended))
+        (error (message "mdview: cannot switch off %s: %s"
+                        mode (error-message-string err)))))))
+
+(defun mdview--resume-modes ()
+  "Switch the modes suspended by `mdview--suspend-modes' on again."
+  (dolist (mode mdview--suspended)
+    (condition-case err
+        (funcall mode 1)
+      (error (message "mdview: cannot switch %s back on: %s"
+                      mode (error-message-string err)))))
+  (setq mdview--suspended nil))
+
+(defun mdview--save-settings ()
+  "Remember the settings in `mdview--overridden-settings'.
+Each entry of `mdview--saved' is (VAR LOCAL-P VALUE); the value set for
+the rendering is appended by `mdview--note-view-settings'."
+  (setq mdview--saved
+        (mapcar (lambda (var)
+                  (list var (local-variable-p var)
+                        (and (boundp var) (symbol-value var))))
+                mdview--overridden-settings)))
+
+(defun mdview--note-view-settings (&optional vars)
+  "Record in `mdview--saved' the values the rendering set.
+With VARS, record only those (after a re-rendering changed them)."
+  (setq mdview--saved
+        (mapcar (lambda (entry)
+                  (let ((var (car entry)))
+                    (if (or (null vars) (memq var vars))
+                        (append (seq-take entry 3)
+                                (list (and (boundp var) (symbol-value var))))
+                      entry)))
+                mdview--saved)))
+
+(defun mdview--restore-settings ()
+  "Restore the settings remembered by `mdview--save-settings'.
+A setting that something else changed while the buffer was rendered
+keeps its new value: `write-file', for instance, computes a new
+`buffer-auto-save-file-name', which must not be replaced by the old one."
+  (pcase-dolist (`(,var ,local ,value ,set) mdview--saved)
+    (when (equal (and (boundp var) (symbol-value var)) set)
+      (if local
+          (set (make-local-variable var) value)
+        (kill-local-variable var))))
+  (setq mdview--saved nil)
+  (mdview--set-window-margins))
+
+(defun mdview--install-hooks ()
+  "Install the buffer-local hooks that look after a rendered buffer.
+They stay when the buffer goes back to its source (they do nothing
+then), and are removed with the other local variables when the major
+mode changes.  The global `mdview-image-update-functions' entry
+ignores buffers that are not rendered."
+  (add-hook 'before-save-hook #'mdview--before-save -100 t)
+  (add-hook 'write-contents-functions #'mdview--refuse-to-write-rendering nil t)
+  (add-hook 'after-save-hook #'mdview--after-save 100 t)
+  (add-hook 'before-revert-hook #'mdview--before-revert -100 t)
+  (add-hook 'after-revert-hook #'mdview--after-revert 100 t)
+  (add-hook 'change-major-mode-hook #'mdview--on-change-major-mode nil t)
+  (add-hook 'kill-buffer-hook #'mdview--on-kill -100 t)
+  ;; Remote images that arrive after the rendering re-flow it.
+  (add-hook 'mdview-image-update-functions #'mdview--on-images-updated)
+  (add-hook 'kill-emacs-hook #'mdview--on-kill-emacs -100)
+  (add-hook 'clone-indirect-buffer-hook #'mdview--on-clone))
+
+(defun mdview--apply-view-settings (width)
+  "Set up the rendered buffer for content WIDTH; see `mdview--enter'."
+  (setq buffer-read-only t
+        truncate-lines t
+        word-wrap nil
+        buffer-auto-save-file-name nil)
+  ;; The source keeps its fontification in the twin; nothing may
+  ;; fontify, or strip the faces of, the rendering.
+  (setq-local fontification-functions nil)
+  (setq-local jit-lock-mode nil)
+  (setq-local jit-lock-functions nil)
+  (setq-local jit-lock-context-unfontify-pos nil)
+  (setq-local font-lock-fontify-region-function #'mdview--ignore-fontification)
+  (setq-local font-lock-unfontify-region-function #'mdview--ignore-fontification)
+  (setq-local syntax-propertize-function nil)
+  (setq-local imenu-create-index-function #'mdview--imenu-create-index)
+  (setq-local imenu--index-alist nil)
+  (setq-local mark-ring nil)
+  (setq-local window-configuration-change-hook '(t))
+  (mdview--apply-margins width)
+  (mdview-faces-remap)
+  (add-hook 'window-size-change-functions #'mdview--window-size-changed nil t)
+  (add-hook 'window-buffer-change-functions #'mdview--window-size-changed nil t))
+
+(defun mdview--swap (other)
+  "Exchange the text of the current buffer with that of OTHER.
+The modified flag belongs to the text, and `buffer-swap-text' also
+counts the exchange as a modification, so the current buffer is given
+back the modified state it reported before; the mode line, `kill-buffer',
+`save-some-buffers' and the staleness check of auto-revert therefore
+keep seeing the state of the source.  The variable `buffer-file-name' is unbound
+meanwhile so that setting the flag takes no file lock and asks no
+question.  OTHER is left unmodified."
+  (unless (buffer-live-p other)
+    (error "The source text of this buffer was lost (its hidden buffer was killed)"))
+  (let ((modified (buffer-modified-p)))
+    (buffer-swap-text other)
+    (let ((buffer-file-name nil)
+          (buffer-file-truename nil))
+      (restore-buffer-modified-p modified))
+    (with-current-buffer other
+      (restore-buffer-modified-p nil))))
+
+(defun mdview--enter ()
+  "Replace the text of the current buffer by its rendering.
+The rendering is built in a new hidden buffer first, so an error leaves
+the buffer as it was.  When the twin still holds a rendering of the
+unchanged source at the current width it is swapped in without
+rendering.  Afterwards the source text lives in the twin, the buffer is
+read-only, fontification, syntax propertization and auto-saving are
+off, the modes of `mdview-suspended-modes' are suspended, and every
+window shows the block of the source line it showed before, at the same
+screen row (see `mdview--apply-capture')."
+  (mdview--check-swappable)
+  (let* ((source (current-buffer))
+         (width (mdview--content-width))
+         (images (if (eq mdview--images-enabled 'unset)
+                     mdview-display-images
+                   mdview--images-enabled))
+         (base-dir (mdview--compute-base-dir))
+         (reuse (and (buffer-live-p mdview--twin)
+                     mdview--twin-key
+                     (equal mdview--twin-key (list width images))
+                     (mdview--source-unchanged-p)))
+         (capture (mdview--capture))
+         (fresh (unless reuse
+                  (mdview--render-to-buffer (mdview--source-document)
+                                            width images base-dir)))
+         ;; From here on nothing may interrupt: the texts get exchanged.
+         (throw-on-input nil)
+         (inhibit-quit t))
+    (setq mdview--images-enabled images
+          mdview--base-dir base-dir)
+    (mdview--suspend-modes)
+    (mdview--save-settings)
+    (let ((old mdview--twin))
+      (mdview--swap (or fresh old))
+      (when fresh
+        (setq mdview--twin fresh)
+        (with-current-buffer fresh
+          (setq mdview--owner source)
+          (rename-buffer (format " *mdview: %s*" (buffer-name source)) t))
+        (unless (eq old fresh)
+          (mdview--kill-hidden old))))
+    (setq mdview--rendered t
+          mdview--source-key (mdview--current-source-key)
+          mdview--twin-key nil
+          mdview--last-width width)
+    (setq mdview-mode t)
+    (condition-case err
+        (progn
+          (syntax-ppss-flush-cache (point-min))
+          (mdview--install-hooks)
+          (mdview--apply-view-settings width)
+          (mdview--note-view-settings)
+          (setq mdview--memory
+                (mdview--apply-capture capture (and reuse mdview--memory))))
+      (error
+       ;; Never leave the rendering in place half set up: put the source
+       ;; back before reporting the error.
+       (ignore-errors
+         ;; Whatever was set so far counts as the rendering's value, so
+         ;; that leaving restores all of it.
+         (mdview--note-view-settings)
+         (mdview--leave))
+       (signal (car err) (cdr err))))))
+
+(defun mdview--leave (&optional dying)
+  "Put the source text of the current buffer back in place of the rendering.
+Everything `mdview--enter' changed is restored, and every window shows
+the line of the block it showed, at the same screen row; a window that
+did not move since the rendering was shown gets its exact old point and
+start back.  The rendering stays in the twin for reuse.  With DYING
+non-nil (the buffer is being killed or changes major mode) the
+suspended modes are not switched back on."
+  (mdview--check-leavable)
+  (let ((capture (mdview--capture))
+        (throw-on-input nil)
+        (inhibit-quit t))
+    (mdview--cancel-refit)
+    (mdview--cancel-image-update)
+    (remove-hook 'window-size-change-functions #'mdview--window-size-changed t)
+    (remove-hook 'window-buffer-change-functions #'mdview--window-size-changed t)
+    (mdview-faces-unremap)
+    (mdview--restore-settings)
+    (mdview--swap mdview--twin)
+    (setq mdview--rendered nil
+          mdview--source-key (mdview--current-source-key)
+          mdview--twin-key (list mdview--last-width mdview--images-enabled))
+    (setq mdview-mode nil)
+    (syntax-ppss-flush-cache (point-min))
+    (setq mdview--memory (mdview--apply-capture capture mdview--memory))
+    (if dying
+        (setq mdview--suspended nil)
+      (mdview--resume-modes))))
+
+(defun mdview--check-leavable ()
+  "Signal an error unless the source can be swapped back now.
+Checked before anything is restored, so that a failure leaves the
+rendering fully in place rather than half undone."
+  (unless (buffer-live-p mdview--twin)
+    (error "The source text of this buffer was lost (its hidden buffer was killed)"))
+  (when (seq-some (lambda (buffer) (eq (buffer-base-buffer buffer) (current-buffer)))
+                  (buffer-list))
+    (user-error "Kill the indirect buffers of %s before showing its source"
+                (buffer-name))))
+
+(defun mdview--enter-or-report ()
+  "Render the current buffer from a hook; report an error instead of signalling."
+  (condition-case err
+      (mdview-mode 1)
+    (error (message "mdview: %s" (error-message-string err)))))
+
+;;;; Hooks: saving, reverting, changing the major mode, killing
+
+(defun mdview--before-save ()
+  "Put the source back before the buffer is saved, if it is rendered.
+Runs first in the buffer-local `before-save-hook', so that the other
+save hooks (formatters, whitespace cleanup) and the file see the
+source.  The request to render again is reset on every save, so that a
+save that failed cannot make a later one switch to the rendering."
+  (setq mdview--resume-after-save mdview--rendered
+        mdview--narrowing nil)
+  (when mdview--rendered
+    (mdview-mode -1)
+    ;; `basic-save-buffer' runs this hook inside `save-restriction' of the
+    ;; (unnarrowed) rendering, which widens the source on exit; remember
+    ;; the source's restriction so that `mdview--after-save' can redo it.
+    (when (buffer-narrowed-p)
+      (setq mdview--narrowing (cons (copy-marker (point-min))
+                                    (copy-marker (point-max) t))))))
+
+(defun mdview--refuse-to-write-rendering ()
+  "Stop a save that would write the rendering instead of the source.
+Runs from `write-contents-functions', after `before-save-hook'.
+`basic-save-buffer' demotes errors in `before-save-hook' to messages, so
+if `mdview--before-save' failed to put the source back, the save would
+otherwise go ahead with the rendering."
+  (when mdview--rendered
+    (error "Refusing to save the mdview rendering; switch to the source first"))
+  nil)
+
+(defun mdview--after-save ()
+  "Render the buffer again after a save that `mdview--before-save' began."
+  (when mdview--resume-after-save
+    (setq mdview--resume-after-save nil)
+    (when mdview--narrowing
+      (narrow-to-region (car mdview--narrowing) (cdr mdview--narrowing))
+      (set-marker (car mdview--narrowing) nil)
+      (set-marker (cdr mdview--narrowing) nil)
+      (setq mdview--narrowing nil))
+    (mdview--enter-or-report)))
+
+(defun mdview--before-revert ()
+  "Put the source back before the buffer is reverted, if it is rendered."
+  (setq mdview--resume-after-revert mdview--rendered)
+  (when mdview--rendered
+    (mdview-mode -1)))
+
+(defun mdview--after-revert ()
+  "Render the reverted text when `mdview--before-revert' asked for it.
+This is how a rendered buffer follows its file under `auto-revert-mode'
+and `global-auto-revert-mode'.  Auto-revert binds `buffer-read-only'
+around the revert and so restores the rendering's t afterwards; when
+rendering fails, the source is made writable again once that is over."
+  (when mdview--resume-after-revert
+    (setq mdview--resume-after-revert nil)
+    (mdview--enter-or-report)
+    (unless mdview--rendered
+      (let ((buffer (current-buffer)))
+        (run-at-time 0 nil #'mdview--fix-read-only buffer)))))
+
+(defun mdview--fix-read-only (buffer)
+  "Make BUFFER writable when it is back to its source and its file is writable."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (and (not mdview--rendered) buffer-read-only buffer-file-name
+                 (file-writable-p buffer-file-name))
+        (setq buffer-read-only nil)))))
+
+(defun mdview--twin-kill-query ()
+  "Refuse to kill a hidden buffer with the source of a rendered buffer in it.
+The buffer-local `kill-buffer-query-functions' of twins and render
+buffers.  Commands such as `kill-some-buffers' or `clean-buffer-list'
+would otherwise destroy the Markdown source, unsaved edits included.
+A twin holding only a rendering may go."
+  (let ((owner mdview--owner))
+    (not (and (buffer-live-p owner)
+              (eq (buffer-local-value 'mdview--twin owner) (current-buffer))
+              (buffer-local-value 'mdview--rendered owner)))))
+
+(defun mdview--on-kill-emacs ()
+  "Put the source back in every rendered buffer before Emacs exits.
+Runs early in `kill-emacs-hook', so that `save-place-mode', desktop and
+the like record positions in the source, not in the rendering."
+  (dolist (buffer (buffer-list))
+    (when (mdview--view-p buffer)
+      (with-current-buffer buffer
+        (ignore-errors (mdview--leave t))))))
+
+(defun mdview--on-clone ()
+  "Drop the mdview state that `clone-indirect-buffer' copied into a clone.
+The clone shares the text of its base buffer, which may be a rendering;
+it is not rendered by mdview itself (it has no twin of its own), and
+while it lives the base buffer cannot swap its source back (see
+`mdview--check-leavable')."
+  (when (or mdview--rendered mdview--twin)
+    (dolist (var '(mdview--rendered mdview--twin mdview--saved mdview--suspended
+                   mdview--memory mdview--refit-timer mdview--image-update-timer))
+      (kill-local-variable var))
+    (setq mdview-mode nil)
+    (dolist (entry '((before-save-hook . mdview--before-save)
+                     (after-save-hook . mdview--after-save)
+                     (write-contents-functions . mdview--refuse-to-write-rendering)
+                     (before-revert-hook . mdview--before-revert)
+                     (after-revert-hook . mdview--after-revert)
+                     (change-major-mode-hook . mdview--on-change-major-mode)
+                     (kill-buffer-hook . mdview--on-kill)
+                     (window-size-change-functions . mdview--window-size-changed)
+                     (window-buffer-change-functions . mdview--window-size-changed)))
+      (remove-hook (car entry) (cdr entry) t))))
+
+(defun mdview--kill-twin ()
+  "Kill the twin of the current buffer, if any."
+  (mdview--kill-hidden mdview--twin)
+  (setq mdview--twin nil
+        mdview--twin-key nil))
+
+(defun mdview--on-change-major-mode ()
+  "Put the source back before a change of major mode, and drop the twin."
+  (when mdview--rendered
+    (condition-case err
+        (mdview--leave t)
+      (error (message "mdview: %s" (error-message-string err)))))
+  (mdview--kill-twin))
+
+(defun mdview--on-kill ()
+  "Clean up when a buffer that was rendered is killed.
+The source is put back first, so that the other functions of
+`kill-buffer-hook' (such as `save-place-mode') see it.  A failure to
+do so is reported but never prevents the kill."
+  (when mdview--rendered
+    (condition-case err
+        (mdview--leave t)
+      (error (message "mdview: %s" (error-message-string err)))))
+  (mdview--cancel-refit)
+  (mdview--cancel-image-update)
+  (mdview-image-cancel-pending (current-buffer) t)
+  (mdview--kill-twin)
+  (setq mdview--document nil))
+
+;;;; Re-rendering: refresh, refit, images
+
+(defun mdview--view-p (buffer)
+  "Return non-nil when BUFFER is live and currently rendered."
+  (and (buffer-live-p buffer)
+       (buffer-local-value 'mdview--rendered buffer)))
+
+(defun mdview--render-into (buffer &optional line force-parse)
+  "Render the rendered BUFFER again, keeping the position.
 Point ends up at the block rendered from source line LINE (an integer),
 or, when LINE is nil, at the block that was at point before; the windows
-showing the view keep the block that was at their top.  The parsed
-document is reused when the source text did not change (see
-`mdview--source-document'), and garbage collection is made less eager
-for the duration (`mdview--render-gc-threshold')."
+showing BUFFER keep the block that was at their top.  The parsed
+document is reused unless FORCE-PARSE is non-nil.  The new rendering is
+built in a hidden buffer and swapped in, so an error, or `while-no-input'
+giving up, leaves the old rendering in place."
   (with-current-buffer buffer
-    (let* ((gc-cons-threshold (max gc-cons-threshold mdview--render-gc-threshold))
-           (gc-cons-percentage (max gc-cons-percentage 0.5))
-           (document (mdview--source-document))
+    (let* ((document (mdview--source-document force-parse))
            (line (or line (mdview--source-line-at (mdview--view-point))))
            (starts (mdview--window-starts buffer))
            (width (mdview--content-width))
-           (inhibit-read-only t)
-           (buffer-undo-list t)
-           (mdview-display-images mdview--images-enabled))
+           (fresh (mdview--render-to-buffer document width mdview--images-enabled
+                                            mdview--base-dir))
+           ;; The rendering is done; exchanging it must not be interrupted.
+           (throw-on-input nil)
+           (inhibit-quit t))
       (mdview--cancel-refit)
       (mdview--cancel-image-update)
-      (when (fboundp 'mdview-image-cancel-pending)
-        (mdview-image-cancel-pending buffer))
-      (erase-buffer)
-      (mdview-render-document document :width width :base-dir mdview--base-dir)
-      (setq mdview--last-width width)
-      (setq imenu--index-alist nil)
-      (set-buffer-modified-p nil)
+      (mdview--swap fresh)
+      ;; FRESH now holds the old rendering; forget its pending images.
+      (mdview--kill-hidden fresh)
+      (setq mdview--last-width width
+            imenu--index-alist nil
+            mdview--memory nil)
       (mdview--apply-margins width)
+      (mdview--note-view-settings '(left-margin-width right-margin-width))
       (goto-char (point-min))
       (when line (mdview--goto-source-line line))
       (dolist (window (get-buffer-window-list buffer nil t))
         (set-window-point window (point)))
       (mdview--restore-window-starts starts))))
 
-(defun mdview-render-string (string &optional width base-dir)
-  "Render the Markdown STRING and return the result as a propertized string.
-WIDTH is the content width in columns (default: `mdview-max-width' or
-80); BASE-DIR resolves relative image paths (default: `default-directory')."
-  (let ((base-dir (or base-dir default-directory)))
-    (with-temp-buffer
-      (setq default-directory base-dir)
-      (mdview-render-document (mdview-parse-string string)
-                              :width (or width mdview-max-width 80)
-                              :base-dir base-dir)
-      (buffer-string))))
-
-;;;; Views and their sources
-
-(defun mdview--buffer-name (name)
-  "Return the name of the view buffer for a source called NAME."
-  (format "*mdview: %s*" name))
-
-(defun mdview--view-p (buffer)
-  "Return non-nil when BUFFER is a live `mdview-mode' buffer."
-  (and (buffer-live-p buffer)
-       (provided-mode-derived-p (buffer-local-value 'major-mode buffer)
-                                'mdview-mode)))
-
-(defun mdview--views-of (source)
-  "Return the live views whose source buffer is SOURCE."
-  (seq-filter (lambda (buffer)
-                (and (mdview--view-p buffer)
-                     (eq (buffer-local-value 'mdview--source-buffer buffer)
-                         source)))
-              (buffer-list)))
-
-(defun mdview--view-shows-p (view buffer file)
-  "Return non-nil when VIEW's current source is BUFFER or FILE."
-  (or (and buffer
-           (eq (buffer-local-value 'mdview--source-buffer view) buffer))
-      (and file
-           (equal (buffer-local-value 'mdview--source-file view) file))))
-
-(defun mdview--view-showed-p (view buffer file)
-  "Return non-nil when BUFFER or FILE occurs in the history of VIEW."
-  (seq-some (lambda (entry)
-              (let ((source (car entry)))
-                (or (and buffer (eq source buffer))
-                    (and file (equal source file)))))
-            (buffer-local-value 'mdview--history view)))
-
-(defun mdview--find-view (buffer file)
-  "Return the live view rendered from BUFFER or from FILE, or nil.
-A view currently showing that source is preferred; failing that, a view
-that showed it earlier in its history (and then followed a link to
-another document) is returned, so that toggling from the same source
-comes back to the same view instead of creating a second one."
-  (let ((views (seq-filter #'mdview--view-p (buffer-list))))
-    (or (seq-find (lambda (view) (mdview--view-shows-p view buffer file)) views)
-        (seq-find (lambda (view) (mdview--view-showed-p view buffer file)) views))))
-
-(defun mdview--source-name (buffer file)
-  "Return the display name of a source given its BUFFER and FILE.
-The result is never empty."
-  (let ((name (cond (file (file-name-nondirectory (directory-file-name file)))
-                    ((buffer-live-p buffer) (buffer-name buffer)))))
-    (if (and name (not (string-empty-p name))) name "?")))
-
-(defun mdview--set-source (buffer file)
-  "Make BUFFER and/or FILE (either may be nil) the source of this view.
-Updates the base directory, `default-directory' and the name of the view
-buffer."
-  (setq mdview--source-buffer buffer
-        mdview--source-file (and file (expand-file-name file))
-        mdview--base-dir (cond (file (file-name-directory (expand-file-name file)))
-                               ((buffer-live-p buffer)
-                                (buffer-local-value 'default-directory buffer))
-                               (t default-directory)))
-  (setq default-directory mdview--base-dir)
-  (let ((name (mdview--buffer-name (mdview--source-name buffer file))))
-    (unless (equal (buffer-name) name)
-      (rename-buffer name t))))
-
-(defun mdview--make-view (buffer file)
-  "Return the view for source BUFFER and/or FILE, creating it if needed.
-An existing view of the same source is reused; a new one is put in
-`mdview-mode' and gets its first history entry."
-  (let ((view (or (mdview--find-view buffer file)
-                  (generate-new-buffer
-                   (mdview--buffer-name (mdview--source-name buffer file))))))
-    (with-current-buffer view
-      (unless (derived-mode-p 'mdview-mode)
-        (mdview-mode))
-      (mdview--set-source buffer file)
-      (unless (and (>= mdview--history-index 0)
-                   (equal (car (nth mdview--history-index mdview--history))
-                          (or mdview--source-file buffer)))
-        (mdview--history-push)))
-    view))
-
-(defun mdview--display (view)
-  "Show VIEW and remember where it came from.
-When VIEW is already visible in a window of the selected frame, that
-window is selected, so toggling from a source shown next to its view
-keeps both visible.  Otherwise `mdview-display-action' shows it, and
-when that replaced the buffer of the selected window, the window and
-the buffer are remembered for `mdview-quit'."
-  (let ((window (get-buffer-window view)))
-    (if window
-        (select-window window)
-      (let* ((origin (selected-window))
-             (buffer (let ((source (buffer-local-value 'mdview--source-buffer view)))
-                       (if (buffer-live-p source) source (window-buffer origin)))))
-        (funcall mdview-display-action view)
-        (with-current-buffer view
-          (let ((replaced (eq (window-buffer origin) view)))
-            (setq mdview--source-window (and replaced origin)
-                  mdview--origin-buffer (and replaced buffer))))))))
-
-(defun mdview--show (view line)
-  "Display VIEW and render it with point at source LINE; return VIEW.
-When the very first rendering of a new view fails, the view is killed
-and the windows restored before the error is signalled again, so that
-no empty view is left on display."
-  (let ((fresh (null (buffer-local-value 'mdview--last-width view)))
-        (configuration (current-window-configuration)))
-    (mdview--display view)
-    (condition-case err
-        (mdview--render-into view line)
-      (error
-       (when fresh
-         (set-window-configuration configuration)
-         (kill-buffer view))
-       (signal (car err) (cdr err))))
-    view))
-
-(defun mdview--ensure-source-buffer ()
-  "Return the live source buffer of this view, visiting the file if needed."
-  (cond ((buffer-live-p mdview--source-buffer) mdview--source-buffer)
-        ((and mdview--source-file (file-exists-p mdview--source-file))
-         (let ((buffer (find-file-noselect mdview--source-file)))
-           (mdview--set-source buffer mdview--source-file)
-           buffer))
-        (t (user-error "The source of this view no longer exists"))))
-
-;;;; Hooks: saving the source, killing the view, resizing the window
-
-(defun mdview--after-save ()
-  "Re-render the views of the buffer that was just saved, if any.
-Runs from the global `after-save-hook' (installed by `mdview-mode') and
-does nothing for buffers that are not the source of a view."
-  (when mdview-refresh-on-save
-    (dolist (view (mdview--views-of (current-buffer)))
-      (condition-case err
-          (mdview--render-into view)
-        (error (message "mdview: %s" (error-message-string err)))))))
-
-(defun mdview--on-kill ()
-  "Clean up when a view buffer is killed."
-  (mdview--cancel-refit)
-  (mdview--cancel-image-update)
-  (when (fboundp 'mdview-image-cancel-pending)
-    (mdview-image-cancel-pending (current-buffer) t))
-  (setq mdview--source-buffer nil
-        mdview--document nil))
-
 (defun mdview--cancel-refit ()
-  "Cancel the pending refit timer of this view, if any."
+  "Cancel the pending refit timer of this buffer, if any."
   (when mdview--refit-timer
     (cancel-timer mdview--refit-timer)
     (setq mdview--refit-timer nil)))
 
 (defun mdview--window-size-changed (object)
-  "Schedule a refit of the view shown in OBJECT, a window or a frame.
-Runs from the buffer-local `window-size-change-functions'."
+  "Schedule a refit of the rendering shown in OBJECT, a window or a frame.
+Runs from the buffer-local `window-size-change-functions' and
+`window-buffer-change-functions' of a rendered buffer."
   (let ((buffer (if (windowp object) (window-buffer object) (current-buffer))))
     (when (mdview--view-p buffer)
       (with-current-buffer buffer
@@ -595,7 +1017,7 @@ Runs from the buffer-local `window-size-change-functions'."
                                      #'mdview--refit buffer)))))))
 
 (defun mdview--refit (buffer &optional line)
-  "Re-render the view BUFFER if its content width changed.
+  "Render BUFFER again if its content width changed.
 Point goes to the block of source LINE, or stays on the current block
 when LINE is nil.  The rendering is abandoned as soon as the user types
 and rescheduled for the next idle period (with LINE remembered), so a
@@ -624,32 +1046,41 @@ completed."
                nil))))))))
 
 (defun mdview--cancel-image-update ()
-  "Cancel the pending image re-rendering timer of this view, if any."
+  "Cancel the pending image re-rendering timer of this buffer, if any."
   (when mdview--image-update-timer
     (cancel-timer mdview--image-update-timer)
     (setq mdview--image-update-timer nil)))
 
 (defun mdview--on-images-updated (buffer)
-  "Schedule a re-rendering of the view BUFFER after remote images arrived.
-Runs from `mdview-image-update-functions' (installed by `mdview-mode')
-and ignores buffers that are not views.  The image module replaces a
+  "Schedule a new rendering of BUFFER after remote images arrived.
+Runs from `mdview-image-update-functions'.  The image module replaces a
 placeholder in place, which keeps the width of its line but cannot
-re-wrap a paragraph around an inline image, so the view is rendered
-again from the cached document (the image bytes are cached as well)
-once Emacs has been idle for `mdview-refit-delay'; images arriving close
-together share one rendering."
-  (when (mdview--view-p buffer)
-    (with-current-buffer buffer
-      (mdview--cancel-image-update)
-      (setq mdview--image-update-timer
-            (run-with-idle-timer mdview-refit-delay nil
-                                 #'mdview--rerender-for-images buffer)))))
+re-wrap a paragraph around an inline image, so a rendered buffer is
+rendered again from the cached document (the image bytes are cached as
+well) once Emacs has been idle for `mdview-refit-delay'; images
+arriving close together share one rendering.  When BUFFER is the twin
+holding the rendering of a buffer that shows its source, the rendering
+is marked stale instead, so that the next \\[mdview-toggle] renders
+again."
+  (cond ((mdview--view-p buffer)
+         (with-current-buffer buffer
+           (mdview--cancel-image-update)
+           (setq mdview--image-update-timer
+                 (run-with-idle-timer mdview-refit-delay nil
+                                      #'mdview--rerender-for-images buffer))))
+        ((buffer-live-p buffer)
+         (let ((owner (buffer-local-value 'mdview--owner buffer)))
+           (when (and (buffer-live-p owner)
+                      (eq (buffer-local-value 'mdview--twin owner) buffer))
+             (with-current-buffer owner
+               (unless mdview--rendered
+                 (setq mdview--twin-key nil))))))))
 
 (defun mdview--rerender-for-images (buffer)
-  "Re-render the view BUFFER so that its text re-flows around its images.
-Nothing happens when images are switched off in the view.  Like a refit
-the rendering is abandoned and rescheduled when the user types, and a
-failure is reported once in the echo area."
+  "Render BUFFER again so that its text re-flows around its images.
+Nothing happens when images are switched off in the buffer.  Like a
+refit the rendering is abandoned and rescheduled when the user types,
+and a failure is reported once in the echo area."
   (when (mdview--view-p buffer)
     (with-current-buffer buffer
       (setq mdview--image-update-timer nil)
@@ -659,49 +1090,85 @@ failure is reported once in the echo area."
               (mdview--on-images-updated buffer))
           (error (message "mdview: %s" (error-message-string err))))))))
 
-(defun mdview--revert-buffer (&rest _)
-  "Re-render the view; the `revert-buffer-function' of `mdview-mode'."
-  (mdview-refresh))
-
 ;;;; History
 
-(defun mdview--history-save-point ()
-  "Record point in the current history entry."
-  (when (>= mdview--history-index 0)
-    (setcdr (nth mdview--history-index mdview--history) (point))))
+;; The history belongs to the window: following a link to another
+;; Markdown file shows that file's buffer, rendered, in the same window,
+;; and `l'/`r' go back and forth between the documents shown there.
+;; The window parameter `mdview-history' holds (INDEX . ENTRIES); each
+;; entry is a list (BUFFER FILE POINT).
 
-(defun mdview--history-push ()
-  "Add the current source to the history, dropping the forward entries."
-  (mdview--history-save-point)
-  (setq mdview--history
-        (append (seq-take mdview--history (1+ mdview--history-index))
-                (list (cons (or mdview--source-file mdview--source-buffer)
-                            (point)))))
-  (setq mdview--history-index (1- (length mdview--history))))
+(defun mdview--history-entry ()
+  "Return a history entry for the current buffer at point."
+  (list (current-buffer)
+        (buffer-file-name (or (buffer-base-buffer) (current-buffer)))
+        (point)))
+
+(defun mdview--history-current-p (entry)
+  "Return non-nil when the history ENTRY is the current buffer."
+  (or (eq (car entry) (current-buffer))
+      (and (nth 1 entry)
+           (equal (nth 1 entry) (buffer-file-name)))))
+
+(defun mdview--history (&optional window)
+  "Return the history of WINDOW (default: selected) as (INDEX . ENTRIES).
+A history whose current entry is not the buffer shown in WINDOW (the
+user switched buffers by other means) is not continued: a fresh one
+starting at the current buffer is returned instead."
+  (let* ((window (or window (selected-window)))
+         (history (window-parameter window 'mdview-history)))
+    (if (and history
+             (mdview--history-current-p (nth (car history) (cdr history))))
+        history
+      (cons 0 (list (mdview--history-entry))))))
+
+(defun mdview--history-save-point (history)
+  "Record point in the current entry of HISTORY."
+  (setf (nth 2 (nth (car history) (cdr history))) (point)))
+
+(defun mdview--history-push (history)
+  "Make the current buffer the newest entry of HISTORY, dropping forward ones.
+HISTORY is the window's history before the move; the result is stored
+in the selected window."
+  (let ((entries (append (seq-take (cdr history) (1+ (car history)))
+                         (list (mdview--history-entry)))))
+    (set-window-parameter nil 'mdview-history
+                          (cons (1- (length entries)) entries))))
+
+(defun mdview--show-rendered (buffer &optional pos)
+  "Show BUFFER rendered in the selected window, at POS or its beginning."
+  (pop-to-buffer-same-window buffer)
+  (unless mdview--rendered
+    (mdview-mode 1))
+  (goto-char (min (or pos (point-min)) (point-max)))
+  (set-window-point nil (point))
+  (set-window-start nil (line-beginning-position) t))
 
 (defun mdview--history-move (delta)
   "Show the history entry at distance DELTA from the current one."
-  (let ((index (+ mdview--history-index delta)))
-    (unless (and (>= index 0) (< index (length mdview--history)))
+  (let* ((history (mdview--history))
+         (index (+ (car history) delta))
+         (entries (cdr history)))
+    (unless (and (>= index 0) (< index (length entries)))
       (user-error (if (< delta 0)
                       "No earlier document in the history"
                     "No later document in the history")))
-    (mdview--history-save-point)
-    (let* ((entry (nth index mdview--history))
-           (source (car entry)))
-      (cond ((stringp source)
-             (mdview--set-source (find-buffer-visiting source) source))
-            ((buffer-live-p source)
-             (mdview--set-source source (buffer-file-name source)))
-            (t (user-error "The source buffer of that document was killed")))
-      (setq mdview--history-index index)
-      (mdview--render-into (current-buffer) 1)
-      (goto-char (min (cdr entry) (point-max))))))
+    (mdview--history-save-point history)
+    (let* ((entry (nth index entries))
+           (buffer (car entry))
+           (file (nth 1 entry)))
+      (unless (buffer-live-p buffer)
+        (unless (and file (file-exists-p file))
+          (user-error "That document is gone"))
+        (setq buffer (find-file-noselect file))
+        (setcar entry buffer))
+      (mdview--show-rendered buffer (nth 2 entry))
+      (set-window-parameter nil 'mdview-history (cons index entries)))))
 
 ;;;; Headings
 
 (defun mdview--headings ()
-  "Return the headings of the view as a list of (POSITION LEVEL ID TEXT).
+  "Return the headings of the rendering as a list of (POSITION LEVEL ID TEXT).
 Consecutive runs of heading text with the same id (a wrapped heading)
 are merged into one entry."
   (let ((pos (point-min))
@@ -722,7 +1189,7 @@ are merged into one entry."
     (nreverse result)))
 
 (defun mdview--imenu-create-index ()
-  "Return an imenu index of the headings in the view."
+  "Return an imenu index of the headings in the rendering."
   (let ((seen (make-hash-table :test #'equal))
         (index nil))
     (dolist (heading (mdview--headings))
@@ -758,7 +1225,7 @@ Falls back to the beginning of the line of POS."
         (line-beginning-position)))))
 
 (defun mdview--scroll-to-top (pos)
-  "Scroll the window of the view to put the block at POS at the top."
+  "Scroll the window of the rendering to put the block at POS at the top."
   (let ((window (get-buffer-window (current-buffer))))
     (when window
       (set-window-start window (mdview--block-start-near pos)))))
@@ -811,13 +1278,13 @@ When POS is inside a link, that link does not count."
     found))
 
 (defun mdview--first-link-position ()
-  "Return the start of the first link in the view, or nil."
+  "Return the start of the first link in the rendering, or nil."
   (if (get-text-property (point-min) 'mdview-link)
       (point-min)
     (mdview--next-link-position (point-min))))
 
 (defun mdview--last-link-position ()
-  "Return the start of the last link in the view, or nil."
+  "Return the start of the last link in the rendering, or nil."
   (mdview--previous-link-position (point-max)))
 
 (defun mdview--markdown-file-p (file)
@@ -847,7 +1314,7 @@ Links without a scheme, file: URLs and Windows drive letters are local."
 (defun mdview--local-file (path)
   "Return the absolute file name of the local link PATH.
 PATH may be a file: URL; percent-escapes are decoded and relative names
-resolve against the view's base directory."
+resolve against the buffer's base directory."
   (let* ((parsed (url-generic-parse-url path))
          (raw (if (and (url-type parsed)
                        (string-equal-ignore-case (url-type parsed) "file"))
@@ -859,11 +1326,15 @@ resolve against the view's base directory."
     (expand-file-name decoded (or mdview--base-dir default-directory))))
 
 (defun mdview--visit-in-view (file)
-  "Render the Markdown FILE in this view, pushing it onto the history."
-  (let ((file (expand-file-name file)))
-    (mdview--set-source (find-buffer-visiting file) file)
-    (mdview--history-push)
-    (mdview--render-into (current-buffer) 1)))
+  "Show the Markdown FILE rendered in the selected window.
+The file is visited (an existing buffer is reused), rendered unless it
+already is, shown from its beginning, and pushed onto the window's
+history after the current document."
+  (let* ((history (mdview--history))
+         (buffer (find-file-noselect (expand-file-name file))))
+    (mdview--history-save-point history)
+    (mdview--show-rendered buffer)
+    (mdview--history-push history)))
 
 (defun mdview--open-local (url)
   "Open the local link URL: Markdown files here, other files in Emacs."
@@ -956,92 +1427,63 @@ to be link targets, since they cannot be images."
 
 ;;;###autoload
 (defun mdview (&optional buffer)
-  "Render BUFFER (default: the current buffer) as Markdown and show the view.
-The view is a buffer named *mdview: NAME* in `mdview-mode', displayed
-with `mdview-display-action'; point is placed at the block rendered from
-the line at point in BUFFER.  An existing view of BUFFER is reused.
-Return the view buffer."
+  "Render BUFFER (default: the current buffer) in place and return it.
+This turns on `mdview-mode'; in a buffer that is already rendered it
+renders again (`mdview-refresh')."
   (interactive)
-  (let ((source (get-buffer (or buffer (current-buffer)))))
-    (if (mdview--view-p source)
-        (with-current-buffer source (mdview-refresh) source)
-      (let ((line (with-current-buffer source (line-number-at-pos)))
-            (file (buffer-file-name (or (buffer-base-buffer source) source))))
-        (mdview--show (mdview--make-view source file) line)))))
+  (with-current-buffer (get-buffer (or buffer (current-buffer)))
+    (if mdview--rendered
+        (mdview-refresh)
+      (mdview-mode 1))
+    (current-buffer)))
 
 ;;;###autoload
 (defun mdview-file (file)
-  "Render the Markdown FILE and show the view.
-A buffer visiting FILE becomes the view's source; otherwise the file is
-read directly and `mdview-visit-source' visits it on demand.  Relative
-links and images resolve against the directory of FILE.  Return the
-view buffer."
+  "Visit the Markdown FILE in the selected window and show it rendered.
+An existing buffer visiting FILE is reused.  Return the buffer."
   (interactive "fMarkdown file: ")
-  (let* ((file (expand-file-name file))
-         (buffer (find-buffer-visiting file)))
+  (let ((file (expand-file-name file)))
     (when (file-directory-p file)
       (user-error "%s is a directory, not a Markdown file" file))
     (unless (file-readable-p file)
       (user-error "Cannot read %s" file))
-    (if buffer
-        (mdview buffer)
-      (mdview--show (mdview--make-view nil file) 1))))
+    (let ((buffer (find-file-noselect file)))
+      (pop-to-buffer-same-window buffer)
+      (unless mdview--rendered
+        (mdview-mode 1))
+      buffer)))
 
 ;;;###autoload
 (defun mdview-toggle ()
-  "Switch between a Markdown buffer and its rendered view.
-In a Markdown buffer, show the view with point at the block rendered
-from the current line.  In a view, go back to the source at the line of
-the block at point, visiting the source file when no buffer holds it."
+  "Switch the current buffer between its Markdown source and its rendering.
+Point stays on the same block in both directions, at the same screen
+row; toggling twice without moving returns to the exact old position."
   (interactive)
-  (if (derived-mode-p 'mdview-mode)
-      (mdview-visit-source)
-    (mdview)))
+  (mdview-mode (if mdview--rendered -1 1)))
 
 (defun mdview--check-view ()
-  "Signal a `user-error' unless the current buffer is an mdview view."
-  (unless (derived-mode-p 'mdview-mode)
-    (user-error "Not in an mdview buffer (use M-x mdview to render this one)")))
+  "Signal a `user-error' unless the current buffer is rendered."
+  (unless mdview--rendered
+    (user-error "Not a rendered buffer (use M-x mdview to render this one)")))
 
 (defun mdview-refresh ()
-  "Re-render the view from its source, keeping the current block."
+  "Render the buffer again from its source, keeping the current block."
   (interactive)
   (mdview--check-view)
-  (mdview--render-into (current-buffer)))
+  (mdview--render-into (current-buffer) nil t))
+
+(defun mdview-edit ()
+  "Show the Markdown source of this rendered buffer, for editing.
+Point goes to the line of the block at point."
+  (interactive)
+  (mdview--check-view)
+  (mdview-mode -1))
 
 (defun mdview-quit ()
-  "Quit the view.
-When the view replaced another buffer in the selected window (the
-Markdown buffer it was opened from, even after links to other documents
-were followed), show that buffer there again; otherwise use
-`quit-window'."
+  "Quit the window showing the rendered buffer, with `quit-window'.
+The buffer stays rendered; \\[mdview-edit] shows its source instead."
   (interactive)
-  (let ((view (current-buffer))
-        (back (if (buffer-live-p mdview--origin-buffer)
-                  mdview--origin-buffer
-                mdview--source-buffer)))
-    (if (and (eq (selected-window) mdview--source-window)
-             (buffer-live-p back))
-        (progn
-          (setq mdview--source-window nil
-                mdview--origin-buffer nil)
-          (pop-to-buffer-same-window back)
-          (bury-buffer view))
-      (quit-window))))
-
-(defun mdview-visit-source ()
-  "Visit the source of this view at the line of the block at point."
-  (interactive)
-  (mdview--check-view)
-  (let* ((line (mdview--source-line-at (point)))
-         (buffer (mdview--ensure-source-buffer))
-         (window (get-buffer-window buffer)))
-    (if window
-        (select-window window)
-      (pop-to-buffer-same-window buffer))
-    (when line
-      (goto-char (point-min))
-      (forward-line (1- line)))))
+  (quit-window))
 
 (defun mdview-next-link ()
   "Move point to the next link, wrapping around to the first one."
@@ -1068,7 +1510,7 @@ were followed), show that buffer there again; otherwise use
 (defun mdview-follow-link (&optional pos)
   "Follow the link, image or footnote marker at POS (default: point).
 Anchors move to the heading and scroll it to the top; Markdown files
-are rendered in this view (see `mdview-history-back'); other local
+are shown rendered in this window (see `mdview-history-back'); other local
 files are visited with `find-file-other-window'; external URLs go to
 `browse-url'; images open with `mdview-image-open', except that an
 image wrapped in a link follows the link like text would; footnote
@@ -1147,19 +1589,19 @@ one at point being the default.  When `imenu-use-popup-menu' is
       (mdview--toc-completing-read index))))
 
 (defun mdview-history-back ()
-  "Show the previous document of this view's history."
+  "Show the previous document of this window's history."
   (interactive)
   (mdview--check-view)
   (mdview--history-move -1))
 
 (defun mdview-history-forward ()
-  "Show the next document of this view's history."
+  "Show the next document of this window's history."
   (interactive)
   (mdview--check-view)
   (mdview--history-move 1))
 
 (defun mdview-toggle-images ()
-  "Toggle the display of images in this view and re-render it."
+  "Toggle the display of images in this buffer and render it again."
   (interactive)
   (mdview--check-view)
   (setq mdview--images-enabled (not mdview--images-enabled))
@@ -1215,6 +1657,36 @@ the init file before those modes are available."
       (with-eval-after-load feature
         (when (boundp map)
           (define-key (symbol-value map) key #'mdview-toggle))))))
+
+
+;;;###autoload
+(defun mdview--initial-view ()
+  "Render the newly visited current buffer when it is a Markdown file.
+Called from `find-file-hook' (via `mdview--find-file-hook') when
+`mdview-initial-view' is `view'.  Buffers whose major mode does not
+derive from one of `mdview-markdown-modes', indirect buffers and
+buffers being reverted (a revert renders again by itself) are left
+alone; a failure is reported and leaves the source shown."
+  (when (and (not revert-buffer-in-progress-p)
+             (not mdview--rendered)
+             (not mdview--owner)
+             (not (buffer-base-buffer))
+             (seq-some (lambda (mode) (provided-mode-derived-p major-mode mode))
+                       mdview-markdown-modes))
+    (mdview--enter-or-report)))
+
+;; The two forms below are also copied into the autoloads file, so that
+;; files open rendered without mdview being loaded beforehand, while a
+;; visit costs nothing as long as the option is `edit'.
+;;;###autoload (defun mdview--find-file-hook () "Apply `mdview-initial-view' to the visited file." (when (eq mdview-initial-view 'view) (mdview--initial-view)))
+;;;###autoload (add-hook 'find-file-hook #'mdview--find-file-hook 90)
+
+(defun mdview--find-file-hook ()
+  "Apply `mdview-initial-view' to the visited file."
+  (when (eq mdview-initial-view 'view)
+    (mdview--initial-view)))
+
+(add-hook 'find-file-hook #'mdview--find-file-hook 90)
 
 (provide 'mdview)
 ;;; mdview.el ends here

@@ -47,7 +47,7 @@ with `byte-compile-error-on-warn` on Emacs 29 and 30.
 | `mdview-image.el` | Image loading (local/remote, async), scaling, placeholders, cache | faces |
 | `mdview-table.el` | Table layout: column widths, cell wrapping, alignment → lines | faces, render helpers |
 | `mdview-render.el` | Layout engine (contexts, margins, wrapping, boxes) and block/inline rendering | ast, faces, code, image, table |
-| `mdview.el` | Commands, `mdview-mode`, keymap, link following, history, refit, source sync, integration | everything |
+| `mdview.el` | In-place `mdview-mode`, commands, keymap, link following, history, refit, source sync, save/revert hooks, integration | everything |
 
 Dependency direction is strictly downward in that table (render may call
 table/code/image; nothing calls back into `mdview.el`).  `mdview-table.el`
@@ -645,8 +645,8 @@ Faces may appear as lists or anonymous plists; handle `(face1 face2)`,
   live and the placeholder still present.  The replacement keeps the
   line's width (the column difference is taken from or added to the
   line's trailing padding), and the abnormal hook
-  `mdview-image-update-functions` is then run with the view buffer so
-  the viewer can re-render and re-wrap paragraphs around inline images.
+  `mdview-image-update-functions` is then run with the buffer holding the
+  rendering so the viewer can re-render and re-wrap paragraphs around inline images.
   Cache the raw data per URL in a session hash table
   (`mdview-image-cache`).  A fetch that fails, times out or returns
   undisplayable data leaves the placeholder, removes its
@@ -664,88 +664,233 @@ Faces may appear as lists or anonymous plists; handle `(face1 face2)`,
 
 ## 10. Commands, modes, integration (`mdview.el`)
 
-- `mdview-mode`: derived from `special-mode`; `truncate-lines t`,
-  `buffer-read-only t`, undo disabled (`buffer-disable-undo`: every render
-  rewrites the whole buffer and the records would only retain the previous
-  rendering), `cursor-type` as default (users navigate), imenu index from
-  heading properties, `left-margin-width`/`right-margin-width` =
-  `mdview-margin` (default 4) with `mdview-center-content` (default nil)
-  enlarging the left margin to center the content when the window is wider
-  than `mdview-max-width` + margins.
-- Buffer-local state: source buffer, source file, base dir, last render
-  width, history (list of `(file-or-buffer . point)`), images-enabled
-  flag, the origin (window and buffer the view replaced, for `q`), and the
-  parsed document with the key of the source text it came from.
-- Commands: `mdview` (render current buffer → `*mdview: NAME*`, display with
-  `mdview-display-action`, default same window; when the view is already
-  visible in a window of the frame, that window is selected instead so a
-  side-by-side source/view layout survives toggling), `mdview-file`
-  (rejects directories with a `user-error`; a failed first render kills the
-  new view and restores the windows instead of leaving an empty view),
-  `mdview-toggle`, `mdview-refresh` (`g`), `mdview-quit` (`q`: switch the
-  window back to the buffer the view replaced when it was opened — the
-  original source even after links to other documents were followed —
-  else `quit-window`), `mdview-next-link`/`mdview-previous-link` (`TAB`/`S-
-  TAB`), `mdview-follow-link` (`RET`, also `mouse-1`/`mouse-2`),
-  `mdview-next-heading`/`mdview-previous-heading` (`n`/`p`),
-  `mdview-toc` (`t`: completion over the heading names with the heading
-  at point as default; `imenu`'s popup menu only when
-  `imenu-use-popup-menu` is `always`), `mdview-history-back`/`-forward`
-  (`l`/`r`), `mdview-toggle-images` (`i`), `mdview-visit-source` (`e`),
-  `mdview-copy-link` (`w`: local links are copied as the absolute file name
-  they resolve to, anchor kept; `C-u w` copies the URL as written),
-  `SPC`/`DEL`/`S-SPC` scroll.  `C-c C-v` in the view runs `mdview-toggle`
-  too.  View-only commands signal "Not in an mdview buffer" elsewhere.
-- One view per source: `mdview` reuses the view whose current source is
-  the buffer/file, or failing that a view that showed it earlier in its
-  history (and followed a link away), so toggling again after `q` from a
-  navigated view returns to the same view and its history.
-- Link following: `#anchor` → heading with that `mdview-heading-id`
-  (also try the slug of the raw anchor); `path.md[#anchor]` relative to
-  base dir → render that file in the *same* view buffer (push history);
-  other local files → `find-file-other-window`; `http(s)`/`mailto` →
+### 10.1 In-place rendering (issue #3)
+
+A Markdown buffer is rendered *in place*: the buffer the user edits is the
+buffer that shows the rendering, toggled like md-mode's `C-c C-v`, so
+saving, reverting and auto-revert act on the buffer being looked at.
+There is no separate view buffer.  (Consequence: every window showing the
+buffer shows the same state; source and rendering cannot be side by
+side.)
+
+- `mdview-mode` is a buffer-local minor mode (lighter ` mdview`, keymap
+  `mdview-mode-map`); on = the text of the buffer is its rendering.  The
+  internal flag `mdview--rendered` is set only together with an actual
+  swap of the text; the mode variable follows it.
+- **Mechanism: `buffer-swap-text`.**  The rendering is built in a fresh
+  hidden buffer (` *mdview-render*`, fundamental mode, undo off, its text
+  marked `fontified t`) and its *text* is exchanged with the source
+  buffer's.  The source text then waits in that hidden buffer, the
+  *twin* (renamed ` *mdview: NAME*`), with everything attached to it —
+  markers (including other packages' and the mark), overlays (flymake,
+  folding), text properties (fontification, `syntax-table`), the undo
+  list — and comes back exactly when swapped back.  Swapping runs no
+  modification hooks, takes no file lock, raises no supersession
+  question and records no undo; buffer-local variables (major mode, file
+  name, coding system, local hooks) stay with the buffer.  The source
+  text is therefore never edited by mdview, and a render error leaves the
+  buffer untouched.  Rejected alternatives: erase+insert (md-mode's way)
+  collapses every marker and overlay and needs lock/supersession dodges;
+  an invisible source with the rendering appended would be seen by every
+  `(save-restriction (widen) …)`, by saving and by line numbers.
+- **One swap function** (`mdview--swap`) does every exchange: it signals
+  if the other buffer is dead, and restores the buffer's modified flag
+  afterwards (`buffer-swap-text` counts the exchange as a modification of
+  both texts), with `buffer-file-name` let-bound to nil so that setting it
+  locks nothing.  So the mode line, `kill-buffer`, `save-some-buffers` and
+  auto-revert's staleness check always see the state of the source.
+  Never wrap a swap in `save-excursion`/`save-restriction`: they would
+  restore into the other buffer.
+- **Kept rendering.**  Leaving puts the rendering into the twin.  The
+  next enter swaps it back without rendering when the source is
+  unchanged (key: `buffer-chars-modified-tick` and accessible portion of
+  the source, recorded right *after* each swap because swaps bump the
+  tick), the width and the image setting are the same, and no remote
+  image arrived into it meanwhile (that marks it stale so the text
+  re-flows).  Otherwise a new rendering replaces it.  The parsed document
+  is cached under the same key.
+- Indirect buffers, and buffers that have indirect buffers, cannot swap
+  text: `mdview-mode` signals a `user-error`.  The narrowed portion of a
+  narrowed buffer is what gets rendered.
+- **While rendered**, the buffer has: `buffer-read-only`,
+  `truncate-lines` t, `word-wrap` nil, `left-`/`right-margin-width` =
+  `mdview-margin` (applied with `set-window-margins`, which keeps window
+  start and point), the derived faces remapped (`mdview-faces-remap`),
+  undo off (the rendering's undo list is `t`), and these overrides
+  (`mdview--overridden-settings`): `fontification-functions`,
+  `jit-lock-mode`, `jit-lock-functions`, `jit-lock-context-unfontify-pos`
+  nil and the font-lock (un)fontify-region functions no-ops (nothing may
+  fontify the rendering or strip its faces; the source keeps its own
+  fontification in the twin); `syntax-propertize-function` nil
+  (`syntax-ppss-flush-cache` after every swap, since its bookkeeping is
+  buffer-local); mdview's imenu index; `buffer-auto-save-file-name` nil
+  (an auto-save would write the rendering); `mark-ring` nil (its markers
+  went with the source); the local `window-configuration-change-hook`
+  reduced to the global one (md-mode and olivetti act on the text and
+  margins there).  Leaving restores each setting — unless something
+  changed it meanwhile (e.g. `write-file` computing a new auto-save
+  name), in which case the new value stays.  The buffer-local minor modes
+  in `mdview-suspended-modes` (default `flyspell-mode`,
+  `visual-line-mode`, `whitespace-mode`, `display-line-numbers-mode`,
+  `display-fill-column-indicator-mode`, `visual-fill-column-mode`,
+  `olivetti-mode`) that are on are switched off before the swap and on
+  again after leaving.
+- **Positions.**  A swap maps the buffer's point and every window showing
+  the buffer: source line → first block with `mdview-source-line` ≥ the
+  line; rendered position → line of the nearest preceding block →
+  beginning of that source line.  Each window keeps the screen row of
+  its point (window start found with `vertical-motion`).  Each swap
+  remembers where it put each window and where the window was
+  (`mdview--memory`); the next swap restores the exact old point and
+  start for a window that did not move, provided the text coming back is
+  the very text put away (always when leaving; when entering only if the
+  kept rendering is reused).  So toggling twice without moving is an
+  exact no-op, in both directions.
+
+### 10.2 Saving, reverting, mode changes, killing
+
+The buffer-local hooks are installed on the first rendering and stay
+(doing nothing while the source is shown) until the major mode changes.
+
+- **Save while rendered**: `mdview--before-save` runs first in the local
+  `before-save-hook` (depth −100, so formatters and other save hooks see
+  the source) and switches to the source, recording whether to come
+  back; the request is reset on every save, so a failed save cannot make
+  a later save switch to the rendering.  `mdview--after-save` (local
+  `after-save-hook`, depth 100) renders again — a swap without rendering
+  when the save hooks left the text alone, with the exact window
+  positions.  `basic-save-buffer` runs the hook inside a
+  `save-restriction` of the (unnarrowed) rendering, which would widen the
+  source on exit; a narrowed source's restriction is recorded as markers
+  and re-applied before rendering again.  Because `basic-save-buffer` demotes errors in
+  `before-save-hook` to messages, a local `write-contents-functions`
+  entry refuses the save outright if the buffer is still rendered: the
+  rendering is never written to the file.
+- **Revert while rendered** (`revert-buffer`, `auto-revert-mode`,
+  `global-auto-revert-mode`): local `before-revert-hook` (depth −100)
+  switches to the source and records the request in the permanent-local
+  `mdview--resume-after-revert` (reset on every revert); local
+  `after-revert-hook` renders the reloaded text.  `revert-buffer--default`
+  copies the local `after-revert-hook` before re-reading and re-applies it
+  after `normal-mode`, so this also works for a revert that does not
+  preserve modes.  Auto-revert only reverts unmodified buffers, which the
+  modified-flag rule of `mdview--swap` keeps truthful.  A change on disk
+  therefore reaches the rendering without a key press; while the source
+  is shown, auto-revert is plain Emacs, and the stale kept rendering is
+  detected by its key on the next toggle.  Auto-revert let-binds
+  `buffer-read-only` around the revert, so when rendering after a revert
+  fails the source is made writable again from a zero-delay timer.
+- **Major-mode change**: `change-major-mode-hook` switches to the source
+  (before `kill-all-local-variables`) and kills the twin; the minor mode
+  is off in the new major mode.
+- **Kill**: the local `kill-buffer-hook` entry (depth −100) switches to
+  the source first, so later kill hooks (`save-place-mode`, desktop) see
+  source positions, then kills the twin and cancels the buffer's pending
+  image fetches.  `kill-buffer` still asks about unsaved source edits.
+- **Exit**: a global `kill-emacs-hook` entry (depth −100) puts the source
+  back in every rendered buffer, so `save-place-mode` and desktop record
+  source positions.
+- **Indirect clones**: a global `clone-indirect-buffer-hook` entry strips
+  the copied mdview state (flags, twin, local hooks) from a clone of a
+  rendered buffer.  While any indirect buffer of a rendered buffer lives,
+  its source cannot be swapped back (`buffer-swap-text` refuses):
+  leaving signals a `user-error` naming the cause.
+- **Failure safety**: before leaving, the twin's liveness and the absence
+  of indirect buffers are checked, so a failed leave restores nothing and
+  the rendering stays fully in place; the swap phase of entering, leaving
+  and re-rendering runs with `inhibit-quit` and `throw-on-input` nil; an
+  error after the swap while entering puts the source back before it is
+  reported; leaving from `kill-buffer-hook` or `change-major-mode-hook`
+  reports errors instead of signalling, so a buffer can always be killed.
+  Window starts are computed with `vertical-motion` given the window,
+  never under `with-selected-window`, which would overwrite the window
+  points just set.
+- **Twin protection**: twins and render buffers are created *with* buffer
+  hooks and carry a local `kill-buffer-query-functions` entry that
+  refuses to kill a twin that holds the source of a rendered buffer, so
+  `kill-some-buffers`, `clean-buffer-list` and the like cannot destroy
+  it.  A twin holding only a kept rendering may be killed.
+- Known limits: markers held outside the buffer (registers, the global
+  mark ring, `window-prev-buffers`) point into the twin while the buffer
+  is rendered; tree-sitter parsers stay with the buffer and reparse
+  whatever text they find when queried.
+
+### 10.3 Commands and keys
+
+- `mdview` (render the current buffer in place, or re-render it if it is
+  rendered; returns the buffer), `mdview-file` (visit FILE in the selected
+  window and render it; rejects directories and unreadable files with a
+  `user-error`; returns the buffer), `mdview-toggle` (switch source ↔
+  rendering; `C-c C-v` in the rendering), `mdview-mode`.
+- Keys while rendered: `q` `mdview-quit` (`quit-window`; the buffer stays
+  rendered), `e` and `C-x C-q` (`[remap read-only-mode]`) `mdview-edit`
+  (back to the source at the line of the block at point), `g`
+  `mdview-refresh` (render again, parsing again), `TAB`/`S-TAB`
+  `mdview-next-link`/`mdview-previous-link`, `RET`/`mouse-1`/`mouse-2`
+  `mdview-follow-link`, `n`/`p` headings, `t` `mdview-toc` (completion over
+  the heading names with the heading at point as default; `imenu`'s popup
+  menu only when `imenu-use-popup-menu` is `always`), `l`/`r`
+  `mdview-history-back`/`-forward`, `i` `mdview-toggle-images`, `w`
+  `mdview-copy-link` (local links as the absolute file name they resolve
+  to, anchor kept; `C-u w` as written), `SPC`/`DEL`/`S-SPC` scroll, `<`/`>`.
+  Commands that need a rendering signal "Not a rendered buffer"
+  elsewhere.
+- Link following: `#anchor` → heading with that `mdview-heading-id` (also
+  the slug of the raw anchor); `path.md[#anchor]` relative to the base
+  dir (the file's directory, else `default-directory`) → visit that file
+  and show it rendered in the selected window, then the anchor; other
+  local files → `find-file-other-window`; `http(s)`/`mailto` →
   `browse-url`; images → `mdview-image-open`.  An image wrapped in a link
   carries the link's URL in `mdview-link`; `RET` on it follows that URL
   like a text link (the image's own URL is recognised through
   `mdview-image-url` — text property or pending-placeholder overlay — or
   the `:file` of the displayed image).
-- Source sync: `mdview-toggle` from the source places point in the view at
-  the first rendered block whose `mdview-source-line` ≥ the source line;
-  `mdview-visit-source` and `mdview-toggle` from the view do the reverse
-  using the nearest preceding `mdview-source-line`.
-- Re-rendering (`g`, refit, save, `i`): the parsed document is cached
-  per view with a key of the source text (`buffer-chars-modified-tick` of
-  a live source buffer, else modification time and size of the file) and
-  reused while the key matches, so only a changed source is parsed again.
-  `gc-cons-threshold` is raised to 64 MB (`gc-cons-percentage` to 0.5)
-  for the duration: the renderer allocates ~70 MB per MB of input and the
-  default threshold makes garbage collection dominate the render time of
-  large documents.  Point stays on the block of the same source line, and
-  every window showing the view keeps the block that was at its top
-  (`set-window-start` to the block's new position plus the recorded line
-  offset) instead of being recentred around point.  Remote images that
-  arrive after the rendering trigger one more render from
-  `mdview-image-update-functions` (debounced by `mdview-refit-delay`,
-  run under `while-no-input` like a refit, skipped when images are off in
-  the view) so that paragraphs re-flow around inline images at their
-  real width; the image bytes come from the cache, so this is immediate.
-- Refit: `mdview-auto-refit` (default t) re-renders via a 0.2 s idle timer
-  from `window-size-change-functions` when the effective width changed,
-  preserving the current source line.  The refit render runs inside
-  `while-no-input`; when the user types it is abandoned and rescheduled
-  for the next idle period, and a render error is reported once with
-  `message` (the width is recorded so the same failure is not retried on
-  every resize).  `mdview-refresh-on-save` (default t) re-renders the
-  views of a saved buffer from the *global* `after-save-hook` (installed by
-  `mdview-mode`, filtered by `mdview--views-of`); a buffer-local hook
-  would be lost when the source changes major mode
-  (`kill-all-local-variables`).
-- Width: `W = min(window-body-width − 2·margin − 1, mdview-max-width or ∞)`,
-  at least 20.
-- Integration: `mdview-install-keybinding KEY` binds KEY to `mdview-toggle`
-  in `markdown-mode-map`, `gfm-mode-map` and `md-mode-map` (each via
-  `with-eval-after-load`).  Autoload cookies on `mdview`, `mdview-file`,
-  `mdview-toggle`, `mdview-mode`, `mdview-install-keybinding`.
+- History belongs to the window (window parameter `mdview-history`,
+  `(INDEX . ENTRIES)`, entry `(BUFFER FILE POINT)`): following a link to a
+  Markdown file pushes the new document after the current one (dropping
+  forward entries); `l`/`r` show the neighbouring document rendered at its
+  recorded point, visiting the file again if its buffer was killed.  When
+  the window shows a buffer that is not the history's current entry (the
+  user switched buffers by other means) a fresh history starts there.
+- Re-rendering (`g`, refit, `i`, images): rendered into a hidden buffer
+  and swapped in; point stays on the block of the same source line and
+  every window keeps the block that was at its top (`set-window-start` to
+  the block's new position plus the recorded line offset).
+  `gc-cons-threshold` is raised to 64 MB (`gc-cons-percentage` 0.5) while
+  rendering: the renderer allocates ~70 MB per MB of input.  Remote images
+  that arrive later trigger one more render from
+  `mdview-image-update-functions` (debounced by `mdview-refit-delay`, run
+  under `while-no-input`, skipped when images are off) so paragraphs
+  re-flow around inline images.
+- Refit: `mdview-auto-refit` (default t) re-renders via a 0.2 s idle
+  timer from the buffer-local `window-size-change-functions` and
+  `window-buffer-change-functions` when the effective width changed.  The
+  render runs inside `while-no-input` (the commit after it does not); when
+  the user types it is abandoned and rescheduled, and a render error is
+  reported once with `message` (the width is recorded so it is not
+  retried on every resize).
+- Width: `W = min(window-body-width + margins − 2·margin − 1,
+  mdview-max-width or ∞)`, at least 20; `mdview-center-content` (default
+  nil) enlarges the left margin to center the content.
+- Initial state: `mdview-initial-view` (`edit`, default, or `view`) decides
+  whether a visited file whose major mode derives from one of
+  `mdview-markdown-modes` (default `markdown-mode`, `gfm-mode`, `md-mode`,
+  `markdown-ts-mode`) opens rendered.  `mdview--find-file-hook` runs in
+  `find-file-hook` at depth 90 (after `save-place-mode` restored point),
+  skips reverts (`revert-buffer-in-progress-p`; a revert re-renders by
+  itself), indirect buffers and rendered ones, and reports failures
+  instead of signalling.  The option is autoloaded (as a `defvar`, so
+  `setq` in an init file works), and the hook function and its
+  `add-hook` are copied into the autoloads file by same-line
+  `;;;###autoload` forms: the hook costs a variable test per visit and
+  loads mdview only when the option is `view`.  The rendering is laid
+  out for the selected window and refitted when the buffer gets its
+  window.
+- Integration: `mdview-install-keybinding KEY` binds KEY to
+  `mdview-toggle` in `markdown-mode-map`, `gfm-mode-map` and `md-mode-map`
+  (each via `with-eval-after-load`).  Autoload cookies on `mdview`,
+  `mdview-file`, `mdview-toggle`, `mdview-mode`,
+  `mdview-install-keybinding`, `mdview-version`, `mdview-initial-view`.
 - Everything that touches the display (face remapping, `display-graphic-p`
   checks, image sizes) must degrade gracefully in `--batch` so that tests
   run headless.
@@ -857,7 +1002,11 @@ frame the same happens when the font does not draw the glyph exactly
   (exact blank-line counts), table layout (widths, expansion, wrapping,
   alignment), code fontification (mapping, guides, unknown language),
   image module (placeholders in batch, path resolution, cache), commands
-  (toggle round-trip, link navigation, anchors, history, refresh).
+  (toggle round-trip and exact return, what rendering preserves of the
+  source — markers, overlays, properties, undo, modified flag, no file
+  lock —, save/revert/auto-revert/major-mode change/kill while rendered,
+  twin protection, initial view and its autoload forms, link navigation,
+  anchors, history, refresh).
 - Golden tests: `test/mdview-golden-test.el` renders every
   `test/fixtures/*.md` at width 80 in batch (images → placeholders) and
   compares the plain text to `test/golden/<name>.txt`; `make golden`
@@ -949,7 +1098,7 @@ frame the same happens when the font does not draw the glyph exactly
 (mdview-image-placeholder URL ALT)         ; → propertized placeholder string
 (mdview-image-cancel-pending &optional BUFFER KILL)   ; stop waiting for BUFFER's placeholders
 (mdview-image-clear-cache)
-mdview-image-update-functions              ; abnormal hook, called with the view buffer after a
+mdview-image-update-functions              ; abnormal hook, called with the rendering's buffer after a
                                            ; placeholder was replaced (from the retrieval callback)
 ;; options: mdview-image-timeout, mdview-image-max-parallel, mdview-image-max-height/-width, …
 

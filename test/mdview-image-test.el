@@ -684,7 +684,7 @@ option at 5 seconds."
           (should (null mdview-image--waiting)))))))
 
 (ert-deftest mdview-image-job-region-survives-copying ()
-  "A placeholder copied into an mdview-mode buffer is still found by its id."
+  "A placeholder copied into a buffer in `mdview-mode' is still found by its id."
   (mdview-image-test-with-graphics
     (let ((copy (generate-new-buffer " *mdview-image-test-copy*"))
           text job)
@@ -700,7 +700,7 @@ option at 5 seconds."
             ;; The temp buffer is dead; nothing is found yet.
             (should-not (mdview-image--job-region job))
             (with-current-buffer copy
-              (setq major-mode 'mdview-mode)
+              (setq-local mdview-mode t)
               (insert "prefix " text " suffix"))
             (should (equal (mdview-image--job-region job)
                            (list copy 8 (+ 8 (length text))))))

@@ -45,6 +45,7 @@
 (require 'mdview-faces)
 
 (defvar url-http-response-status)       ; url-http.el, local to responses
+(defvar mdview-mode)                    ; mdview.el, on in rendered buffers
 
 ;;;; Options
 
@@ -512,8 +513,8 @@ Search from FROM, defaulting to the beginning of the buffer."
 
 (defun mdview-image--job-region (job)
   "Return (BUFFER START END) of JOB's placeholder, or nil if it is gone.
-The overlay locates it when alive; otherwise buffers in `mdview-mode' are
-searched for the `mdview-image-pending' property, which survives when
+The overlay locates it when alive; otherwise buffers where `mdview-mode'
+is on are searched for the `mdview-image-pending' property, which survives when
 the renderer copies the placeholder text into another buffer."
   (let* ((overlay (mdview-image--job-overlay job))
          (id (mdview-image--job-id job))
@@ -524,8 +525,8 @@ the renderer copies the placeholder text into another buffer."
                (and region (list buffer (car region) (cdr region)))))
         (seq-some (lambda (buf)
                     (and (buffer-live-p buf)
-                         (with-current-buffer buf
-                           (derived-mode-p 'mdview-mode))
+                         (local-variable-p 'mdview-mode buf)
+                         (buffer-local-value 'mdview-mode buf)
                          (let ((region (mdview-image--pending-region id buf)))
                            (and region (list buf (car region) (cdr region))))))
                   (buffer-list)))))
