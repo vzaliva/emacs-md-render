@@ -143,20 +143,6 @@ fresh string."
 
 ;;;; Source positions
 
-(defun mdview-render--trim (string)
-  "Return STRING without leading and trailing whitespace, offsets kept.
-Like `string-trim', except that the result is cut with
-`mdview-ast-substring', so the source offsets carried by the text
-property `mdview-pos' stay exact when leading characters are removed."
-  (let ((start 0) (end (length string)))
-    (while (and (< start end) (memq (aref string start) '(?\s ?\t ?\n ?\r)))
-      (setq start (1+ start)))
-    (while (and (> end start) (memq (aref string (1- end)) '(?\s ?\t ?\n ?\r)))
-      (setq end (1- end)))
-    (if (and (zerop start) (= end (length string)))
-        string
-      (mdview-ast-substring string start end))))
-
 (defun mdview-render--without-positions (string)
   "Return a copy of STRING without the text property `mdview-pos'."
   (let ((copy (copy-sequence string)))
@@ -840,7 +826,7 @@ align=\"center\") has every line centered; one with `:summary' (an HTML
                    (mdview-render-inlines (mdview-node-children node) ctx)
                    "\n+")))
         (when (mdview-node-prop node :summary)
-          (setq text (mdview-render--trim text))
+          (setq text (mdview-ast-trim text))
           (add-face-text-property 0 (length text) 'mdview-summary t text)
           (setq text (concat (propertize (mdview-glyph 'summary)
                                          'face 'mdview-summary)

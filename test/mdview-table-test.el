@@ -631,14 +631,14 @@ KEYS are passed on to `mdview-table-layout'."
 ;;;; Source positions
 
 (ert-deftest mdview-table-trim-keeps-positions ()
-  (let ((trimmed (mdview-table--trim (propertize "  abc \t" 'mdview-pos 10))))
+  (let ((trimmed (mdview-ast-trim (propertize "  abc \t" 'mdview-pos 10))))
     (should (equal trimmed "abc"))
     (should (equal (mdview-ast-pos-at 0 trimmed) 12))
     (should (equal (mdview-ast-pos-at 2 trimmed) 14)))
   (let ((string (propertize "abc" 'mdview-pos 1)))
-    (should (eq (mdview-table--trim string) string)))
-  (should (equal (mdview-table--trim "   ") ""))
-  (should (equal (mdview-table--trim "") "")))
+    (should (eq (mdview-ast-trim string) string)))
+  (should (equal (mdview-ast-trim "   ") ""))
+  (should (equal (mdview-ast-trim "") "")))
 
 (ert-deftest mdview-table-split-lines-keeps-positions ()
   (let ((lines (mdview-table--split-lines (propertize "ab\ncd\n" 'mdview-pos 4))))

@@ -138,6 +138,20 @@ the result's characters stay right."
                              'mdview-pos offset new))))
     new))
 
+(defun mdview-ast-trim (string)
+  "Return STRING without leading and trailing whitespace, offsets kept.
+Like `string-trim', except that the result is cut with
+`mdview-ast-substring', so the source offsets carried by the text
+property `mdview-pos' stay exact when leading characters are removed."
+  (let ((start 0) (end (length string)))
+    (while (and (< start end) (memq (aref string start) '(?\s ?\t ?\n ?\r)))
+      (setq start (1+ start)))
+    (while (and (> end start) (memq (aref string (1- end)) '(?\s ?\t ?\n ?\r)))
+      (setq end (1- end)))
+    (if (and (zerop start) (= end (length string)))
+        string
+      (mdview-ast-substring string start end))))
+
 (defun mdview-slug (string)
   "Return the GitHub-style anchor slug of heading text STRING.
 The text is downcased; every character that is not a letter, a digit, a

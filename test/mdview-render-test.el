@@ -1559,12 +1559,12 @@ RUNS is a list of (OFFSET . PIECE)."
     (should-not (text-property-not-all 0 see 'mdview-pos nil text))))
 
 (ert-deftest mdview-render-trim-rebases ()
-  (let ((trimmed (mdview-render--trim (propertize "  ab \n" 'mdview-pos 5))))
+  (let ((trimmed (mdview-ast-trim (propertize "  ab \n" 'mdview-pos 5))))
     (should (equal trimmed "ab"))
     (should (equal (mdview-ast-pos-at 0 trimmed) 7)))
   (let ((string (propertize "ab" 'mdview-pos 1)))
-    (should (eq (mdview-render--trim string) string)))
-  (should (equal (mdview-render--trim " \t ") "")))
+    (should (eq (mdview-ast-trim string) string)))
+  (should (equal (mdview-ast-trim " \t ") "")))
 
 (provide 'mdview-render-test)
 ;;; mdview-render-test.el ends here

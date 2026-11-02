@@ -62,21 +62,6 @@ never more than its natural width).  Empty columns have minimum 1.")
 
 ;;;; Measuring cells
 
-(defun mdview-table--trim (string)
-  "Return STRING without leading and trailing whitespace, offsets kept.
-Like `string-trim', except that the result is cut with
-`mdview-ast-substring', so the source offsets carried by the text
-property `mdview-pos' stay exact when leading characters are removed
-\(docs/DESIGN.md section 3)."
-  (let ((start 0) (end (length string)))
-    (while (and (< start end) (memq (aref string start) '(?\s ?\t ?\n ?\r)))
-      (setq start (1+ start)))
-    (while (and (> end start) (memq (aref string (1- end)) '(?\s ?\t ?\n ?\r)))
-      (setq end (1- end)))
-    (if (and (zerop start) (= end (length string)))
-        string
-      (mdview-ast-substring string start end))))
-
 (defun mdview-table--split-lines (string)
   "Split STRING at newlines (hard breaks), keeping text properties.
 The pieces are cut with `mdview-ast-substring', so source offsets in
@@ -97,7 +82,7 @@ Tabs are replaced by spaces so that `string-width' agrees with the
 display width, and every line (the pieces between hard breaks) is
 trimmed, so that the text after a <br> starts at the column edge
 whether or not the cell has to wrap.  Source offsets in `mdview-pos'
-stay exact (see `mdview-table--trim')."
+stay exact (see `mdview-ast-trim')."
   (let ((string (and cell (funcall render-cell cell))))
     (cond
      ((not (stringp string)) "")
@@ -105,8 +90,8 @@ stay exact (see `mdview-table--trim')."
       (when (string-search "\t" string)
         (setq string (subst-char-in-string ?\t ?\s string)))
       (if (string-search "\n" string)
-          (mapconcat #'mdview-table--trim (mdview-table--split-lines string) "\n")
-        (mdview-table--trim string))))))
+          (mapconcat #'mdview-ast-trim (mdview-table--split-lines string) "\n")
+        (mdview-ast-trim string))))))
 
 (defun mdview-table--max-width (strings)
   "Return the largest `string-width' among STRINGS, or 0 when empty."
