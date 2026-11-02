@@ -64,12 +64,22 @@ git:
 
 ```elisp
 (unless (package-installed-p 'mdview)
-  (package-vc-install "https://github.com/vzaliva/emacs-md-render"))
+  (package-vc-install '(mdview :url "https://github.com/vzaliva/emacs-md-render")))
 
 (use-package mdview
   :commands (mdview mdview-file mdview-toggle)
   :bind (:map markdown-mode-map ("C-c C-v" . mdview-toggle)))
 ```
+
+Name the package explicitly, as above.  Given only the URL,
+`package-vc-install` names the package after the repository
+(`emacs-md-render`), so a `(package-installed-p 'mdview)` guard is never
+true: Emacs then re-runs the install at every start, asks "Overwrite
+previous checkout for package `emacs-md-render'?", and if you decline the
+error aborts the rest of your init file (themes, fonts and all).  If you
+already installed it the URL-only way, either guard on
+`'emacs-md-render` instead, or remove that package (`M-x package-delete`)
+and reinstall with the snippet above; otherwise both copies get activated.
 
 If you use [md-mode](https://github.com/yibie/md-mode), which already binds
 `C-c C-v` to its own in-place renderer, rebind it to `mdview-toggle`:
