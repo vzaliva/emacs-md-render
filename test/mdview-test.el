@@ -189,25 +189,48 @@ window, and BODY runs with it current; it is killed afterwards."
           (should (= unremapped 1)))))))
 
 (ert-deftest mdview-test-keymap ()
-  (dolist (binding '(("g" . mdview-refresh)
+  ;; The keys of DESIGN.md section 10.3: outline/org/markdown-mode chords,
+  ;; the button and view-mode keys, and no plain printable key.
+  (dolist (binding '(("C-c C-v" . mdview-toggle)
+                     ("C-c C-n" . mdview-next-heading)
+                     ("C-c C-p" . mdview-previous-heading)
+                     ("C-c C-f" . mdview-forward-heading-same-level)
+                     ("C-c C-b" . mdview-backward-heading-same-level)
+                     ("C-c C-u" . mdview-up-heading)
+                     ("C-c C-j" . mdview-toc)
                      ("TAB" . mdview-next-link) ("<backtab>" . mdview-previous-link)
-                     ("RET" . mdview-follow-link) ("n" . mdview-next-heading)
-                     ("p" . mdview-previous-heading) ("t" . mdview-toc)
-                     ("l" . mdview-history-back) ("r" . mdview-history-forward)
-                     ("i" . mdview-toggle-images)
-                     ("w" . mdview-copy-link) ("SPC" . scroll-up-command)
+                     ("C-c C-x C-n" . mdview-next-link)
+                     ("C-c C-x C-p" . mdview-previous-link)
+                     ("RET" . mdview-follow-link) ("C-c C-o" . mdview-follow-link)
+                     ("C-c C-l" . mdview-copy-link)
+                     ("C-c &" . mdview-history-back)
+                     ("C-c <left>" . mdview-history-back)
+                     ("C-c <right>" . mdview-history-forward)
+                     ("C-c C-x C-v" . mdview-toggle-images)
+                     ("C-c C-x C-i" . mdview-toggle-images)
+                     ("C-c C-r" . mdview-refresh)
+                     ("SPC" . scroll-up-command)
                      ("DEL" . scroll-down-command) ("S-SPC" . scroll-down-command)
-                     ("<" . beginning-of-buffer) (">" . end-of-buffer)
                      ("C->" . mdview-increase-width)
                      ("C-<" . mdview-decrease-width)
-                     ("C-0" . mdview-reset-width)
-                     ("C-c C-v" . mdview-toggle)))
-    (should (eq (lookup-key mdview-mode-map (kbd (car binding))) (cdr binding))))
-  (should-not (lookup-key mdview-mode-map (kbd "q")))
-  (should-not (lookup-key mdview-mode-map (kbd "e")))
+                     ("C-0" . mdview-reset-width)))
+    (should (eq (lookup-key mdview-mode-map (kbd (car binding))) (cdr binding)))
+    (should (commandp (cdr binding))))
+  (dolist (key '("q" "e" "g" "n" "p" "t" "l" "r" "i" "w" "<" ">"))
+    (should-not (lookup-key mdview-mode-map (kbd key))))
+  (should (eq (command-remapping 'self-insert-command nil (list mdview-mode-map))
+              'mdview-self-insert))
   (should-not (command-remapping 'read-only-mode nil (list mdview-mode-map)))
   (should (eq (lookup-key mdview-mode-map [mouse-1]) #'mdview-mouse-follow-link))
   (should (eq (lookup-key mdview-mode-map [mouse-2]) #'mdview-mouse-follow-link)))
+
+(ert-deftest mdview-test-describe-mode-lists-keys ()
+  ;; The mode's documentation expands its keymap, so `describe-mode'
+  ;; shows every binding.
+  (let ((doc (documentation 'mdview-mode)))
+    (dolist (text '("C-c C-v" "mdview-toggle" "C-c C-n" "mdview-next-heading"
+                    "C-c C-o" "mdview-follow-link" "mdview-self-insert"))
+      (should (string-match-p (regexp-quote text) doc)))))
 
 (ert-deftest mdview-test-version ()
   (should (stringp (mdview-version)))
@@ -515,6 +538,44 @@ window, and BODY runs with it current; it is killed afterwards."
             (should (= (point) vpoint))
             (should (= (window-start window) vstart))))))))
 
+(ert-deftest mdview-test-toggle-keeps-word ()
+  ;; Point goes to the word it was on, in both directions, even inside
+  ;; a block, among repeated words, and in a nested block.
+  (mdview-test-with-source
+      (source (concat "# Title\n\nAlpha beta *gamma* delta\nepsilon zeta eta\n"
+                      "\n> one two one two\n\n- item one\n- item two theta\n"))
+    (with-current-buffer source
+      (goto-char (point-min))
+      (search-forward "zeta")
+      (backward-char 2)
+      (mdview-toggle)
+      (should mdview--rendered)
+      (should (looking-at "ta eta"))
+      (should (= (mdview--source-line-at (point)) 3))
+      ;; The second "one" of the quote, from the rendering to the source.
+      (goto-char (point-min))
+      (search-forward "two one")
+      (mdview-toggle)
+      (should-not mdview--rendered)
+      (should (= (line-number-at-pos) 6))
+      (should (looking-back "> one two one" (line-beginning-position)))
+      ;; A word of the second list item, from the source to the rendering.
+      (goto-char (point-min))
+      (search-forward "theta")
+      (backward-char 1)
+      (mdview-toggle)
+      (should mdview--rendered)
+      (should (looking-at "a\\b"))
+      (should (looking-back "item two thet" (line-beginning-position)))
+      (should (= (mdview--source-line-at (point)) 9))
+      ;; Without a word before point in the block: the block's start.
+      (goto-char (point-min))
+      (search-forward "Alpha")
+      (beginning-of-line)
+      (mdview-toggle)
+      (should (= (line-number-at-pos) 3))
+      (should (bolp)))))
+
 (ert-deftest mdview-test-toggle-reuses-rendering ()
   ;; Toggling back to an unchanged source swaps the kept rendering in;
   ;; an edit, or a new width, renders again.
@@ -561,11 +622,37 @@ window, and BODY runs with it current; it is killed afterwards."
       (dolist (command '(mdview-refresh mdview-toggle-images
                          mdview-history-back mdview-history-forward
                          mdview-increase-width mdview-decrease-width
-                         mdview-reset-width))
+                         mdview-reset-width mdview-self-insert))
         (let ((err (should-error (funcall command) :type 'user-error)))
           (should (string-match-p "Not a rendered buffer" (cadr err)))))
       (should-error (mdview-set-width 80) :type 'user-error)
       (should (equal (buffer-string) "Text\n")))))
+
+(ert-deftest mdview-test-typing-edits-source ()
+  ;; A self-inserting key switches to the source at the word at point
+  ;; and inserts there, as the key would in the source; a prefix
+  ;; argument repeats it; with the option off the rendering is read-only.
+  (mdview-test-with-source (source "First\n\nSecond block here\n\nThird\n")
+    (with-current-buffer source
+      (mdview-mode 1)
+      (goto-char (point-min))
+      (search-forward "block")
+      (mdview-test-quietly (execute-kbd-macro (kbd "X")))
+      (should-not mdview--rendered)
+      (should-not mdview-mode)
+      (should (equal (buffer-string) "First\n\nSecond blockX here\n\nThird\n"))
+      (should (= (point) (+ (point-min) (length "First\n\nSecond blockX"))))
+      (mdview-mode 1)
+      (goto-char (point-min))
+      (search-forward "Third")
+      (mdview-test-quietly (execute-kbd-macro (kbd "C-u 3 !")))
+      (should (equal (buffer-string) "First\n\nSecond blockX here\n\nThird!!!\n"))
+      (mdview-mode 1)
+      (let ((mdview-edit-on-typing nil))
+        (should-error (execute-kbd-macro (kbd "Y")) :type 'buffer-read-only))
+      (should mdview--rendered)
+      (should (string-match-p "Third!!!" (buffer-string)))
+      (should-not (string-match-p "Y" (buffer-string))))))
 
 (ert-deftest mdview-test-refresh-keeps-source-line ()
   (mdview-test-with-source (source "First\n\nSecond\n\nThird\n")
@@ -582,6 +669,27 @@ window, and BODY runs with it current; it is killed afterwards."
       (should (equal (mdview-test--source-lines) '(1 3 5)))
       (should (= (mdview--source-line-at (point)) 5))
       (should-not (buffer-modified-p)))))
+
+(ert-deftest mdview-test-refresh-keeps-word ()
+  ;; Rendering again at another width keeps point on the same word.
+  (mdview-test-with-source
+      (source (concat "Intro\n\n"
+                      (mapconcat (lambda (i) (format "word%d" i))
+                                 (number-sequence 1 40) " ")
+                      "\n"))
+    (with-current-buffer source
+      (let ((mdview-max-width 60))
+        (mdview-mode 1)
+        (goto-char (point-min))
+        (search-forward "word27")
+        (backward-char 1)
+        (set-window-point (selected-window) (point))
+        (let ((mdview-max-width 30))
+          (mdview-refresh))
+        (should (= mdview--last-width 30))
+        (should (looking-at "7\\b"))
+        (should (looking-back "word2" (line-beginning-position)))
+        (should (= (window-point (selected-window)) (point)))))))
 
 ;;;; Saving, reverting, auto-revert, major modes, killing
 
@@ -1112,6 +1220,44 @@ window, and BODY runs with it current; it is killed afterwards."
       (mdview-previous-heading)
       (should (= (point) (nth 0 positions)))
       (should-error (mdview-previous-heading) :type 'user-error))))
+
+(ert-deftest mdview-test-heading-same-level-and-up ()
+  ;; C-c C-f / C-c C-b / C-c C-u with outline-mode's semantics: the
+  ;; search starts from the heading of the section point is in and a
+  ;; heading of a higher rank ends it.
+  (mdview-test-with-fake-view
+      (view (concat "intro\n"
+                    (mdview-test--heading "A" 1 "a") "\n\n"
+                    (mdview-test--heading "B" 2 "b") "\nbody of B\n\n"
+                    (mdview-test--heading "C" 3 "c") "\n\n"
+                    (mdview-test--heading "D" 2 "d") "\n\n"
+                    (mdview-test--heading "E" 1 "e") "\n"))
+    (let ((at (lambda (name)
+                (nth 0 (seq-find (lambda (heading) (equal (nth 3 heading) name))
+                                 (mdview--headings))))))
+      (goto-char (point-min))
+      (dolist (command '(mdview-forward-heading-same-level
+                         mdview-backward-heading-same-level mdview-up-heading))
+        (let ((err (should-error (funcall command) :type 'user-error)))
+          (should (string-match-p "Before first heading" (cadr err)))))
+      (search-forward "body of B")
+      (mdview-forward-heading-same-level)
+      (should (= (point) (funcall at "D")))
+      (should-error (mdview-forward-heading-same-level) :type 'user-error)
+      (mdview-backward-heading-same-level)
+      (should (= (point) (funcall at "B")))
+      (should-error (mdview-backward-heading-same-level) :type 'user-error)
+      (goto-char (funcall at "C"))
+      (should-error (mdview-forward-heading-same-level) :type 'user-error)
+      (mdview-up-heading)
+      (should (= (point) (funcall at "B")))
+      (mdview-up-heading)
+      (should (= (point) (funcall at "A")))
+      (should-error (mdview-up-heading) :type 'user-error)
+      (mdview-forward-heading-same-level)
+      (should (= (point) (funcall at "E")))
+      (mdview-backward-heading-same-level)
+      (should (= (point) (funcall at "A"))))))
 
 (ert-deftest mdview-test-imenu-index ()
   (mdview-test-with-fake-view

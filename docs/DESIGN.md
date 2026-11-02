@@ -317,7 +317,7 @@ at column 2).  `mdview-box-frame-style` = `wide` (default) | `none`
   colour (#A5A5A5 dark / #666666 light).
 - Setext headings render as H1/H2.
 - Every heading line carries text properties `mdview-heading-level` and
-  `mdview-heading-id` (for `n`/`p`, imenu and anchor links).
+  `mdview-heading-id` (for `C-c C-n`/`C-c C-p`, imenu and anchor links).
 
 ### Paragraph
 
@@ -765,8 +765,19 @@ side.)
   `olivetti-mode`) that are on are switched off before the swap and on
   again after leaving.
 - **Positions.**  A swap maps the buffer's point and every window showing
-  the buffer: source line → first block with `mdview-source-line` ≥ the
-  line; rendered position → line of the nearest preceding block →
+  the buffer to the same *word*.  The block of the position is found
+  first (in the source: the block with the greatest `mdview-source-line`
+  not after point's line, together with the blocks nested in it that
+  start on that line; in the rendering: the nearest preceding block), then
+  the word at point — a run of letters and digits, which the source and
+  the rendering share verbatim — is identified by its ordinal among the
+  equal words from the block's start and found again in the other text,
+  at the same offset into the word (`mdview--anchor`,
+  `mdview--matching-position`; the text just swapped out is read in the
+  twin).  When no word precedes point in the block, or the other text
+  lacks that occurrence (a word inside a link's URL, say), the block is
+  the fallback: source line → first block with `mdview-source-line` ≥
+  the line; rendered position → line of the nearest preceding block →
   beginning of that source line.  Each window keeps the screen row of
   its point (window start found with `vertical-motion`).  Each swap
   remembers where it put each window and where the window was
@@ -851,25 +862,72 @@ The buffer-local hooks are installed on the first rendering and stay
   window and render it; rejects directories and unreadable files with a
   `user-error`; returns the buffer), `mdview-toggle` (switch source ↔
   rendering; `C-c C-v` in the rendering), `mdview-mode`.
-- Keys while rendered: `C-c C-v` `mdview-toggle` (back to the source
-  at the line of the block at point), `g`
-  `mdview-refresh` (render again, parsing again), `TAB`/`S-TAB`
-  `mdview-next-link`/`mdview-previous-link`, `RET`/`mouse-1`/`mouse-2`
-  `mdview-follow-link`, `n`/`p` headings, `t` `mdview-toc` (completion over
-  the heading names with the heading at point as default; `imenu`'s popup
-  menu only when `imenu-use-popup-menu` is `always`), `l`/`r`
-  `mdview-history-back`/`-forward`, `i` `mdview-toggle-images`, `w`
-  `mdview-copy-link` (local links as the absolute file name they resolve
-  to, anchor kept; `C-u w` as written), `SPC`/`DEL`/`S-SPC` scroll, `<`/`>`,
-  `C->`/`C-<` `mdview-increase-width`/`mdview-decrease-width` (by
-  `mdview-width-step` columns, default 4, or the numeric prefix; then
-  `>`, `<`, `0` and `C-0` in `mdview-width-transient-map` continue or
-  reset, like the keys after `text-scale-adjust`; a step that the window
-  or the floor of 20 columns leaves nothing to do only reports that),
-  `C-0` `mdview-reset-width` (back to `mdview-max-width`; it shadows the
-  global digit argument while rendered, `C-u 0` and `M-0` remain),
-  `mdview-set-width` (M-x; 0 or nil = the default).  Commands that need
-  a rendering signal "Not a rendered buffer" elsewhere.
+- Keys while rendered (`mdview-mode-map`, issue #1).  The rules: no plain
+  printable key, so that typing edits the source (next bullet) and no
+  key is lost to evil's normal state or to habit from the source mode;
+  for everything else the `C-c` chord that outline-mode, org-mode and
+  markdown-mode bind to the same action, in that order of precedence,
+  with the keys that button buffers (Info, eww, help) and `view-mode`
+  share — `TAB`, `RET`, `SPC`, `DEL` — kept because they are the
+  universal ones.  The Info/eww letter keys of the first versions (`g`,
+  `n`, `p`, `t`, `l`, `r`, `i`, `w`, `<`, `>`) are gone; the rendering is
+  the user's own file buffer, not a special-mode buffer, and a letter
+  there should type.
+
+  | Key | Command | Precedent |
+  |---|---|---|
+  | `C-c C-v` | `mdview-toggle` | md-mode's toggle; what `mdview-install-keybinding` binds in the source |
+  | `C-c C-n` / `C-c C-p` | `mdview-next-heading` / `mdview-previous-heading` | outline (`outline-next-visible-heading`), markdown-mode |
+  | `C-c C-f` / `C-c C-b` | `mdview-forward-heading-same-level` / `mdview-backward-heading-same-level` | outline, org, markdown-mode |
+  | `C-c C-u` | `mdview-up-heading` | outline, org, markdown-mode |
+  | `C-c C-j` | `mdview-toc` | org (`org-goto`: jump to a heading with completion) |
+  | `TAB` / `S-TAB`; `C-c C-x C-n` / `C-c C-x C-p` | `mdview-next-link` / `mdview-previous-link` | buttons (`forward-button`); org (`org-next-link`) |
+  | `RET`, `mouse-1`, `mouse-2`; `C-c C-o` | `mdview-follow-link` | buttons; org (`org-open-at-point`), markdown-mode (`markdown-follow-thing-at-point`) |
+  | `C-c C-l` | `mdview-copy-link` | the link key of org and markdown-mode (`org-insert-link` edits the link at point) |
+  | `C-c <left>` / `C-c <right>`; `C-c &` | `mdview-history-back` / `mdview-history-forward` | browsers' Alt-arrows; org's `org-mark-ring-goto` returns from a followed link |
+  | `C-c C-x C-v`; `C-c C-x C-i` | `mdview-toggle-images` | org (`org-toggle-inline-images`); markdown-mode (`markdown-toggle-inline-images`) |
+  | `C-c C-r` | `mdview-refresh` | mnemonic (re-render); org's `C-c C-c` is a prefix in markdown-mode, and `g` would type |
+  | `SPC` / `DEL` / `S-SPC` | `scroll-up-command` / `scroll-down-command` | `view-mode`, Info, eww |
+  | `C->` / `C-<` / `C-0` | `mdview-increase-width` / `mdview-decrease-width` / `mdview-reset-width` | `text-scale-adjust` style, with `mdview-width-transient-map` |
+  | `[remap self-insert-command]` | `mdview-self-insert` | typing edits |
+
+  Not bound: `C-c C-b`/`C-c C-f` as help-mode's history keys (the outline
+  meaning wins), `M-,`/`C-M-,` (`xref-go-back` has its own stack), `q`
+  (the buffer is the file's), `e`/`C-x C-q` (duplicates of `C-c C-v`).
+  Under evil, normal state shadows `TAB`, `RET`, `SPC` and `DEL` with its
+  own motions; every action remains reachable through its `C-c` chord
+  (`C-c C-o` for links), and insert state's self-inserting keys reach
+  `mdview-self-insert`.  Details: `mdview-toggle` goes back to the source
+  at the word at point (§10.1 Positions); `mdview-refresh` renders again,
+  parsing again; `mdview-toc` completes over the heading names with the
+  heading at point as default (`imenu`'s popup menu only when
+  `imenu-use-popup-menu` is `always`); `mdview-copy-link` copies local
+  links as the absolute file name they resolve to, anchor kept, and with
+  a prefix argument as written; the same-level and up commands have
+  `outline-mode`'s semantics (the search starts from the heading of the
+  section point is in — `outline-back-to-heading` — and a heading of a
+  smaller level number ends it; before the first heading they signal);
+  the width keys step by `mdview-width-step` columns (default 4) or the
+  numeric prefix, then `>`, `<`, `0` and `C-0` in
+  `mdview-width-transient-map` continue or reset, like the keys after
+  `text-scale-adjust` (a step that the window or the floor of 20 columns
+  leaves nothing to do only reports that); `C-0` resets to
+  `mdview-max-width` and shadows the global digit argument while
+  rendered (`C-u 0` and `M-0` remain); `mdview-set-width` (M-x; 0 or nil
+  = the default).  Commands that need a rendering signal "Not a rendered
+  buffer" elsewhere.
+- Typing edits (`mdview-self-insert`, bound through
+  `[remap self-insert-command]`): a self-inserting key leaves the
+  rendering as `mdview-toggle` does — the buffer shows its source at the
+  word at point — and then runs what the key is bound to in the source
+  (`key-binding` of the event once the minor mode is off; normally
+  `self-insert-command`, with the numeric prefix argument still in
+  effect), setting `this-command` to it so that undo amalgamation and
+  `last-command` checks see an ordinary insertion.  A message names the
+  key that shows the rendering again.  `mdview-edit-on-typing` nil makes
+  the command signal `buffer-read-only` instead, as the key did before.
+  `SPC` and `DEL` keep scrolling: they are view-mode's keys, and only the
+  first key of a typing run is seen by the rendering.
 - Link following: `#anchor` → heading with that `mdview-heading-id` (also
   the slug of the raw anchor); `path.md[#anchor]` relative to the base
   dir (the file's directory, else `default-directory`) → visit that file
@@ -883,14 +941,17 @@ The buffer-local hooks are installed on the first rendering and stay
 - History belongs to the window (window parameter `mdview-history`,
   `(INDEX . ENTRIES)`, entry `(BUFFER FILE POINT)`): following a link to a
   Markdown file pushes the new document after the current one (dropping
-  forward entries); `l`/`r` show the neighbouring document rendered at its
-  recorded point, visiting the file again if its buffer was killed.  When
+  forward entries); `C-c <left>`/`C-c <right>` show the neighbouring
+  document rendered at its recorded point, visiting the file again if its
+  buffer was killed.  When
   the window shows a buffer that is not the history's current entry (the
   user switched buffers by other means) a fresh history starts there.
-- Re-rendering (`g`, refit, `i`, images): rendered into a hidden buffer
-  and swapped in; point stays on the block of the same source line and
-  every window keeps the block that was at its top (`set-window-start` to
-  the block's new position plus the recorded line offset).
+- Re-rendering (`C-c C-r`, refit, `C-c C-x C-v`, images): rendered into a
+  hidden buffer and swapped in; point stays on the word it was on (found
+  as in §10.1 Positions, within the block of the same source line, which
+  is the fallback) and every window keeps the block that was at its top
+  (`set-window-start` to the block's new position plus the recorded line
+  offset).
   `gc-cons-threshold` is raised to 64 MB (`gc-cons-percentage` 0.5) while
   rendering: the renderer allocates ~70 MB per MB of input.  Remote images
   that arrive later trigger one more render from

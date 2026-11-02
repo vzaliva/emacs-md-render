@@ -60,6 +60,7 @@ scripts/              dev tooling: dump.el, tmux-shot.sh (+ shot-colors.el), gui
 docs/DESIGN.md        architecture, AST contract, style specification
 docs/gallery.md       the page the README screenshots show (+ docs/gallery/ images)
 docs/screenshots/     the README gallery (regenerate with `make screenshots`)
+CHANGELOG.md          notable user-visible changes (key changes go here)
 ```
 
 ## How to work

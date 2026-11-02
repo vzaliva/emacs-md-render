@@ -147,24 +147,33 @@ Or let the package install the binding in all Markdown modes it knows about:
 |---|---|
 | `M-x mdview` | Render the current buffer in place (re-renders it if it is already rendered). |
 | `M-x mdview-file` | Visit a Markdown file and show it rendered. |
-| `M-x mdview-toggle`, `M-x mdview-mode` | Switch the buffer between its source and its rendering, keeping your position; toggling twice without moving returns exactly where you were. |
+| `M-x mdview-toggle`, `M-x mdview-mode` | Switch the buffer between its source and its rendering, keeping your position (the word at point); toggling twice without moving returns exactly where you were. |
 
-Keys in the rendered buffer (`mdview-mode`):
+Keys in the rendered buffer (`mdview-mode`) are the `C-c` chords that
+outline-mode, org-mode and markdown-mode use for the same action, plus
+the usual button keys; there are no plain letter keys, because typing
+edits:
 
 | Key | Action |
 |---|---|
-| `g` | Re-render from the source |
-| `TAB` / `S-TAB` | Next / previous link |
-| `RET`, `mouse-1`, `mouse-2` | Follow the link at point: anchors scroll to the heading, Markdown files are visited and shown rendered in the same window (with history), other local files open in Emacs, URLs in the browser; footnote references jump to their definition and back; local images open in Emacs, remote ones in the browser; an image that is itself a link follows the link |
-| `n` / `p` | Next / previous heading |
-| `t` | Table of contents: pick a heading with completion (the heading at point is the default) |
-| `l` / `r` | Back / forward through the Markdown documents followed via links in this window (the history is per window) |
-| `i` | Toggle inline images |
-| `w` | Copy the link at point: local files as the absolute file name they resolve to, URLs as written (`C-u w` always copies the raw link) |
+| any printable character | Start editing: the buffer switches to its source at the word at point and the character is inserted there (`mdview-edit-on-typing`) |
+| `C-c C-v` | Back to the source (`mdview-toggle`), at the word at point |
+| `C-c C-n` / `C-c C-p` | Next / previous heading |
+| `C-c C-f` / `C-c C-b` | Next / previous heading of the same level, within the same parent (as in outline-mode) |
+| `C-c C-u` | Up to the parent heading |
+| `C-c C-j` | Table of contents: pick a heading with completion (the heading at point is the default), like `org-goto` |
+| `TAB` / `S-TAB` (also `C-c C-x C-n` / `C-c C-x C-p`, as in org) | Next / previous link |
+| `RET`, `C-c C-o`, `mouse-1`, `mouse-2` | Follow the link at point: anchors scroll to the heading, Markdown files are visited and shown rendered in the same window (with history), other local files open in Emacs, URLs in the browser; footnote references jump to their definition and back; local images open in Emacs, remote ones in the browser; an image that is itself a link follows the link |
+| `C-c C-l` | Copy the link at point: local files as the absolute file name they resolve to, URLs as written (`C-u C-c C-l` always copies the raw link) |
+| `C-c <left>` / `C-c <right>` (also `C-c &` for back, as in org) | Back / forward through the Markdown documents followed via links in this window (the history is per window) |
+| `C-c C-x C-v` (also `C-c C-x C-i`, as in markdown-mode) | Toggle inline images |
+| `C-c C-r` | Re-render from the source |
 | `SPC` / `DEL` / `S-SPC` | Scroll down / up |
-| `<` / `>` | Beginning / end of the document |
 | `C->` / `C-<` / `C-0` | Wider / narrower text, by `mdview-width-step` columns (a numeric prefix gives the columns), and back to the default width; right after `C->` or `C-<`, plain `>`, `<` and `0` keep adjusting or reset. Most terminals cannot send these: use `M-x mdview-set-width` there (0 restores the default) |
-| `C-c C-v` | Back to the source (`mdview-toggle`) |
+
+`C-h m` lists them all.  Under evil, normal state keeps its own `TAB`,
+`RET`, `SPC` and `DEL`; the `C-c` chords still work (`C-c C-o` follows a
+link).
 
 The view re-flows when the window width or the text size changes
 (`mdview-auto-refit`): zooming the frame (`C-x C-M-+`, zoom-frm) or the
@@ -192,6 +201,9 @@ View and layout:
   windows.
 - `mdview-auto-refit` / `mdview-refit-delay` (default `t` / 0.2 s): re-flow
   when the window width changes.
+- `mdview-edit-on-typing` (default `t`): typing a character while rendered
+  switches to the source at the word at point and inserts it there;
+  `nil` keeps the rendering strictly read-only.
 - `mdview-initial-view` (default `edit`): `view` makes visited Markdown
   files open rendered.  It applies to files whose major mode derives from
   one in `mdview-markdown-modes` (default `markdown-mode`, `gfm-mode`,

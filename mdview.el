@@ -72,6 +72,15 @@ See `mdview-increase-width' and `mdview-decrease-width'."
   :type 'natnum
   :group 'mdview)
 
+(defcustom mdview-edit-on-typing t
+  "Non-nil means typing into a rendering edits the Markdown source.
+A self-inserting key pressed while a buffer is rendered switches the
+buffer to its source at the word at point and inserts the character
+there (see `mdview-self-insert').  When nil, such a key only reports
+that the rendering is read-only."
+  :type 'boolean
+  :group 'mdview)
+
 (defcustom mdview-margin 4
   "Width in columns of the left and right margins of a rendering."
   :type 'integer
@@ -239,29 +248,39 @@ See `mdview--apply-view-settings' for the values used while rendered.")
 
 (defvar mdview-mode-map
   (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "g") #'mdview-refresh)
+    ;; Typing edits the source; every other key is a `C-c' chord that
+    ;; outline-mode, org-mode or markdown-mode use for the same thing,
+    ;; or a key of buttons and `view-mode' (docs/DESIGN.md section 10.3).
+    (define-key map [remap self-insert-command] #'mdview-self-insert)
+    (define-key map (kbd "C-c C-v") #'mdview-toggle)
+    (define-key map (kbd "C-c C-n") #'mdview-next-heading)
+    (define-key map (kbd "C-c C-p") #'mdview-previous-heading)
+    (define-key map (kbd "C-c C-f") #'mdview-forward-heading-same-level)
+    (define-key map (kbd "C-c C-b") #'mdview-backward-heading-same-level)
+    (define-key map (kbd "C-c C-u") #'mdview-up-heading)
+    (define-key map (kbd "C-c C-j") #'mdview-toc)
     (define-key map (kbd "TAB") #'mdview-next-link)
     (define-key map [backtab] #'mdview-previous-link)
     (define-key map [S-tab] #'mdview-previous-link)
+    (define-key map (kbd "C-c C-x C-n") #'mdview-next-link)
+    (define-key map (kbd "C-c C-x C-p") #'mdview-previous-link)
     (define-key map (kbd "RET") #'mdview-follow-link)
+    (define-key map (kbd "C-c C-o") #'mdview-follow-link)
     (define-key map [mouse-1] #'mdview-mouse-follow-link)
     (define-key map [mouse-2] #'mdview-mouse-follow-link)
-    (define-key map (kbd "n") #'mdview-next-heading)
-    (define-key map (kbd "p") #'mdview-previous-heading)
-    (define-key map (kbd "t") #'mdview-toc)
-    (define-key map (kbd "l") #'mdview-history-back)
-    (define-key map (kbd "r") #'mdview-history-forward)
-    (define-key map (kbd "i") #'mdview-toggle-images)
-    (define-key map (kbd "w") #'mdview-copy-link)
+    (define-key map (kbd "C-c C-l") #'mdview-copy-link)
+    (define-key map (kbd "C-c &") #'mdview-history-back)
+    (define-key map (kbd "C-c <left>") #'mdview-history-back)
+    (define-key map (kbd "C-c <right>") #'mdview-history-forward)
+    (define-key map (kbd "C-c C-x C-v") #'mdview-toggle-images)
+    (define-key map (kbd "C-c C-x C-i") #'mdview-toggle-images)
+    (define-key map (kbd "C-c C-r") #'mdview-refresh)
     (define-key map (kbd "SPC") #'scroll-up-command)
     (define-key map (kbd "DEL") #'scroll-down-command)
     (define-key map (kbd "S-SPC") #'scroll-down-command)
-    (define-key map (kbd "<") #'beginning-of-buffer)
-    (define-key map (kbd ">") #'end-of-buffer)
     (define-key map (kbd "C->") #'mdview-increase-width)
     (define-key map (kbd "C-<") #'mdview-decrease-width)
     (define-key map (kbd "C-0") #'mdview-reset-width)
-    (define-key map (kbd "C-c C-v") #'mdview-toggle)
     map)
   "Keymap of `mdview-mode', active while a buffer is rendered.")
 
@@ -278,8 +297,10 @@ source, and a revert renders the reloaded text.
 
 The source is never edited by the rendering: it is kept in a hidden
 buffer while the buffer is rendered (see docs/DESIGN.md section 10).
-Indirect buffers, and buffers that have indirect buffers, cannot be
-rendered in place.
+Typing a character while rendered switches to the source at the word
+at point and inserts it there (`mdview-edit-on-typing').  Indirect
+buffers, and buffers that have indirect buffers, cannot be rendered in
+place.
 
 \\{mdview-mode-map}"
   :lighter " mdview"
@@ -534,14 +555,116 @@ portion); in the rendering, the line of the block at or before POS."
       (or (mdview--source-line-at pos) 1)
     (line-number-at-pos pos)))
 
+(defun mdview--line-start (line)
+  "Return the position of the beginning of LINE of the current text.
+Lines count from 1 in the accessible portion; past the last line the
+result is `point-max'."
+  (save-excursion
+    (goto-char (point-min))
+    (forward-line (1- line))
+    (point)))
+
 (defun mdview--position-of (line)
   "Return the position in the current text that stands for source LINE."
   (if mdview--rendered
       (mdview--source-line-position line)
+    (mdview--line-start line)))
+
+(defun mdview--anchor (pos from)
+  "Describe the word at POS by its place among the words from FROM on.
+A word is a run of letters and digits, the one thing the source and the
+rendering share verbatim.  Return (WORD INDEX OFFSET): WORD is the word
+at POS, or the last one before it; INDEX counts the occurrences of WORD
+from FROM up to and including it; OFFSET is the distance of POS from
+its start, at most its length.  Return nil when no word lies between
+FROM and POS."
+  (when (<= from pos)
     (save-excursion
-      (goto-char (point-min))
-      (forward-line (1- line))
-      (point))))
+      (goto-char (min (1+ pos) (point-max)))
+      (when (re-search-backward "[[:alnum:]]" from t)
+        (skip-chars-backward "[:alnum:]" from)
+        (let* ((start (point))
+               (end (progn (skip-chars-forward "[:alnum:]") (point)))
+               (word (buffer-substring-no-properties start end))
+               (case-fold-search nil)
+               (index 1))
+          (goto-char from)
+          (while (re-search-forward "[[:alnum:]]+" start t)
+            (when (equal (match-string-no-properties 0) word)
+              (setq index (1+ index))))
+          (list word index (min (- pos start) (- end start))))))))
+
+(defun mdview--anchor-position (anchor from to)
+  "Return the position ANCHOR names among the words between FROM and TO.
+ANCHOR comes from `mdview--anchor'; the result is nil when the
+occurrence of its word that it names is not there."
+  (pcase-let ((`(,word ,index ,offset) anchor))
+    (let ((case-fold-search nil))
+      (when (<= from to)
+        (save-excursion
+          (goto-char from)
+          (catch 'found
+            (while (re-search-forward "[[:alnum:]]+" to t)
+              (when (and (equal (match-string-no-properties 0) word)
+                         (zerop (setq index (1- index))))
+                (throw 'found (+ (match-beginning 0) offset))))
+            nil))))))
+
+(defun mdview--block-range (pos)
+  "Return the block of the rendering at or before POS, with its extent.
+The value is (LINE START END NEXT-LINE): LINE and START as in
+`mdview--block-at', END the start of the following block (or
+`point-max') and NEXT-LINE that block's source line (or nil).  Nil
+before the first block."
+  (let ((block (mdview--block-at pos)))
+    (when block
+      (let ((next (text-property-not-all (1+ (cdr block)) (point-max)
+                                         'mdview-source-line nil)))
+        (list (car block) (cdr block) (or next (point-max))
+              (and next (get-text-property next 'mdview-source-line)))))))
+
+(defun mdview--block-span (line)
+  "Return the extent in the rendering of the block containing source LINE.
+That is the block with the greatest source line not after LINE, together
+with the blocks nested in it that start on the same line: (BLOCK-LINE
+START END), or nil when every block starts after LINE."
+  (let ((best nil) (first nil) (last nil))
+    (dolist (entry (mdview--block-starts))
+      (let ((entry-line (car entry)))
+        (when (and (<= entry-line line) (or (null best) (>= entry-line best)))
+          (when (or (null best) (> entry-line best))
+            (setq first (cdr entry)))
+          (setq best entry-line
+                last (cdr entry)))))
+    (and first (list best first (nth 2 (mdview--block-range last))))))
+
+(defun mdview--matching-position (line point)
+  "Return where the word at POINT of the text swapped out is in this text.
+POINT belongs to the text now in the twin, where it stood for source
+LINE; the word at it (`mdview--anchor') is looked for in the block of
+LINE here.  Nil when there is no such word, when the block does not
+contain it, or when the twin is gone."
+  (let ((twin mdview--twin))
+    (when (buffer-live-p twin)
+      (if mdview--rendered
+          (let ((span (mdview--block-span line)))
+            (when span
+              (let ((anchor (with-current-buffer twin
+                              (mdview--anchor point (mdview--line-start
+                                                     (nth 0 span))))))
+                (and anchor
+                     (mdview--anchor-position anchor (nth 1 span) (nth 2 span))))))
+        (pcase-let ((`(,block ,anchor)
+                     (with-current-buffer twin
+                       (let ((block (mdview--block-range point)))
+                         (list block
+                               (and block (mdview--anchor point (nth 1 block))))))))
+          (when anchor
+            (let ((next (nth 3 block)))
+              (mdview--anchor-position anchor (mdview--line-start (nth 0 block))
+                                       (if (and next (> next (nth 0 block)))
+                                           (mdview--line-start next)
+                                         (point-max))))))))))
 
 (defun mdview--window-row (window)
   "Return the screen row of WINDOW's point, counted from its start."
@@ -583,14 +706,17 @@ CAPTURE comes from `mdview--capture' before the swap.  MEMORY is the
 `mdview--memory' of the previous swap when the text now current is the
 text that swap put away, else nil: a window whose point did not move
 since then gets its old point and start back exactly.  Other windows get
-the position standing for the same source line, at the same screen row.
-Return the new memory."
+the position of the word their point was on (`mdview--matching-position'),
+or failing that the block of the same source line, at the same screen
+row.  Return the new memory."
   (let ((new nil))
     (pcase-dolist (`(,window ,point ,start ,row ,line) capture)
       (let* ((remembered (assq window memory))
              (exact (and remembered (eql (nth 1 remembered) point)))
              (target (min (point-max)
-                          (if exact (nth 2 remembered) (mdview--position-of line)))))
+                          (cond (exact (nth 2 remembered))
+                                ((mdview--matching-position line point))
+                                (t (mdview--position-of line))))))
         (push (list window target point start) new)
         (cond ((null window) (goto-char target))
               ((and (window-live-p window) (eq (window-buffer window) (current-buffer)))
@@ -1033,14 +1159,19 @@ do so is reported but never prevents the kill."
 (defun mdview--render-into (buffer &optional line force-parse)
   "Render the rendered BUFFER again, keeping the position.
 Point ends up at the block rendered from source line LINE (an integer),
-or, when LINE is nil, at the block that was at point before; the windows
-showing BUFFER keep the block that was at their top.  The parsed
-document is reused unless FORCE-PARSE is non-nil.  The new rendering is
-built in a hidden buffer and swapped in, so an error, or `while-no-input'
-giving up, leaves the old rendering in place."
+or, when LINE is nil, on the word it was on before (at least on the
+same block); the windows showing BUFFER keep the block that was at
+their top.  The parsed document is reused unless FORCE-PARSE is
+non-nil.  The new rendering is built in a hidden buffer and swapped in,
+so an error, or `while-no-input' giving up, leaves the old rendering in
+place."
   (with-current-buffer buffer
     (let* ((document (mdview--source-document force-parse))
-           (line (or line (mdview--source-line-at (mdview--view-point))))
+           (pos (mdview--view-point))
+           (anchor (unless line
+                     (let ((block (mdview--block-range pos)))
+                       (and block (mdview--anchor pos (nth 1 block))))))
+           (line (or line (mdview--source-line-at pos)))
            (starts (mdview--window-starts buffer))
            (width (mdview--content-width))
            (scale (mdview--image-scale))
@@ -1061,7 +1192,12 @@ giving up, leaves the old rendering in place."
       (mdview--apply-margins width)
       (mdview--note-view-settings '(left-margin-width right-margin-width))
       (goto-char (point-min))
-      (when line (mdview--goto-source-line line))
+      (when line
+        (mdview--goto-source-line line)
+        (let* ((span (and anchor (mdview--block-span line)))
+               (target (and span (mdview--anchor-position
+                                  anchor (nth 1 span) (nth 2 span)))))
+          (when target (goto-char target))))
       (dolist (window (get-buffer-window-list buffer nil t))
         (set-window-point window (point)))
       (mdview--restore-window-starts starts))))
@@ -1102,12 +1238,12 @@ scale of the images both follow the text."
 
 (defun mdview--refit (buffer &optional line)
   "Render BUFFER again if its content width or the scale of its images changed.
-Point goes to the block of source LINE, or stays on the current block
-when LINE is nil.  The rendering is abandoned as soon as the user types
-and rescheduled for the next idle period (with LINE remembered), so a
-resize never locks Emacs up; a failure is reported in the echo area
-once rather than on every resize.  Return non-nil when a rendering
-completed."
+Point goes to the block of source LINE, or stays on the word it is on
+when LINE is nil (see `mdview--render-into').  The rendering is
+abandoned as soon as the user types and rescheduled for the next idle
+period, so a resize never locks Emacs up; a failure is reported in the
+echo area once rather than on every resize.  Return non-nil when a
+rendering completed."
   (when (mdview--view-p buffer)
     (with-current-buffer buffer
       (setq mdview--refit-timer nil)
@@ -1116,21 +1252,20 @@ completed."
                    (not (and (eql (mdview--content-width window)
                                   mdview--last-width)
                              (eql (mdview--image-scale) mdview--last-scale))))
-          (let ((line (or line (mdview--source-line-at (mdview--view-point)))))
-            (condition-case err
-                (if (while-no-input (mdview--render-into buffer line) nil)
-                    (progn
-                      (setq mdview--refit-timer
-                            (run-with-idle-timer mdview-refit-delay nil
-                                                 #'mdview--refit buffer line))
-                      nil)
-                  t)
-              (error
-               ;; Do not retry at this size on every subsequent resize.
-               (setq mdview--last-width (mdview--content-width window)
-                     mdview--last-scale (mdview--image-scale))
-               (message "mdview: %s" (error-message-string err))
-               nil))))))))
+          (condition-case err
+              (if (while-no-input (mdview--render-into buffer line) nil)
+                  (progn
+                    (setq mdview--refit-timer
+                          (run-with-idle-timer mdview-refit-delay nil
+                                               #'mdview--refit buffer line))
+                    nil)
+                t)
+            (error
+             ;; Do not retry at this size on every subsequent resize.
+             (setq mdview--last-width (mdview--content-width window)
+                   mdview--last-scale (mdview--image-scale))
+             (message "mdview: %s" (error-message-string err))
+             nil)))))))
 
 (defun mdview--cancel-image-update ()
   "Cancel the pending image re-rendering timer of this buffer, if any."
@@ -1553,6 +1688,29 @@ row; toggling twice without moving returns to the exact old position."
   (unless mdview--rendered
     (user-error "Not a rendered buffer (use M-x mdview to render this one)")))
 
+(defun mdview-self-insert ()
+  "Switch to the Markdown source and type the key there.
+Every self-inserting key runs this while a buffer is rendered (the
+keymap remaps `self-insert-command'): the buffer goes back to its
+source at the word at point, as `mdview-toggle' does, and the key is
+then handled as the source handles it, normally `self-insert-command'
+inserting it (repeatedly with a numeric prefix argument).  Typing into
+the rendering thus edits the document without an explicit switch.  When
+`mdview-edit-on-typing' is nil the key reports that the buffer is
+read-only instead."
+  (interactive)
+  (mdview--check-view)
+  (unless mdview-edit-on-typing
+    (barf-if-buffer-read-only))
+  (mdview-mode -1)
+  (let ((command (key-binding (vector last-command-event) t)))
+    (unless (and (commandp command) (not (eq command 'mdview-self-insert)))
+      (setq command #'self-insert-command))
+    (setq this-command command)
+    (message "Editing the source (%s shows the rendering again)"
+             (substitute-command-keys "\\[mdview-toggle]"))
+    (call-interactively command)))
+
 (defun mdview-refresh ()
   "Render the buffer again from its source, keeping the current block."
   (interactive)
@@ -1625,6 +1783,62 @@ references and definitions jump to each other."
                             (reverse (mdview--headings)))))
     (unless previous (user-error "No previous heading"))
     (goto-char (nth 0 previous))))
+
+(defun mdview--heading-index ()
+  "Return (INDEX . HEADINGS): the headings and the index of the one at point.
+The heading at point is the last one starting at or before point, the
+heading of the section point is in, as `outline-back-to-heading' finds
+it; before the first heading signal a `user-error'."
+  (let ((headings (mdview--headings))
+        (index nil)
+        (i 0))
+    (dolist (heading headings)
+      (when (<= (nth 0 heading) (point))
+        (setq index i))
+      (setq i (1+ i)))
+    (unless index (user-error "Before first heading"))
+    (cons index headings)))
+
+(defun mdview-forward-heading-same-level ()
+  "Move to the next heading of the same level as the heading at point.
+As with `outline-forward-same-level', the search starts from the heading
+of the section point is in and stops at a heading of a higher rank (a
+smaller level number)."
+  (interactive)
+  (pcase-let* ((`(,index . ,headings) (mdview--heading-index))
+               (level (nth 1 (nth index headings)))
+               (target (seq-find (lambda (heading) (<= (nth 1 heading) level))
+                                 (nthcdr (1+ index) headings))))
+    (unless (and target (= (nth 1 target) level))
+      (user-error "No following same-level heading"))
+    (goto-char (nth 0 target))))
+
+(defun mdview-backward-heading-same-level ()
+  "Move to the previous heading of the same level as the heading at point.
+As with `outline-backward-same-level', the search starts from the
+heading of the section point is in and stops at a heading of a higher
+rank (a smaller level number)."
+  (interactive)
+  (pcase-let* ((`(,index . ,headings) (mdview--heading-index))
+               (level (nth 1 (nth index headings)))
+               (target (seq-find (lambda (heading) (<= (nth 1 heading) level))
+                                 (reverse (seq-take headings index)))))
+    (unless (and target (= (nth 1 target) level))
+      (user-error "No previous same-level heading"))
+    (goto-char (nth 0 target))))
+
+(defun mdview-up-heading ()
+  "Move to the heading the heading at point is a subheading of.
+As with `outline-up-heading', that is the nearest previous heading of a
+higher rank (a smaller level number) than the heading of the section
+point is in."
+  (interactive)
+  (pcase-let* ((`(,index . ,headings) (mdview--heading-index))
+               (level (nth 1 (nth index headings)))
+               (target (seq-find (lambda (heading) (< (nth 1 heading) level))
+                                 (reverse (seq-take headings index)))))
+    (unless target (user-error "Already at top level of the outline"))
+    (goto-char (nth 0 target))))
 
 (defun mdview--toc-default (index)
   "Return the label in the imenu INDEX of the heading at or before point."
