@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Capture how text-mode Emacs renders FILE with mdview, using a private tmux
+# server so the user's own tmux sessions are untouched.
+#
+# Usage: scripts/tmux-shot.sh FILE [COLUMNS] [ROWS] [THEME]
+#   THEME: "dark" (default, modus-vivendi) or "light" (modus-operandi)
+# Output: /tmp/mdview-shots/<name>-<theme>.txt  (plain text, full buffer)
+#         /tmp/mdview-shots/<name>-<theme>.ansi (tmux capture with colours)
+#         /tmp/mdview-shots/<name>-<theme>.png  (if uv + rsvg-convert exist)
+set -euo pipefail
+here=$(cd "$(dirname "$0")/.." && pwd)
+file=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+cols=${2:-110}
+rows=${3:-60}
+theme=${4:-dark}
+case $theme in dark) emtheme=modus-vivendi;; light) emtheme=modus-operandi;; *) emtheme=$theme;; esac
+name=$(basename "$file" .md)
+out=/tmp/mdview-shots
+mkdir -p "$out"
+sock=mdview-shot-$$
+tmux -L "$sock" new-session -d -s shot -x "$cols" -y "$rows" \
+  "TERM=xterm-256color $EMACS_BIN emacs -nw -Q -L '$here' --eval \"(progn (load-theme '$emtheme t) (require 'mdview) (setq mdview-auto-refit nil) (mdview-file \\\"$file\\\"))\"" 2>/dev/null || \
+tmux -L "$sock" new-session -d -s shot -x "$cols" -y "$rows" \
+  "TERM=xterm-256color emacs -nw -Q -L '$here' --eval \"(progn (load-theme '$emtheme t) (require 'mdview) (setq mdview-auto-refit nil) (mdview-file \\\"$file\\\"))\""
+sleep 4
+tmux -L "$sock" capture-pane -t shot -p -e -S 0 -E "$((rows-1))" > "$out/$name-$theme.ansi"
+tmux -L "$sock" capture-pane -t shot -p > "$out/$name-$theme.screen.txt"
+# Scroll through the whole document, capturing each page.
+page=0
+: > "$out/$name-$theme.pages.ansi"
+while [ $page -lt 40 ]; do
+  tmux -L "$sock" capture-pane -t shot -p -e >> "$out/$name-$theme.pages.ansi"
+  echo "----- page $page -----" >> "$out/$name-$theme.pages.ansi"
+  before=$(tmux -L "$sock" capture-pane -t shot -p | md5)
+  tmux -L "$sock" send-keys -t shot C-v
+  sleep 0.5
+  after=$(tmux -L "$sock" capture-pane -t shot -p | md5)
+  [ "$before" = "$after" ] && break
+  page=$((page+1))
+done
+tmux -L "$sock" kill-server 2>/dev/null || true
+if command -v uv >/dev/null && command -v rsvg-convert >/dev/null; then
+  "$here/scripts/ansi-to-png.sh" "$out/$name-$theme.ansi" "$out/$name-$theme.png" "$cols" || true
+fi
+echo "captured $out/$name-$theme.{ansi,screen.txt,pages.ansi}"

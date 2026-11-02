@@ -1,0 +1,10 @@
+*.elc
+*~
+\#*\#
+.\#*
+/test/commonmark/spec.json
+/test/out/
+/.eask/
+/dist/
+.DS_Store
+__pycache__/
