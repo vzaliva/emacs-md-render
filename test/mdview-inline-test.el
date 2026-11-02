@@ -10,7 +10,8 @@
 ;; algorithm, strikethrough, inline and reference links, images,
 ;; autolinks (angle brackets and the GFM bare forms, on and off), raw
 ;; inline HTML, hard and soft breaks, footnote references, text merging,
-;; Unicode, and robustness on pathological inputs.
+;; Unicode, robustness on pathological inputs, and source positions
+;; (`mdview-pos' on text, `:pos' on code spans and raw HTML).
 ;;
 ;; Results are compared as compact s-expressions produced by
 ;; `mdview-inline-test--sexp': a text node is its string, every other
@@ -1236,6 +1237,256 @@ Without the memo this 1.1 MB input took about 8 s (x8 per doubling)."
           (let ((nodes (mdview-inline-parse slice hash)))
             (should (cl-every #'mdview-inline-test--well-formed-p nodes))
             (should (stringp (mdview-node-text (cons 'paragraph (cons nil nodes)))))))))))
+
+;;;; Source positions
+
+;; Text strings carry `mdview-pos', the content offset (index into the
+;; parsed string) of the first source character of each run; `code' and
+;; `html-inline' nodes carry `:pos' (docs/DESIGN.md section 3, invariant
+;; R1).  The oracle below checks every run of every text string against
+;; the input.
+
+(defun mdview-inline-test--stretches (string)
+  "Return the `mdview-pos' stretches of STRING as (START END VALUE) lists.
+A stretch is a maximal range of equal values; characters without the
+property form stretches with VALUE nil."
+  (let ((start 0) (out nil) (len (length string)))
+    (while (< start len)
+      (let ((end (or (next-single-property-change start 'mdview-pos string) len)))
+        (push (list start end (get-text-property start 'mdview-pos string)) out)
+        (setq start end)))
+    (nreverse out)))
+
+(defun mdview-inline-test--positioned (nodes)
+  "Return the positioned pieces of NODES in document order.
+Each is (STRING) for a text string, or (TYPE POS TEXT) for a `code' or
+`html-inline' node."
+  (let ((out nil))
+    (dolist (node nodes)
+      (cond
+       ((stringp node) (push (list node) out))
+       ((memq (mdview-node-type node) '(code html-inline))
+        (push (list (mdview-node-type node) (mdview-node-prop node :pos)
+                    (car (mdview-node-children node)))
+              out))
+       (t (setq out (append (reverse (mdview-inline-test--positioned
+                                      (mdview-node-children node)))
+                            out)))))
+    (nreverse out)))
+
+(defun mdview-inline-test--source-matches-p (input value text)
+  "Return non-nil when TEXT is what INPUT holds at offset VALUE.
+TEXT must be INPUT's characters from VALUE on, except that a run whose
+source starts with an entity reference must be exactly that entity
+decoded.  A backslash escape points at the escaped character, so it
+matches as is."
+  (or (and (<= (+ value (length text)) (length input))
+           (string= text (substring-no-properties
+                          input value (+ value (length text)))))
+      (and (< value (length input))
+           (eq (aref input value) ?&)
+           (eq (string-match mdview-inline--entity-regexp input value) value)
+           (string= text (mdview-ast-decode-entities (match-string 0 input))))))
+
+(defun mdview-inline-test--check-positions (input &optional refs)
+  "Assert the source positions of parsing INPUT with REFS.
+Every character of every text string has `mdview-pos'; every stretch
+reads the input at its offset (see `mdview-inline-test--source-matches-p');
+`code' and `html-inline' `:pos' point at their text; and the offsets
+grow strictly in document order."
+  (let ((last -1))
+    (dolist (piece (mdview-inline-test--positioned (mdview-inline-parse input refs)))
+      (if (null (cdr piece))
+          (dolist (stretch (mdview-inline-test--stretches (car piece)))
+            (pcase-let* ((`(,start ,end ,value) stretch)
+                         (text (substring-no-properties (car piece) start end)))
+              (should (equal (list input text (natnump value))
+                             (list input text t)))
+              (should (equal (list input text value
+                                   (and (mdview-inline-test--source-matches-p
+                                         input value text)
+                                        t))
+                             (list input text value t)))
+              (should (equal (list input text (> value last)) (list input text t)))
+              (setq last value)))
+        (pcase-let ((`(,type ,pos ,text) piece))
+          (should (equal (list input type (natnump pos)) (list input type t)))
+          (should (equal (list input type
+                               (subst-char-in-string
+                                ?\n ?\s (substring input pos
+                                                   (min (length input)
+                                                        (+ pos (length text))))))
+                         (list input type text)))
+          (should (> pos last))
+          (setq last pos))))))
+
+(defconst mdview-inline-test--position-inputs
+  '("plain text"
+    "*emphasis* and _more_ text"
+    "**strong** and __strong__"
+    "***both*** and *a **b** c* and **a *b* c**"
+    "***foo**" "**foo***" "*foo**" "**foo*" "***foo* bar**" "*a* **b *c***"
+    "a * b ** c _ d" "*foo bar *" "foo*bar*baz" "_foo_bar_" "**x*y*z**"
+    "~~strike~~ and ~one~ and ~~~three~~~"
+    "[link](/url \"title\") and [link 2](</a b> 'single')"
+    "[*emph* `code` link](/u (paren title))"
+    "![image *alt*](/i.png \"t\") and ![](/empty)"
+    "[ref] and [full][ref] and [coll][] and [Ref]"
+    "[a [b] c](/u)" "[a](b) ]] [[ ! ![ x" "[unclosed *em* link" "[link](/u)x"
+    "`code` and `` co`de `` and ` ` and `  ` and `a\nb`"
+    "`unclosed and ``also"
+    "&amp; &copy; &#35; &#x22; &nosuch; & alone &amp"
+    "\\*not\\* \\\\ \\a \\` \\[x\\] \\&amp; end\\"
+    "hard  \nbreak and back\\\nslash and soft\n   break"
+    "trailing   \n  lead"
+    "<http://example.com/a?b> and <mailto:x@y.z> and <me@example.org>"
+    "<a href=\"x\">tag</a> <br/> <!-- c --> <?pi?> <!D x> <![CDATA[y]]>"
+    "a < b and <notatag and <3"
+    "see www.example.com, http://a.b/c?d (and https://x.y/z) or me@ex.org."
+    "*www.inside.em* and [www.in.link](/u) and `www.code`"
+    "ftp://f.example/x www.a_b.c www.x.org.)"
+    "foot[^1] note [^note] and [^bad label]"
+    "mixed: *a [b `c` d](/u) e* &lt;f&gt; \\_g\\_ <h> **i**"
+    "日本語 **太字** テスト 😀 *a* 👍🏽"
+    "")
+  "Inputs for the position oracle.")
+
+(defun mdview-inline-test--position-refs ()
+  "Return the reference map used with `mdview-inline-test--position-inputs'."
+  (mdview-inline-test--refs '("ref" "/ref" "Ref title") '("coll" "/coll")
+                            '("full" "/full")))
+
+(ert-deftest mdview-inline-test-positions-oracle ()
+  "Every run of every text string maps back to the input it came from."
+  (let ((refs (mdview-inline-test--position-refs)))
+    (dolist (autolinks '(t nil))
+      (let ((mdview-inline-extended-autolinks autolinks))
+        (dolist (input mdview-inline-test--position-inputs)
+          (mdview-inline-test--check-positions input)
+          (mdview-inline-test--check-positions input refs))))))
+
+(ert-deftest mdview-inline-test-positions-oracle-fixtures ()
+  "The oracle holds for every paragraph-sized chunk of the fixtures."
+  (let ((refs (mdview-inline-test--position-refs)))
+    (dolist (file (directory-files
+                   (expand-file-name "test/fixtures" mdview-inline-test--root)
+                   t "\\.md\\'"))
+      (dolist (chunk (split-string
+                      (with-temp-buffer (insert-file-contents file) (buffer-string))
+                      "\n\n+" t))
+        (mdview-inline-test--check-positions chunk refs)))))
+
+(ert-deftest mdview-inline-test-positions-text-runs ()
+  "Text runs, escapes, entities and literal characters get exact offsets."
+  (pcase-let ((`(,s) (mdview-inline-parse "a\\*b&amp;c\\d<e" nil)))
+    ;; a=0, \*=1-2 (the `*' at 2), b=3, &amp;=4-8, c=9, \=10, d=11, <=12, e=13.
+    (should (equal (substring-no-properties s) "a*b&c\\d<e"))
+    (should (equal (mapcar #'caddr (mdview-inline-test--stretches s))
+                   '(0 2 3 4 9 10 11 12 13)))
+    (should (equal (mapcar (lambda (i) (mdview-ast-pos-at i s)) (number-sequence 0 8))
+                   '(0 2 3 4 9 10 11 12 13))))
+  (pcase-let ((`(,s) (mdview-inline-parse "hello world" nil)))
+    (should (equal (mdview-inline-test--stretches s) '((0 11 0))))
+    (should (= (mdview-ast-pos-at 6 s) 6))))
+
+(ert-deftest mdview-inline-test-positions-emphasis-leftovers ()
+  "Delimiter runs cut by emphasis keep exact offsets.
+The used delimiters are the inner ones: an opener loses its end, a
+closer its start."
+  (pcase-let ((`(,star (strong nil ,foo)) (mdview-inline-parse "***foo**" nil)))
+    (should (equal star "*"))
+    (should (= (get-text-property 0 'mdview-pos star) 0))
+    (should (= (get-text-property 0 'mdview-pos foo) 3)))
+  (pcase-let ((`((strong nil ,foo) ,star) (mdview-inline-parse "**foo***" nil)))
+    (should (equal star "*"))
+    (should (= (get-text-property 0 'mdview-pos foo) 2))
+    (should (= (get-text-property 0 'mdview-pos star) 7)))
+  (pcase-let ((`((emphasis nil ,foo) ,rest) (mdview-inline-parse "*foo***x" nil)))
+    (should (equal rest "**x"))
+    (should (= (get-text-property 0 'mdview-pos foo) 1))
+    (should (equal (mapcar #'caddr (mdview-inline-test--stretches rest)) '(5 7))))
+  ;; The closer `***' is used up by two matches; one `*' of the opener
+  ;; is left over at its start.
+  (pcase-let ((`(,star (strong nil ,a (emphasis nil ,b)))
+               (mdview-inline-parse "***a *b***" nil)))
+    (should (equal star "*"))
+    (should (= (get-text-property 0 'mdview-pos star) 0))
+    (should (= (get-text-property 0 'mdview-pos a) 3))
+    (should (= (get-text-property 0 'mdview-pos b) 6))))
+
+(ert-deftest mdview-inline-test-positions-code-span ()
+  "`code' nodes carry `:pos', the offset of their first content character."
+  (should (equal (mdview-inline-parse "a `b c`" nil) '("a " (code (:pos 3) "b c"))))
+  (should (equal (mdview-node-props (cadr (mdview-inline-parse "a `b c`" nil)))
+                 '(:pos 3)))
+  ;; One space stripped on each side: the content starts one further.
+  (should (equal (mdview-node-props (car (mdview-inline-parse "`` a ``" nil)))
+                 '(:pos 3)))
+  (should (equal (mdview-node-props (car (mdview-inline-parse "` `` `" nil)))
+                 '(:pos 2)))
+  ;; Only spaces, or a space on one side only: nothing is stripped.
+  (should (equal (mdview-node-props (car (mdview-inline-parse "`  `" nil)))
+                 '(:pos 1)))
+  (should (equal (mdview-node-props (car (mdview-inline-parse "` a`" nil)))
+                 '(:pos 1)))
+  ;; A line ending becomes a space and keeps the length.
+  (should (equal (mdview-node-props (nth 2 (mdview-inline-parse "x\n`a\nb`" nil)))
+                 '(:pos 3)))
+  ;; An unmatched run is text at its first backtick.
+  (pcase-let ((`(,s ,_) (mdview-inline-parse "a ``b`c`" nil)))
+    (should (equal (mapcar #'caddr (mdview-inline-test--stretches s)) '(0 2 4)))))
+
+(ert-deftest mdview-inline-test-positions-html-inline ()
+  "`html-inline' nodes carry `:pos', the offset of their `<'."
+  (should (equal (mapcar (lambda (n) (and (consp n) (mdview-node-prop n :pos)))
+                         (mdview-inline-parse "a <b>c</b> <!-- d -->" nil))
+                 '(nil 2 nil 6 nil 11))))
+
+(ert-deftest mdview-inline-test-positions-links-and-breaks ()
+  "Link text, autolinks, brackets and text after breaks get exact offsets."
+  (pcase-let ((`((link ,_ ,text) ,rest) (mdview-inline-parse "[ab](/u) ]" nil)))
+    (should (= (get-text-property 0 'mdview-pos text) 1))
+    (should (equal (mapcar #'caddr (mdview-inline-test--stretches rest)) '(8 9))))
+  (pcase-let ((`((link ,_ ,uri) ,_ (link ,_ ,mail))
+               (mdview-inline-parse "<http://a.b> <me@x.org>" nil)))
+    (should (= (get-text-property 0 'mdview-pos uri) 1))
+    (should (= (get-text-property 0 'mdview-pos mail) 14)))
+  (pcase-let ((`(,a ,_ ,b) (mdview-inline-parse "a  \nb" nil)))
+    (should (equal (list a b) '("a" "b")))
+    (should (equal (list (get-text-property 0 'mdview-pos a)
+                         (get-text-property 0 'mdview-pos b))
+                   '(0 4))))
+  (pcase-let ((`(,_ ,_ ,b) (mdview-inline-parse "a\\\n   b" nil)))
+    (should (= (get-text-property 0 'mdview-pos b) 6)))
+  (pcase-let ((`(,a ,_ ,b) (mdview-inline-parse "x[^1] y" nil)))
+    (should (equal (list (get-text-property 0 'mdview-pos a)
+                         (get-text-property 0 'mdview-pos b))
+                   '(0 5)))))
+
+(ert-deftest mdview-inline-test-positions-autolink-split ()
+  "Bare URLs split out of a text run are re-based on both sides."
+  (let ((mdview-inline-extended-autolinks t))
+    (pcase-let ((`(,a ,_ ,b (link ,props ,url) ,c (link ,_ ,mail) ,d)
+                 (mdview-inline-parse "x *y* see www.ex.org, or me@ex.org." nil)))
+      (should (equal (list a b c d) '("x " " see " ", or " ".")))
+      (should (equal (plist-get props :url) "http://www.ex.org"))
+      ;; The link's URL is a plain string; only text carries positions.
+      (should-not (text-properties-at 0 (plist-get props :url)))
+      (should (equal (mapcar (lambda (s) (get-text-property 0 'mdview-pos s))
+                             (list a b url c mail d))
+                     '(0 5 10 20 25 34)))
+      (should (equal (mdview-inline-test--stretches url) '((0 10 10))))
+      (should (= (mdview-ast-pos-at 3 c) 23)))))
+
+(ert-deftest mdview-inline-test-positions-degraded ()
+  "Input nested too deeply degrades to one string with `mdview-pos' 0."
+  (let* ((mdview-inline-max-depth 2)
+         (input "*a **b *c* d** e*")
+         (nodes (mdview-inline-parse input nil)))
+    (should (equal nodes (list input)))
+    (should (equal (mdview-inline-test--stretches (car nodes))
+                   (list (list 0 (length input) 0))))
+    (should (= (mdview-ast-pos-at 7 (car nodes)) 7))))
 
 (provide 'mdview-inline-test)
 ;;; mdview-inline-test.el ends here

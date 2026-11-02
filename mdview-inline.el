@@ -34,6 +34,11 @@
 ;; `mdview-inline-max-depth' degrades the whole text to one text node so
 ;; that no consumer of the tree can exhaust the Lisp stack.
 ;;
+;; Every text piece records where it came from: the text property
+;; `mdview-pos' holds the offset into the parsed string of the first
+;; source character of the piece, and `code' and `html-inline' nodes
+;; carry `:pos' (see `mdview-inline-parse').
+;;
 ;; GFM extensions: strikethrough (`~' and `~~', runs of equal length
 ;; match), footnote references `[^label]' (the block parser numbers them
 ;; and turns undefined ones back into text), and extended autolinks for
@@ -163,9 +168,24 @@ closers linear overall, as in cmark.")
           (mdview-inline--node-prev node) nil
           (mdview-inline--node-next node) nil)))
 
-(defun mdview-inline--add-text (root string)
-  "Append a text node holding STRING to ROOT and return it."
-  (let ((node (mdview-inline--make-node :type 'text :text string)))
+(defun mdview-inline--offset (&optional position)
+  "Return the content offset of buffer POSITION (default: point).
+The scratch buffer holds the parsed string from position 1 on, so the
+offset into the string is one less than the buffer position."
+  (1- (or position (point))))
+
+(defun mdview-inline--text (string pos)
+  "Return a copy of STRING with `mdview-pos' POS over its whole length.
+POS is the content offset of the first source character STRING stands
+for (see `mdview-inline-parse')."
+  (propertize string 'mdview-pos pos))
+
+(defun mdview-inline--add-text (root string pos)
+  "Append a text node holding STRING to ROOT and return it.
+POS is the content offset of the first source character of STRING; it
+becomes the text property `mdview-pos' of the whole text."
+  (let ((node (mdview-inline--make-node
+               :type 'text :text (mdview-inline--text string pos))))
     (mdview-inline--append-child root node)
     node))
 
@@ -408,9 +428,11 @@ Point moves past the destination on success."
       (mdview-inline--add-node root 'hard-break)
       (skip-chars-forward " \t"))
      ((and (not (eobp)) (mdview-inline--escapable-p c))
-      (forward-char)
-      (mdview-inline--add-text root (string c)))
-     (t (mdview-inline--add-text root "\\")))))
+      ;; The escaped character stands for itself: point at it, not at
+      ;; the backslash.
+      (mdview-inline--add-text root (string c) (mdview-inline--offset))
+      (forward-char))
+     (t (mdview-inline--add-text root "\\" (mdview-inline--offset (1- (point))))))))
 
 (defun mdview-inline--parse-backticks (root)
   "Parse the backtick run at point under ROOT: a code span or literal text.
@@ -437,51 +459,59 @@ its length is rejected without scanning again."
       (if (not found)
           (progn (goto-char after-open)
                  (mdview-inline--add-text
-                  root (buffer-substring-no-properties start after-open)))
+                  root (buffer-substring-no-properties start after-open)
+                  (mdview-inline--offset start)))
         (let ((content (subst-char-in-string
-                        ?\n ?\s (buffer-substring-no-properties after-open found))))
+                        ?\n ?\s (buffer-substring-no-properties after-open found)))
+              (pos (mdview-inline--offset after-open)))
           (when (and (> (length content) 1)
                      (eq (aref content 0) ?\s)
                      (eq (aref content (1- (length content))) ?\s)
                      (string-match-p "[^ ]" content))
-            (setq content (substring content 1 -1)))
-          (mdview-inline--add-node root 'code nil content))))))
+            (setq content (substring content 1 -1)
+                  pos (1+ pos)))
+          (mdview-inline--add-node root 'code (list :pos pos) content))))))
 
 (defun mdview-inline--parse-entity (root)
   "Parse the entity reference at point under ROOT, or a literal ampersand."
   (if (looking-at mdview-inline--entity-regexp)
       (progn
         (mdview-inline--add-text
-         root (mdview-ast-decode-entities (match-string-no-properties 0)))
+         root (mdview-ast-decode-entities (match-string-no-properties 0))
+         (mdview-inline--offset))
         (goto-char (match-end 0)))
-    (forward-char)
-    (mdview-inline--add-text root "&")))
+    (mdview-inline--add-text root "&" (mdview-inline--offset))
+    (forward-char)))
 
 (defun mdview-inline--parse-autolink (root)
   "Parse an angle-bracket autolink at point under ROOT; return non-nil if so."
   (cond
    ((looking-at mdview-inline--email-autolink-regexp)
-    (let ((address (match-string-no-properties 1)))
+    (let ((address (match-string-no-properties 1))
+          (pos (mdview-inline--offset (match-beginning 1))))
       (goto-char (match-end 0))
       (mdview-inline--append-child
        (mdview-inline--add-node root 'link
                                 (list :url (concat "mailto:" address)
                                       :title nil :autolink t))
-       (mdview-inline--make-node :type 'text :text address))
+       (mdview-inline--make-node :type 'text
+                                 :text (mdview-inline--text address pos)))
       t))
    ((looking-at mdview-inline--uri-autolink-regexp)
-    (let ((uri (match-string-no-properties 1)))
+    (let ((uri (match-string-no-properties 1))
+          (pos (mdview-inline--offset (match-beginning 1))))
       (goto-char (match-end 0))
       (mdview-inline--append-child
        (mdview-inline--add-node root 'link (list :url uri :title nil :autolink t))
-       (mdview-inline--make-node :type 'text :text uri))
+       (mdview-inline--make-node :type 'text :text (mdview-inline--text uri pos)))
       t))))
 
 (defun mdview-inline--parse-html (root)
   "Parse raw inline HTML at point under ROOT; return non-nil if recognised."
   (let ((end (mdview-inline--scan-html)))
     (when end
-      (mdview-inline--add-node root 'html-inline nil
+      (mdview-inline--add-node root 'html-inline
+                               (list :pos (mdview-inline--offset))
                                (buffer-substring-no-properties (point) end))
       (goto-char end)
       t)))
@@ -494,9 +524,10 @@ its length is rejected without scanning again."
   (if (looking-at mdview-inline--text-run-regexp)
       (progn
         (mdview-inline--add-text
-         root (buffer-substring-no-properties (point) (match-end 0)))
+         root (buffer-substring-no-properties (point) (match-end 0))
+         (mdview-inline--offset))
         (goto-char (match-end 0)))
-    (mdview-inline--add-text root (string (following-char)))
+    (mdview-inline--add-text root (string (following-char)) (mdview-inline--offset))
     (forward-char)))
 
 ;;;; Delimiters
@@ -510,7 +541,8 @@ an entry of the delimiter stack."
          (count (progn (skip-chars-forward (string c)) (- (point) start)))
          (after (if (eobp) ?\n (following-char)))
          (node (mdview-inline--add-text
-                root (buffer-substring-no-properties start (point)))))
+                root (buffer-substring-no-properties start (point))
+                (mdview-inline--offset start))))
     (unless (and (eq c ?~) (> count 2))
       (let* ((after-ws (mdview-inline--whitespace-p after))
              (after-p (mdview-inline--punctuation-p after))
@@ -582,10 +614,14 @@ Return the delimiter to continue with."
                             (t 'emphasis)))))
     (cl-decf (mdview-inline--delim-count opener) use)
     (cl-decf (mdview-inline--delim-count closer) use)
+    ;; The delimiters used are the inner ones: the opener loses its
+    ;; last USE characters, so its `mdview-pos' stays; the closer loses
+    ;; its first USE, so `mdview-ast-substring' moves its `mdview-pos'
+    ;; on by USE (invariant R1 of docs/DESIGN.md section 3).
     (setf (mdview-inline--node-text opener-node)
           (substring (mdview-inline--node-text opener-node) 0 (- use)))
     (setf (mdview-inline--node-text closer-node)
-          (substring (mdview-inline--node-text closer-node) use))
+          (mdview-ast-substring (mdview-inline--node-text closer-node) use))
     (let ((tmp (mdview-inline--node-next opener-node)))
       (while (and tmp (not (eq tmp closer-node)))
         (let ((next (mdview-inline--node-next tmp)))
@@ -661,17 +697,20 @@ IMAGE non-nil means the bracket belongs to an image (`![')."
         (mdview-inline--add-node root 'footnote-reference
                                  (list :label (match-string-no-properties 1)))
         (goto-char (match-end 0)))
-    (forward-char)
-    (mdview-inline--add-bracket (mdview-inline--add-text root "[") (point) nil)))
+    (let ((node (mdview-inline--add-text root "[" (mdview-inline--offset))))
+      (forward-char)
+      (mdview-inline--add-bracket node (point) nil))))
 
 (defun mdview-inline--parse-bang (root)
   "Parse the `!' at point under ROOT: an image opener when `[' follows."
-  (forward-char)
-  (if (eq (following-char) ?\[)
-      (progn
-        (forward-char)
-        (mdview-inline--add-bracket (mdview-inline--add-text root "![") (point) t))
-    (mdview-inline--add-text root "!")))
+  (let ((pos (mdview-inline--offset)))
+    (forward-char)
+    (if (eq (following-char) ?\[)
+        (progn
+          (forward-char)
+          (mdview-inline--add-bracket (mdview-inline--add-text root "![" pos)
+                                      (point) t))
+      (mdview-inline--add-text root "!" pos))))
 
 (defun mdview-inline--scan-inline-link ()
   "Scan `(destination \"title\")' at point (just after a `]').
@@ -758,10 +797,10 @@ so that links never nest."
     (forward-char)
     (cond
      ((null opener)
-      (mdview-inline--add-text root "]"))
+      (mdview-inline--add-text root "]" (mdview-inline--offset close-pos)))
      ((not (mdview-inline--bracket-active opener))
       (mdview-inline--remove-bracket)
-      (mdview-inline--add-text root "]"))
+      (mdview-inline--add-text root "]" (mdview-inline--offset close-pos)))
      (t
       (let ((target (or (mdview-inline--scan-inline-link)
                         (mdview-inline--lookup-reference opener close-pos))))
@@ -769,7 +808,7 @@ so that links never nest."
             (mdview-inline--close-link root opener target)
           (mdview-inline--remove-bracket)
           (goto-char (1+ close-pos))
-          (mdview-inline--add-text root "]")))))))
+          (mdview-inline--add-text root "]" (mdview-inline--offset close-pos))))))))
 
 ;;;; GFM extended autolinks (post-pass over text)
 
@@ -863,8 +902,9 @@ Unlike an unanchored `string-match' this never scans past the prefix."
             (let ((end (mdview-inline--trim-autolink-end string start i)))
               (when (> end scheme-end)
                 (cons end (if www
-                              (concat "http://" (substring string start end))
-                            (substring string start end)))))))))))
+                              (concat "http://"
+                                      (substring-no-properties string start end))
+                            (substring-no-properties string start end)))))))))))
 
 (defun mdview-inline--local-part-char-p (c)
   "Return non-nil when C may appear before the `@' of an e-mail address."
@@ -889,7 +929,8 @@ Unlike an unanchored `string-match' this never scans past the prefix."
           (when (and (> i domain-start)
                      (string-search "." domain)
                      (not (memq (aref string (1- i)) '(?- ?_))))
-            (cons i (concat "mailto:" (substring string start i)))))))))
+            (cons i (concat "mailto:"
+                            (substring-no-properties string start i)))))))))
 
 (defun mdview-inline--next-url-candidate (string from)
   "Return the first index at or after FROM of STRING where a URL may start."
@@ -932,10 +973,10 @@ followed back no further than FROM."
             (if hit
                 (progn
                   (when (> cand text-start)
-                    (push (substring string text-start cand) out))
+                    (push (mdview-ast-substring string text-start cand) out))
                   (push (mdview-node 'link (list :url (cdr hit) :title nil
                                                  :autolink t)
-                                     (substring string cand (car hit)))
+                                     (mdview-ast-substring string cand (car hit)))
                         out)
                   (setq pos (car hit) text-start pos))
               (when email
@@ -946,7 +987,7 @@ followed back no further than FROM."
                 (setq at-from (1+ (string-search "@" string cand))))
               (setq pos (1+ cand)))))))
     (when (< text-start len)
-      (push (substring string text-start) out))
+      (push (mdview-ast-substring string text-start) out))
     (nreverse out)))
 
 ;;;; Conversion to the AST
@@ -958,8 +999,8 @@ DEPTH is the nesting depth of NODE (1 for a child of the root)."
   (let ((type (mdview-inline--node-type node))
         (props (mdview-inline--node-props node)))
     (pcase type
-      ('code (mdview-node 'code nil (mdview-inline--node-text node)))
-      ('html-inline (mdview-node 'html-inline nil (mdview-inline--node-text node)))
+      ((or 'code 'html-inline)
+       (mdview-node type props (mdview-inline--node-text node)))
       ((or 'hard-break 'soft-break 'footnote-reference) (mdview-node type props))
       ('image
        (let ((children (mdview-inline--children node t depth)))
@@ -1014,7 +1055,8 @@ abandoned by throwing to `mdview-inline--too-deep'."
      ((eq c ?<)
       (or (mdview-inline--parse-autolink root)
           (mdview-inline--parse-html root)
-          (progn (forward-char) (mdview-inline--add-text root "<"))))
+          (progn (mdview-inline--add-text root "<" (mdview-inline--offset))
+                 (forward-char))))
      ((eq c ?&) (mdview-inline--parse-entity root))
      (t (mdview-inline--parse-text root)))))
 
@@ -1034,10 +1076,23 @@ The result follows the inline node contract of docs/DESIGN.md section
 3: plain strings are text (entities decoded, escapes resolved), and
 `emphasis', `strong', `strikethrough', `code', `link', `image',
 `hard-break', `soft-break', `html-inline' and `footnote-reference'
-nodes carry the properties listed there.  Nesting deeper than
-`mdview-inline-max-depth' degrades the result to STRING as one text
-node.  The parser is not reentrant: it scans in a single hidden buffer
-that every call reuses."
+nodes carry the properties listed there.
+
+Source positions are content offsets, 0-based indices into STRING.
+Every character of a text string carries the text property
+`mdview-pos', valued at the offset of the first source character of
+its run (invariant R1 of docs/DESIGN.md section 3, so the offset of
+any character is that value plus its distance from the start of the
+stretch of equal values; see `mdview-ast-pos-at').  A backslash escape
+points at the escaped character, a decoded entity at its `&'.  `code'
+nodes have `:pos', the offset of the first character of their content
+\(after the opening backticks and the space stripped with the closing
+one, if any), and `html-inline' nodes have `:pos', the offset of their
+`<'.  The block parser translates these offsets to source offsets.
+
+Nesting deeper than `mdview-inline-max-depth' degrades the result to
+STRING as one text node with `mdview-pos' 0.  The parser is not
+reentrant: it scans in a single hidden buffer that every call reuses."
   (let ((mdview-inline--refs refs)
         (mdview-inline--delims nil)
         (mdview-inline--brackets nil)
@@ -1057,7 +1112,7 @@ that every call reuses."
     (if (catch 'mdview-inline--too-deep
           (setq result (mdview-inline--children root nil 0))
           nil)
-        (list string)
+        (list (propertize string 'mdview-pos 0))
       result)))
 
 (provide 'mdview-inline)
