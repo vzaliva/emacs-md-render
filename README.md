@@ -16,29 +16,38 @@ Emacs itself.
 
 ## Screenshots
 
-Text-mode Emacs (`emacs -nw`) showing `test/fixtures/showcase.md` in the
-Solarized dark and light themes and in Emacs's own `modus-vivendi` and
-`modus-operandi`.  The heading and table panels, block quotes and frames
-take their colours from whichever theme you use.
+Graphical Emacs showing [`docs/gallery.md`](docs/gallery.md), a page you
+can open with `M-x mdview-file` to see the same thing.  The panels behind
+headings and tables, block quotes and frames take their colours from
+whichever theme you use.
 
 <table>
 <tr>
-<td>
-<img width="100%" alt="mdview in Solarized dark: headings" src="docs/screenshots/solarized-dark.png">
+<td width="50%">
+<img width="100%" alt="Headings, emphasis, links, inline code, an inline image and nested lists in Solarized dark" src="docs/screenshots/typography.png">
+<b>Typography and lists</b> in Solarized dark; images, here an SVG badge, sit in the text line.
 </td>
-<td>
-<img width="100%" alt="mdview in Solarized light: tables" src="docs/screenshots/solarized-light.png">
+<td width="50%">
+<img width="100%" alt="Python, Emacs Lisp and shell code blocks in modus-vivendi" src="docs/screenshots/code.png">
+<b>Code blocks</b>, highlighted by Emacs's own major modes, with indentation guides, in <code>modus-vivendi</code>.
 </td>
 </tr>
 <tr>
-<td>
-<img width="100%" alt="mdview in modus-vivendi: code blocks" src="docs/screenshots/modus-vivendi.png">
+<td width="50%">
+<img width="100%" alt="Two tables in Solarized light" src="docs/screenshots/tables.png">
+<b>Tables</b> with column alignment, styled and linked cells and wrapped content, in Solarized light.
 </td>
-<td>
-<img width="100%" alt="mdview in modus-operandi: block quotes and lists" src="docs/screenshots/modus-operandi.png">
+<td width="50%">
+<img width="100%" alt="An SVG diagram, nested block quotes, a tip alert and a footnote in modus-operandi" src="docs/screenshots/images.png">
+<b>Images</b>, block quotes and alerts in <code>modus-operandi</code>; images are scaled to the window.
 </td>
 </tr>
 </table>
+
+In a terminal (`emacs -nw`) the same page keeps its tables, code and colours;
+images become placeholders:
+
+![Code blocks and a table in Emacs running in a terminal, in Solarized dark](docs/screenshots/terminal.png)
 
 ## Status
 
@@ -256,12 +265,23 @@ make screenshots # regenerate the README gallery in docs/screenshots/
 make commonmark # CommonMark spec conformance report
 ```
 
-`make shot` and `make screenshots` need tmux, `uv` and `rsvg-convert`
-(`librsvg2-bin` on Debian and Ubuntu).  `scripts/tmux-shot.sh` takes
-`SHOT_TERM` (for example `xterm-direct` for 24-bit colour) and `SHOT_SETUP`
-(a Lisp file loaded before the theme, to put a third-party theme on
-`custom-theme-load-path`); the Solarized shots of the gallery need
-`SOLARIZED_DIR` set to the directory of the `solarized-theme` package.
+`make shot` needs tmux, `uv` and `rsvg-convert` (`librsvg2-bin` on Debian and
+Ubuntu); `scripts/tmux-shot.sh` takes `SHOT_TERM` (for example
+`xterm-direct` for 24-bit colour) and `SHOT_SETUP` (a Lisp file loaded
+before the theme, to put a third-party theme on `custom-theme-load-path`).
+
+`make screenshots` also needs a graphical Emacs (an X11 or GTK build),
+`xvfb-run` (package `xvfb`) and ImageMagick's `import`:
+`scripts/gui-shot.sh` runs Emacs on a private virtual framebuffer, so
+nothing appears on your screen, and captures its frame.  `SHOT_FONT` and
+`SHOT_FONT_HEIGHT` choose the font (DejaVu Sans Mono, 17 pt, by default).
+The shots in Solarized need `SOLARIZED_DIR` set to the directory of the
+`solarized-theme` package; the others use the modus themes that come with
+Emacs.  Each shot scrolls to a section of `docs/gallery.md` by the title of
+its heading, so edit the page freely, but keep the titles the script looks
+for.  `gui-shot.sh` needs an Emacs built for X11 or GTK, so the four
+graphical shots cannot be regenerated with a macOS (NS) Emacs; the terminal
+shot can.
 
 To check image display in a graphical Emacs without screenshots, run
 `scripts/gui-check.el` in the background with absolute paths (see the

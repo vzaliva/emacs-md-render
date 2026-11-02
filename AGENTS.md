@@ -55,9 +55,10 @@ test/fixtures/        Markdown inputs (showcase.md exercises everything)
 test/golden/          expected plain-text renderings at width 80
 test/reference/       Frogmouth's own rendering of the fixtures (truth for the look)
 test/commonmark/      spec runner, HTML serializer, pass-count baseline
-scripts/              dev tooling: dump.el, tmux-shot.sh (+ shot-colors.el), ansi-to-png.sh,
-                      screenshots.sh, frogmouth-reference.sh
+scripts/              dev tooling: dump.el, tmux-shot.sh (+ shot-colors.el), gui-shot.sh
+                      (+ shot-gui.el), ansi-to-png.sh, screenshots.sh, frogmouth-reference.sh
 docs/DESIGN.md        architecture, AST contract, style specification
+docs/gallery.md       the page the README screenshots show (+ docs/gallery/ images)
 docs/screenshots/     the README gallery (regenerate with `make screenshots`)
 ```
 
@@ -72,10 +73,18 @@ make render-faces FILE=... WIDTH=...        # with {face} annotations
 make shot FILE=test/fixtures/showcase.md    # real text-mode Emacs capture -> /tmp/mdview-shots/*.png
                                             # (SHOT_TERM=xterm-direct for 24-bit colour, SHOT_SETUP=file.el
                                             # to load a third-party theme; needs tmux, uv, rsvg-convert)
+scripts/gui-shot.sh FILE OUT.png COLS ROWS THEME [SECTION]   # graphical Emacs capture (see below)
 make screenshots                            # regenerate docs/screenshots/*.png for the README gallery
 make commonmark                             # spec conformance report
 diff <(make -s render WIDTH=98) test/reference/showcase.frogmouth.txt   # compare layout with Frogmouth
 ```
+
+`scripts/gui-shot.sh` screenshots a *graphical* Emacs, but not your desktop:
+it runs `xvfb-run -a`, which starts a private virtual X server on a free
+display of its own, starts Emacs on it and captures only that Emacs frame
+(`import -window ID`), so it is within the rule against desktop screenshots.
+Never point it, or any capture tool, at the display the user is working on
+(`:0`).  It needs `xvfb-run` and ImageMagick's `import`.
 
 For the graphical image path (no screenshots needed) run
 `scripts/gui-check.el` in a background GUI Emacs with ABSOLUTE paths —
@@ -99,9 +108,13 @@ improvement.  To *see* colours, run `make shot` and view the PNG, or
 The `make` targets load the sources with `load-prefer-newer`, so a stale
 `.elc` left by `make compile` never shadows an edited `.el`.
 
-Emacs on the development machine is GNU Emacs 30.2 (NS build, native
-compilation, SVG/PNG/JPEG/WEBP/GIF image support, tree-sitter).  Test on
-`emacs -Q` only; never load the user's init file.
+Emacs 29.1 or later is required.  The project is developed on two machines:
+GNU Emacs 30.2 (NS build, macOS) and GNU Emacs 31.1 (GTK build, Linux), both
+with native compilation, SVG/PNG/JPEG/WEBP/GIF image support and
+tree-sitter.  `scripts/gui-shot.sh` needs an X11 or GTK build, so
+`make screenshots` regenerates the graphical shots only on the Linux
+machine (the terminal one works anywhere).  Test on `emacs -Q` only; never
+load the user's init file.
 
 ## Definition of done for a change
 

@@ -44,8 +44,8 @@ render-ansi:
 shot:
 	scripts/tmux-shot.sh "$(FILE)" $(WIDTH)
 
-# Regenerate the README gallery, docs/screenshots/*.png (see the script for
-# the environment it reads, e.g. SOLARIZED_DIR).
+# Regenerate the README gallery, docs/screenshots/*.png, from docs/gallery.md
+# (see the script for the environment it reads, e.g. SOLARIZED_DIR).
 screenshots:
 	scripts/screenshots.sh
 
