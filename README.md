@@ -163,6 +163,7 @@ Keys in the rendered buffer (`mdview-mode`):
 | `w` | Copy the link at point: local files as the absolute file name they resolve to, URLs as written (`C-u w` always copies the raw link) |
 | `SPC` / `DEL` / `S-SPC` | Scroll down / up |
 | `<` / `>` | Beginning / end of the document |
+| `C->` / `C-<` / `C-0` | Wider / narrower text, by `mdview-width-step` columns (a numeric prefix gives the columns), and back to the default width; right after `C->` or `C-<`, plain `>`, `<` and `0` keep adjusting or reset. Most terminals cannot send these: use `M-x mdview-set-width` there (0 restores the default) |
 | `C-c C-v` | Back to the source (`mdview-toggle`) |
 
 The view re-flows when the window width or the text size changes
@@ -183,7 +184,9 @@ rendered in place, and while a buffer is rendered, markers held elsewhere
 View and layout:
 
 - `mdview-max-width` (default 100): maximum text width in columns; `nil`
-  uses the full window.
+  uses the full window.  `C->` / `C-<` adjust it per buffer while rendered
+  (`mdview-width-step`, default 4, columns per step) and `C-0` restores
+  the default; `M-x mdview-set-width` sets it directly.
 - `mdview-margin` (default 4): left/right margin, as in Frogmouth;
   `mdview-center-content` (default `nil`) centres the content in wider
   windows.

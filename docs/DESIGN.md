@@ -860,9 +860,16 @@ The buffer-local hooks are installed on the first rendering and stay
   menu only when `imenu-use-popup-menu` is `always`), `l`/`r`
   `mdview-history-back`/`-forward`, `i` `mdview-toggle-images`, `w`
   `mdview-copy-link` (local links as the absolute file name they resolve
-  to, anchor kept; `C-u w` as written), `SPC`/`DEL`/`S-SPC` scroll, `<`/`>`.
-  Commands that need a rendering signal "Not a rendered buffer"
-  elsewhere.
+  to, anchor kept; `C-u w` as written), `SPC`/`DEL`/`S-SPC` scroll, `<`/`>`,
+  `C->`/`C-<` `mdview-increase-width`/`mdview-decrease-width` (by
+  `mdview-width-step` columns, default 4, or the numeric prefix; then
+  `>`, `<`, `0` and `C-0` in `mdview-width-transient-map` continue or
+  reset, like the keys after `text-scale-adjust`; a step that the window
+  or the floor of 20 columns leaves nothing to do only reports that),
+  `C-0` `mdview-reset-width` (back to `mdview-max-width`; it shadows the
+  global digit argument while rendered, `C-u 0` and `M-0` remain),
+  `mdview-set-width` (M-x; 0 or nil = the default).  Commands that need
+  a rendering signal "Not a rendered buffer" elsewhere.
 - Link following: `#anchor` → heading with that `mdview-heading-id` (also
   the slug of the raw anchor); `path.md[#anchor]` relative to the base
   dir (the file's directory, else `default-directory`) → visit that file
@@ -904,7 +911,10 @@ The buffer-local hooks are installed on the first rendering and stay
   reported once with `message` (the width is recorded so it is not
   retried on every resize).
 - Width: `W = min(window-body-width + margins − 2·margin − 1,
-  mdview-max-width or ∞)`, at least 20, in columns of the buffer's text:
+  mdview-max-width or ∞)`, at least 20, where a width chosen with
+  `mdview-set-width` (`C->`/`C-<`) replaces `mdview-max-width` for the
+  buffer — a permanent buffer-local value, kept across toggles to the
+  source — in columns of the buffer's text:
   under `text-scale-mode` the window's frame columns are divided by the
   ratio of the scaled to the frame's character width
   (`mdview--column-scale`), and the display margins (`mdview-margin` text

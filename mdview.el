@@ -66,6 +66,12 @@ value (docs/DESIGN.md section 10)."
                  (integer :tag "Columns"))
   :group 'mdview)
 
+(defcustom mdview-width-step 4
+  "Columns by which one width adjustment changes the text of a rendering.
+See `mdview-increase-width' and `mdview-decrease-width'."
+  :type 'natnum
+  :group 'mdview)
+
 (defcustom mdview-margin 4
   "Width in columns of the left and right margins of a rendering."
   :type 'integer
@@ -174,6 +180,11 @@ The value `unset' means `mdview-display-images' has not been consulted
 yet.  See `mdview-toggle-images'.")
 (put 'mdview--images-enabled 'permanent-local t)
 
+(defvar-local mdview--width-override nil
+  "The text width chosen with `mdview-set-width' for this buffer, or nil.
+Non-nil replaces `mdview-max-width' as the limit of the content width.")
+(put 'mdview--width-override 'permanent-local t)
+
 (defvar-local mdview--saved nil
   "Settings replaced while the buffer is rendered: (VAR LOCAL-P VALUE)...")
 
@@ -247,6 +258,9 @@ See `mdview--apply-view-settings' for the values used while rendered.")
     (define-key map (kbd "S-SPC") #'scroll-down-command)
     (define-key map (kbd "<") #'beginning-of-buffer)
     (define-key map (kbd ">") #'end-of-buffer)
+    (define-key map (kbd "C->") #'mdview-increase-width)
+    (define-key map (kbd "C-<") #'mdview-decrease-width)
+    (define-key map (kbd "C-0") #'mdview-reset-width)
     (define-key map (kbd "C-c C-v") #'mdview-toggle)
     map)
   "Keymap of `mdview-mode', active while a buffer is rendered.")
@@ -321,14 +335,23 @@ showing the buffer when there is one."
       (get-buffer-window (current-buffer) t)
       (selected-window)))
 
+(defun mdview--available-width (&optional window)
+  "Return the content width available for a rendering in WINDOW.
+WINDOW defaults to a window showing the current buffer.  This is the
+window width in text columns minus the margins and one column; it may
+be smaller than the 20 columns a rendering always gets."
+  (- (mdview--window-columns (or window (mdview--view-window)))
+     (* 2 mdview-margin) 1))
+
 (defun mdview--content-width (&optional window)
   "Return the content width for a rendering in WINDOW.
 WINDOW defaults to a window showing the current buffer.  This is the
-window width minus the margins and one column, limited by
-`mdview-max-width', and never less than 20 (docs/DESIGN.md section 10)."
-  (let* ((columns (mdview--window-columns (or window (mdview--view-window))))
-         (available (- columns (* 2 mdview-margin) 1)))
-    (max 20 (if mdview-max-width (min available mdview-max-width) available))))
+width WINDOW leaves (`mdview--available-width'), limited by the width
+chosen with `mdview-set-width' or else by `mdview-max-width', and never
+less than 20 (docs/DESIGN.md section 10)."
+  (let ((available (mdview--available-width window))
+        (limit (or mdview--width-override mdview-max-width)))
+    (max 20 (if limit (min available limit) available))))
 
 (defun mdview--set-window-margins ()
   "Give every window showing the current buffer the buffer's margins.
@@ -1658,6 +1681,95 @@ one at point being the default.  When `imenu-use-popup-menu' is
   (setq mdview--images-enabled (not mdview--images-enabled))
   (mdview--render-into (current-buffer))
   (message "Images %s" (if mdview--images-enabled "shown" "hidden")))
+
+;;;; The width of the text
+
+(defvar mdview-width-transient-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd ">") #'mdview-increase-width)
+    (define-key map (kbd "<") #'mdview-decrease-width)
+    (define-key map (kbd "C->") #'mdview-increase-width)
+    (define-key map (kbd "C-<") #'mdview-decrease-width)
+    (define-key map (kbd "0") #'mdview-reset-width)
+    (define-key map (kbd "C-0") #'mdview-reset-width)
+    map)
+  "Keys that keep adjusting the text width after one adjustment.
+Active right after `mdview-increase-width' or `mdview-decrease-width'
+until a key outside the map is typed, like the keys that follow
+`text-scale-adjust'.")
+
+(defun mdview--report-width ()
+  "Say in the echo area how wide the text of the rendering is."
+  (let ((limit (or mdview--width-override mdview-max-width)))
+    (message "Text width %d columns%s" mdview--last-width
+             (cond ((and limit (> limit mdview--last-width))
+                    " (all the window allows)")
+                   (mdview--width-override "")
+                   (t " (the default)")))))
+
+(defun mdview-set-width (width)
+  "Render the buffer again with its text at most WIDTH columns wide.
+WIDTH replaces `mdview-max-width' for this buffer; the text is still
+limited by the window and never narrower than 20 columns.  nil
+\(interactively, 0) goes back to `mdview-max-width'.  The choice is
+kept while the buffer shows its source and applies when it is rendered
+again."
+  (interactive "nText width in columns (0 for the default): ")
+  (mdview--check-view)
+  (setq mdview--width-override
+        (and (numberp width) (> width 0) (max 20 width)))
+  (mdview--render-into (current-buffer))
+  (mdview--report-width))
+
+(defun mdview-reset-width ()
+  "Render the buffer again at the default text width, `mdview-max-width'.
+Bound to \\<mdview-mode-map>\\[mdview-reset-width] while rendered, which
+therefore does not start a numeric argument there; \\[universal-argument] 0
+and \\<global-map>\\[digit-argument] still do."
+  (interactive)
+  (mdview-set-width nil))
+
+(defun mdview--width-delta (arg)
+  "Return the number of columns to change the width by for prefix ARG.
+A numeric ARG is that many columns; nil means `mdview-width-step'."
+  (if arg (prefix-numeric-value arg) (max 1 mdview-width-step)))
+
+(defun mdview--adjust-width (delta)
+  "Make the text of the rendering DELTA columns wider, or narrower if negative.
+The window's width and the floor of 20 columns bound the result; when
+they leave nothing to change, say so instead of rendering again.  The
+keys of `mdview-width-transient-map' stay active afterwards."
+  (mdview--check-view)
+  (let* ((available (mdview--available-width))
+         (current (mdview--content-width))
+         (target (max 20 (min available (+ current delta)))))
+    (if (= target current)
+        (message (if (> delta 0)
+                     "The window allows no more than %d columns"
+                   "The text is already as narrow as it gets, %d columns")
+                 current)
+      (setq mdview--width-override target)
+      (mdview--render-into (current-buffer))
+      (mdview--report-width))
+    (set-transient-map mdview-width-transient-map t)))
+
+(defun mdview-increase-width (&optional columns)
+  "Make the text of the rendering `mdview-width-step' columns wider.
+With a numeric prefix argument COLUMNS, that many columns wider.  The
+window limits the width.  Afterwards `>', `<' and `0' keep adjusting
+the width or reset it (`mdview-width-transient-map'); `C-0' resets it
+at any time."
+  (interactive "P")
+  (mdview--adjust-width (mdview--width-delta columns)))
+
+(defun mdview-decrease-width (&optional columns)
+  "Make the text of the rendering `mdview-width-step' columns narrower.
+With a numeric prefix argument COLUMNS, that many columns narrower; the
+text never gets narrower than 20 columns.  Afterwards `>', `<' and `0'
+keep adjusting the width or reset it (`mdview-width-transient-map');
+`C-0' resets it at any time."
+  (interactive "P")
+  (mdview--adjust-width (- (mdview--width-delta columns))))
 
 (defun mdview--resolved-link (url)
   "Return URL with the path of a local link made absolute.

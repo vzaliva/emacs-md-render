@@ -198,6 +198,9 @@ window, and BODY runs with it current; it is killed afterwards."
                      ("w" . mdview-copy-link) ("SPC" . scroll-up-command)
                      ("DEL" . scroll-down-command) ("S-SPC" . scroll-down-command)
                      ("<" . beginning-of-buffer) (">" . end-of-buffer)
+                     ("C->" . mdview-increase-width)
+                     ("C-<" . mdview-decrease-width)
+                     ("C-0" . mdview-reset-width)
                      ("C-c C-v" . mdview-toggle)))
     (should (eq (lookup-key mdview-mode-map (kbd (car binding))) (cdr binding))))
   (should-not (lookup-key mdview-mode-map (kbd "q")))
@@ -556,9 +559,12 @@ window, and BODY runs with it current; it is killed afterwards."
       (mdview-toggle)
       (should-not mdview-mode)
       (dolist (command '(mdview-refresh mdview-toggle-images
-                         mdview-history-back mdview-history-forward))
+                         mdview-history-back mdview-history-forward
+                         mdview-increase-width mdview-decrease-width
+                         mdview-reset-width))
         (let ((err (should-error (funcall command) :type 'user-error)))
           (should (string-match-p "Not a rendered buffer" (cadr err)))))
+      (should-error (mdview-set-width 80) :type 'user-error)
       (should (equal (buffer-string) "Text\n")))))
 
 (ert-deftest mdview-test-refresh-keeps-source-line ()
@@ -741,6 +747,11 @@ window, and BODY runs with it current; it is killed afterwards."
         (let ((mdview-max-width 100))
           (should (= (mdview--content-width) 100)))
         (let ((mdview-max-width nil))
+          (should (= (mdview--content-width) 111)))
+        ;; A width chosen for the buffer replaces `mdview-max-width'.
+        (let ((mdview-max-width 100) (mdview--width-override 80))
+          (should (= (mdview--content-width) 80)))
+        (let ((mdview-max-width nil) (mdview--width-override 150))
           (should (= (mdview--content-width) 111))))
       (cl-letf (((symbol-function 'window-body-width) (lambda (&rest _) 40)))
         (let ((mdview-max-width 100))
@@ -1181,6 +1192,55 @@ window, and BODY runs with it current; it is killed afterwards."
         (should (string-match-p "Some text" (buffer-string)))
         (mdview-test-quietly (mdview-toggle-images))
         (should (eq mdview--images-enabled before))))))
+
+(ert-deftest mdview-test-adjust-width ()
+  ;; `C->' / `C-<' change the text width by `mdview-width-step' (or the
+  ;; prefix argument) within what the window allows; a reset goes back
+  ;; to `mdview-max-width', and the choice outlives a toggle to the source.
+  (mdview-test-with-source (source "Some text\n")
+    (cl-letf (((symbol-function 'window-margins) (lambda (&rest _) '(nil)))
+              ((symbol-function 'window-body-width) (lambda (&rest _) 200)))
+      (let ((mdview-margin 4) (mdview-max-width 100) (mdview-width-step 4))
+        (with-current-buffer source
+          (mdview-mode 1)
+          (should (= mdview--last-width 100))
+          (mdview-test-quietly
+           (mdview-increase-width)
+           (should (= mdview--last-width 104))
+           (mdview-increase-width 10)
+           (should (= mdview--last-width 114))
+           (mdview-decrease-width)
+           (should (= mdview--last-width 110))
+           (should (= mdview--width-override 110))
+           ;; The choice survives showing the source.
+           (mdview-toggle)
+           (mdview-toggle)
+           (should (= mdview--last-width 110))
+           (mdview-reset-width)
+           (should (= mdview--last-width 100))
+           (should-not mdview--width-override)
+           ;; Never narrower than 20 columns.
+           (mdview-set-width 5)
+           (should (= mdview--last-width 20))
+           (mdview-decrease-width)
+           (should (= mdview--last-width 20))
+           ;; The window bounds it: 200 columns leave 191, and asking for
+           ;; more changes nothing.
+           (mdview-set-width 500)
+           (should (= mdview--last-width 191))
+           (should (= mdview--width-override 500))
+           (mdview-increase-width)
+           (should (= mdview--last-width 191))
+           (should (= mdview--width-override 500)))
+          ;; The keys that continue an adjustment.
+          (should (eq (lookup-key mdview-width-transient-map (kbd ">"))
+                      #'mdview-increase-width))
+          (should (eq (lookup-key mdview-width-transient-map (kbd "<"))
+                      #'mdview-decrease-width))
+          (should (eq (lookup-key mdview-width-transient-map (kbd "0"))
+                      #'mdview-reset-width))
+          (should (eq (lookup-key mdview-width-transient-map (kbd "C-0"))
+                      #'mdview-reset-width)))))))
 
 ;;;; Files
 
