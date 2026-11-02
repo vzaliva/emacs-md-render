@@ -272,9 +272,16 @@ inset frame:
 
 ```
 ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁   top row: W × ▁  (face: fg = frame colour, bg = box colour)
-▎                           ▊   body rows: ▎ + (W-2) cols + ▊  (same frame face on the glyphs)
+▎                           ▊   body rows: ▎ + (W-2) cols + ▊  (▊ drawn reversed, see below)
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔   bottom row: W × ▔
 ```
+
+`▎` fills the left quarter of its cell and `▊` the left three quarters, so
+the frame colour gives a thin edge on the left, and on the right only if
+the right glyph is drawn *reversed* (box colour on frame colour, as Textual
+does): `mdview-render--box-right-glyph` adds `:inverse-video t`.  Without
+that the right edge would be a three-quarter-cell block of page colour.
+The ASCII profile's `|` is not reversed.
 
 The frame colour is the buffer's `default` background (computed at render
 time and face-remapped buffer-locally, `mdview-box-frame`).  Inside the

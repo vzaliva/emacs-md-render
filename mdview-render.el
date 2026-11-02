@@ -318,9 +318,22 @@ padding and the right frame glyph, all on BOX-FACE."
                         (propertize (mdview-glyph 'box-left) 'face 'mdview-box-frame))
                       " " content (make-string fill ?\s) " "
                       (if none " "
-                        (propertize (mdview-glyph 'box-right) 'face 'mdview-box-frame)))))
+                        (mdview-render--box-right-glyph)))))
     (add-face-text-property 0 (length row) box-face t row)
     row))
+
+(defun mdview-render--box-right-glyph ()
+  "Return the right frame glyph of a box body row, propertized.
+The left glyph `▎' fills the left quarter of its cell, which the frame
+colour paints as a thin edge.  The right glyph `▊' fills the left three
+quarters, so it is drawn reversed -- the box colour on the frame colour --
+to leave the same thin edge on the right (Textual draws the border that
+way).  Other glyphs, such as the ASCII `|', are drawn like the left one."
+  (let ((glyph (mdview-glyph 'box-right)))
+    (propertize glyph 'face
+                (if (equal glyph "▊")
+                    '((:inverse-video t) mdview-box-frame)
+                  'mdview-box-frame))))
 
 (defun mdview-render--emit-box (lines box-face ctx)
   "Emit a box on BOX-FACE around LINES in CTX.

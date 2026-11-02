@@ -304,7 +304,28 @@
       (should (equal (mdview-render-test--faces text row) '(mdview-box-frame mdview-h1)))
       (should (equal (mdview-render-test--faces text (+ row 1)) '(mdview-h1)))
       (should (equal (mdview-render-test--faces text (+ row 7)) '(mdview-h1)))
+      ;; the right glyph is reversed so that its thin edge is on the right
       (should (equal (mdview-render-test--faces text (+ row 19))
+                     '(:inverse-video t mdview-box-frame mdview-h1))))))
+
+(ert-deftest mdview-render-box-right-glyph-reversal ()
+  ;; Only the Unicode `▊', which fills the left three quarters of its cell,
+  ;; is reversed; the ASCII profile's `|' is drawn like the left glyph.
+  (let ((text (mdview-render-test--render
+               (mdview-render-test--doc (mdview-render-test--heading 1 "Title")) 20))
+        (right (+ (mdview-render-test--line-pos
+                   (mdview-render-test--render
+                    (mdview-render-test--doc (mdview-render-test--heading 1 "Title")) 20)
+                   2)
+                  19)))
+    (should (equal (mdview-render-test--faces text right)
+                   '(:inverse-video t mdview-box-frame mdview-h1)))
+    (let* ((mdview-use-ascii-glyphs t)
+           (ascii (mdview-render-test--render
+                   (mdview-render-test--doc (mdview-render-test--heading 1 "Title")) 20))
+           (pos (+ (mdview-render-test--line-pos ascii 2) 19)))
+      (should (equal (substring-no-properties ascii pos (1+ pos)) "|"))
+      (should (equal (mdview-render-test--faces ascii pos)
                      '(mdview-box-frame mdview-h1))))))
 
 (ert-deftest mdview-render-h2-box-centered ()
