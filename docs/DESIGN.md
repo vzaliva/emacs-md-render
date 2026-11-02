@@ -78,18 +78,18 @@ Block node types and their properties:
 | Type | Props | Children |
 |---|---|---|
 | `document` | `:refs` hash (normalized label → `(URL . TITLE)`), `:footnotes` list of `footnote-definition` nodes in order of first reference | blocks |
-| `heading` | `:level` 1–6, `:id` unique slug (`-1`, `-2` suffixes on duplicates), `:line` | inlines |
-| `paragraph` | `:line` | inlines |
-| `blockquote` | `:line` | blocks |
-| `list` | `:ordered` bool, `:start` int (ordered only), `:tight` bool, `:marker` char (`?-` `?*` `?+` `?.` `?\)`), `:line` | `item` nodes |
-| `item` | `:task` nil / `checked` / `unchecked` (a `[ ]`/`[x]` marker counts even when nothing follows it on the line, as on GitHub), `:line` | blocks |
-| `code-block` | `:lang` first word of info string or nil, `:info` full info string or nil, `:fenced` bool, `:line` | one string (no trailing newline) |
-| `html-block` | `:line` | one string (raw HTML) |
-| `thematic-break` | `:line` | — |
-| `table` | `:align` list per column of `left`/`center`/`right`/nil, `:line` | `table-row` nodes; first has `:header t` |
+| `heading` | `:level` 1–6, `:id` unique slug (`-1`, `-2` suffixes on duplicates), `:line`, `:pos` | inlines |
+| `paragraph` | `:line`, `:pos` | inlines |
+| `blockquote` | `:line`, `:pos` | blocks |
+| `list` | `:ordered` bool, `:start` int (ordered only), `:tight` bool, `:marker` char (`?-` `?*` `?+` `?.` `?\)`), `:line`, `:pos` | `item` nodes |
+| `item` | `:task` nil / `checked` / `unchecked` (a `[ ]`/`[x]` marker counts even when nothing follows it on the line, as on GitHub), `:line`, `:pos` | blocks |
+| `code-block` | `:lang` first word of info string or nil, `:info` full info string or nil, `:fenced` bool, `:line`, `:pos`, `:positions` | one string (no trailing newline) |
+| `html-block` | `:line`, `:pos`, `:positions` | one string (raw HTML) |
+| `thematic-break` | `:line`, `:pos` | — |
+| `table` | `:align` list per column of `left`/`center`/`right`/nil, `:line`, `:pos` | `table-row` nodes; first has `:header t` |
 | `table-row` | `:header` bool | `table-cell` nodes |
 | `table-cell` | — | inlines |
-| `footnote-definition` | `:label`, `:index` 1-based, `:line` | blocks |
+| `footnote-definition` | `:label`, `:index` 1-based, `:line`, `:pos` | blocks |
 
 Inline node types:
 
@@ -97,16 +97,62 @@ Inline node types:
 |---|---|---|
 | text | — | (a string) |
 | `emphasis`, `strong`, `strikethrough` | — | inlines |
-| `code` | — | one string |
+| `code` | `:pos` (§3 "Source positions") | one string |
 | `link` | `:url`, `:title` or nil, `:autolink` bool | inlines |
 | `image` | `:url`, `:title` or nil, `:alt` plain text | inlines (description) |
 | `hard-break`, `soft-break` | — | — |
-| `html-inline` | — | one string (raw tag) |
+| `html-inline` | `:pos` | one string (raw tag) |
 | `footnote-reference` | `:label`, `:index` | — |
 
 `:line` is the 1-based source line where the block starts; the renderer
 stores it on the first rendered line of each block as the text property
 `mdview-source-line` so the view and the source can be kept in sync.
+
+**Source positions.**  Beyond the line, the AST records where every
+character of the text came from, so that the view and the source map to
+each other character by character (§10.1).  An *offset* is the 0-based
+index into the string that was parsed — the accessible portion of the
+source buffer, so buffer position = `point-min` + offset — counted in the
+original text (CRLF and CR line endings are not normalised away first).
+
+- Every block node has `:pos`: the offset of the first character of the
+  block on its first line — the list marker, the `>`, the first `#`, the
+  opening fence, the first character of indented code, the `[^` of a
+  footnote definition, the first character of a thematic break, an HTML
+  block or a table's header row, and for a paragraph or setext heading
+  the first character of its content once reference definitions are
+  stripped.  `code-block` and `html-block` nodes have `:positions`, the
+  offsets of their content lines in order (fence indentation removed).
+  `code` and `html-inline` nodes have `:pos` (the first character of the
+  span's content, after the stripped space if any; the `<`).
+- Text nodes carry the text property `mdview-pos` on every character
+  copied from the source.  Its value is the offset of the first character
+  of the *run*: a run is a stretch of characters with the same value, so
+  a character's own offset is the value plus its distance from the run's
+  start, which `mdview-ast-pos-at` computes (it looks at this property
+  alone, so faces that change inside a run do not split it).  Adjacent
+  runs always differ in value, which keeps them apart without any
+  separator.  Anything that cuts a string inside a run must re-base the
+  result with `mdview-ast-substring`, or the invariant breaks.
+- Runs are the pieces the inline parser copies verbatim.  A decoded
+  entity or a backslash escape is a run of its own whose text differs
+  from the source (`&amp;` → `&` at the offset of the `&`, `\*` → `*` at
+  the offset of the `*`), and the error stays inside it because the next
+  run carries its own offset.  Characters that come from nowhere in the
+  source (bullets, frames, padding, wrap-inserted newlines, placeholders)
+  carry no `mdview-pos`.
+- `mdview-inline-parse` knows only its STRING argument: its `mdview-pos`
+  values and `:pos` properties are offsets into that string.  The block
+  parser translates them to source offsets through the map of the
+  block's content segments — one per source line of the block, each with
+  the offset where the line's content starts after the container
+  prefixes (`>`, list markers, indentation, fences) were stripped — so
+  continuation lines in lists and quotes, lazy continuation, reference
+  definitions stripped from the start of a paragraph, task markers,
+  heading trimming, tab stops and line endings are all accounted for.
+  Table cells get a one-segment map; the `\|` escape inside a cell
+  shifts the cell's later characters by one, and a partially consumed
+  tab by up to three columns (accepted).
 
 Public parser API:
 
@@ -262,8 +308,17 @@ token of width `ceil(pixel-width / frame-char-width)` (text property
 `mdview-nobreak` and are kept whole: a span marked that way moves to the
 next line as a unit and is only broken at its inner spaces when it is
 wider than `width` by itself.  Trimming never removes an `mdview-columns`
-image atom.  Text properties survive wrapping (slice with `substring`,
-never rebuild strings from `char`s).
+image atom.  Text properties survive wrapping (slice with
+`mdview-ast-substring`, never rebuild strings from `char`s): a line that
+starts inside a run of `mdview-pos` is re-based so that the offsets of
+its characters stay exact (§3, "Source positions").  The same holds for
+every other cut of rendered text: the trimming of table cells, the
+splitting of headings at hard breaks.  Code spans get `mdview-pos` from
+their `:pos`, code block lines from the block's `:positions` (after
+fontification, which rebuilds the string), and the stripped HTML path,
+which parses pieces of raw HTML by itself, strips the property because
+its offsets would be meaningless.  Every block's first character carries
+`mdview-source-pos` (the node's `:pos`) next to `mdview-source-line`.
 
 ## 6. Block styles (what it must look like)
 
@@ -765,19 +820,25 @@ side.)
   `olivetti-mode`) that are on are switched off before the swap and on
   again after leaving.
 - **Positions.**  A swap maps the buffer's point and every window showing
-  the buffer to the same *word*.  The block of the position is found
-  first (in the source: the block with the greatest `mdview-source-line`
-  not after point's line, together with the blocks nested in it that
-  start on that line; in the rendering: the nearest preceding block), then
-  the word at point — a run of letters and digits, which the source and
-  the rendering share verbatim — is identified by its ordinal among the
-  equal words from the block's start and found again in the other text,
-  at the same offset into the word (`mdview--anchor`,
-  `mdview--matching-position`; the text just swapped out is read in the
-  twin).  When no word precedes point in the block, or the other text
-  lacks that occurrence (a word inside a link's URL, say), the block is
-  the fallback: source line → first block with `mdview-source-line` ≥
-  the line; rendered position → line of the nearest preceding block →
+  the buffer to the same *character*, through the source offsets the
+  rendering carries (§3, "Source positions"; `mdview--matching-position`
+  reads the text just swapped out in the twin).  Rendering → source
+  (`mdview--source-offset-at`): a character copied from the source has
+  its own offset (`mdview-ast-pos-at`); any other character — padding,
+  a bullet, a frame — stands for the end of the nearest copied run
+  before it in its block or, before the block's first run, for the
+  block's own start (`mdview-source-pos`); the offset becomes
+  `point-min` + offset in the source.  Source → rendering
+  (`mdview--rendered-position-of`): the block of point's line is found
+  (the block with the greatest `mdview-source-line` not after the line,
+  with the blocks nested in it that start on that line,
+  `mdview--block-span`), and within it the character rendered from
+  point's offset wins; failing that, the end of the run with the greatest
+  offset before it — unless the offset is at or past the start of the
+  next block (its `mdview-source-pos`), which means point was on a blank
+  line or markup between blocks.  The block is the fallback in both
+  directions: source line → first block with `mdview-source-line` ≥ the
+  line; rendered position → line of the nearest preceding block →
   beginning of that source line.  Each window keeps the screen row of
   its point (window start found with `vertical-motion`).  Each swap
   remembers where it put each window and where the window was
@@ -898,7 +959,8 @@ The buffer-local hooks are installed on the first rendering and stay
   own motions; every action remains reachable through its `C-c` chord
   (`C-c C-o` for links), and insert state's self-inserting keys reach
   `mdview-self-insert`.  Details: `mdview-toggle` goes back to the source
-  at the word at point (§10.1 Positions); `mdview-refresh` renders again,
+  at the character at point (§10.1 Positions); `mdview-refresh` renders
+  again,
   parsing again; `mdview-toc` completes over the heading names with the
   heading at point as default (`imenu`'s popup menu only when
   `imenu-use-popup-menu` is `always`); `mdview-copy-link` copies local
@@ -919,7 +981,8 @@ The buffer-local hooks are installed on the first rendering and stay
 - Typing edits (`mdview-self-insert`, bound through
   `[remap self-insert-command]`): a self-inserting key leaves the
   rendering as `mdview-toggle` does — the buffer shows its source at the
-  word at point — and then runs what the key is bound to in the source
+  character at point — and then runs what the key is bound to in the
+  source
   (`key-binding` of the event once the minor mode is off; normally
   `self-insert-command`, with the numeric prefix argument still in
   effect), setting `this-command` to it so that undo amalgamation and
@@ -947,9 +1010,10 @@ The buffer-local hooks are installed on the first rendering and stay
   the window shows a buffer that is not the history's current entry (the
   user switched buffers by other means) a fresh history starts there.
 - Re-rendering (`C-c C-r`, refit, `C-c C-x C-v`, images): rendered into a
-  hidden buffer and swapped in; point stays on the word it was on (found
-  as in §10.1 Positions, within the block of the same source line, which
-  is the fallback) and every window keeps the block that was at its top
+  hidden buffer and swapped in; point stays on the character it was on
+  (its source offset is found again in the block of the same source
+  line, as in §10.1 Positions; the block is the fallback) and every
+  window keeps the block that was at its top
   (`set-window-start` to the block's new position plus the recorded line
   offset).
   `gc-cons-threshold` is raised to 64 MB (`gc-cons-percentage` 0.5) while
@@ -1173,9 +1237,13 @@ frame the same happens when the font does not draw the glyph exactly
 (mdview-node-type NODE) (mdview-node-props NODE) (mdview-node-prop NODE KEY)
 (mdview-node-children NODE) (mdview-node-text NODE) (mdview-slug STRING)
 (mdview-ast-decode-entities STRING)        ; &amp; &#123; &#x1F; … → text
+(mdview-ast-pos-at INDEX &optional OBJECT) ; source offset of the char at INDEX of a string/buffer, or nil
+(mdview-ast-substring STRING FROM &optional TO)   ; `substring' that keeps `mdview-pos' exact
+(mdview-ast-trim STRING)                   ; `string-trim' that keeps `mdview-pos' exact
 
 ;; mdview-inline.el
 (mdview-inline-parse STRING REFS)          ; REFS: hash label→(URL . TITLE), may be nil → list of inline nodes
+                                           ; text carries `mdview-pos' = offsets into STRING; code/html-inline :pos
 
 ;; mdview-parse.el
 (mdview-parse-string STRING) (mdview-parse-buffer &optional BUFFER)   ; → document node
@@ -1232,8 +1300,10 @@ mdview-image-update-functions              ; abnormal hook, called with the rend
 ;; mdview-parse-front-matter, mdview-inline-extended-autolinks
 ```
 
-Text properties the renderer must set: `mdview-source-line` (first line of
-each block), `mdview-heading-level` + `mdview-heading-id` (heading text),
+Text properties the renderer must set: `mdview-source-line` and
+`mdview-source-pos` (first character of each block), `mdview-pos` (every
+character copied from the source, see §3), `mdview-heading-level` +
+`mdview-heading-id` (heading text),
 `mdview-link` (URL on links, images, placeholders), `mdview-link-title`,
 `mdview-image-url` (the image's own URL on images and placeholders, so a
 linked image can be told from a plain one), `mdview-footnote-ref` /

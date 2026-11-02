@@ -147,7 +147,7 @@ Or let the package install the binding in all Markdown modes it knows about:
 |---|---|
 | `M-x mdview` | Render the current buffer in place (re-renders it if it is already rendered). |
 | `M-x mdview-file` | Visit a Markdown file and show it rendered. |
-| `M-x mdview-toggle`, `M-x mdview-mode` | Switch the buffer between its source and its rendering, keeping your position (the word at point); toggling twice without moving returns exactly where you were. |
+| `M-x mdview-toggle`, `M-x mdview-mode` | Switch the buffer between its source and its rendering, keeping your position (the character at point); toggling twice without moving returns exactly where you were. |
 
 Keys in the rendered buffer (`mdview-mode`) are the `C-c` chords that
 outline-mode, org-mode and markdown-mode use for the same action, plus
@@ -156,8 +156,8 @@ edits:
 
 | Key | Action |
 |---|---|
-| any printable character | Start editing: the buffer switches to its source at the word at point and the character is inserted there (`mdview-edit-on-typing`) |
-| `C-c C-v` | Back to the source (`mdview-toggle`), at the word at point |
+| any printable character | Start editing: the buffer switches to its source at the character at point and the typed character is inserted there (`mdview-edit-on-typing`) |
+| `C-c C-v` | Back to the source (`mdview-toggle`), at the character at point |
 | `C-c C-n` / `C-c C-p` | Next / previous heading |
 | `C-c C-f` / `C-c C-b` | Next / previous heading of the same level, within the same parent (as in outline-mode) |
 | `C-c C-u` | Up to the parent heading |
@@ -202,7 +202,7 @@ View and layout:
 - `mdview-auto-refit` / `mdview-refit-delay` (default `t` / 0.2 s): re-flow
   when the window width changes.
 - `mdview-edit-on-typing` (default `t`): typing a character while rendered
-  switches to the source at the word at point and inserts it there;
+  switches to the source at the character at point and inserts it there;
   `nil` keeps the rendering strictly read-only.
 - `mdview-initial-view` (default `edit`): `view` makes visited Markdown
   files open rendered.  It applies to files whose major mode derives from

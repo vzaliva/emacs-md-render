@@ -17,11 +17,13 @@ is in `git log`.
   `<` / `>` are gone.  `TAB`, `RET`, `SPC`, `DEL`, the width keys and
   `C-c C-v` are unchanged.  (Issue #1; docs/DESIGN.md section 10.3.)
 - Switching between the source and the rendering, and re-rendering,
-  keep point on the same word, not only on the same block.
+  keep point on the same character, not only on the same block: the
+  parser records where every character of the text comes from and the
+  rendering carries it (`mdview-pos`; docs/DESIGN.md section 3).
 
 ### Added
 
-- Typing into the rendering switches to the source at the word at point
+- Typing into the rendering switches to the source at the character at point
   and inserts the text there, so editing needs no explicit switch
   (`mdview-self-insert`; option `mdview-edit-on-typing`).
 - `C-c C-f` / `C-c C-b` / `C-c C-u`: next and previous heading of the

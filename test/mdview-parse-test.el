@@ -1107,7 +1107,7 @@ character, as the inline parser does for its runs."
 Every block must have a `:pos' on a plausible character, every line of
 a code or HTML block and every `mdview-pos' run of a paragraph, heading
 or table cell must read the same as SOURCE at its offset (except where
-SOURCE holds a tab or a backslash there).  Return the list of failure
+SOURCE holds a tab, a backslash or an entity there).  Return the list of failure
 descriptions, nil when everything matches."
   (let ((failures nil))
     (cl-labels
@@ -1116,7 +1116,7 @@ descriptions, nil when everything matches."
                                      (min (+ pos len) (length source))))
          (same-p (text pos)
            (let ((there (slice pos (length text))))
-             (or (equal text there) (string-match-p "[\\\t]" there))))
+             (or (equal text there) (string-match-p "[\\\t&]" there))))
          (check-pos (type pos)
            (let ((c (and (integerp pos) (< pos (length source)) (aref source pos)))
                  (expected (pcase type
@@ -1157,13 +1157,16 @@ descriptions, nil when everything matches."
 
 (ert-deftest mdview-parse-positions-oracle-fixtures ()
   "Every position in the parse of each fixture points at its source text.
-The fixtures are checked as they are and with CRLF line endings."
+The fixtures are checked as they are and with CRLF line endings, parsed
+with the real inline parser and with the line-wise stand-in."
   (dolist (file (directory-files (mdview-parse-test--path "test/fixtures") t "\\.md\\'"))
     (let ((source (with-temp-buffer
                     (insert-file-contents file)
                     (buffer-string))))
       (dolist (variant (list source (string-replace "\n" "\r\n" source)))
-        (let ((doc (mdview-parse-test--with-pos-inline (mdview-parse-string variant))))
+        (dolist (doc (list (mdview-parse-string variant)
+                           (mdview-parse-test--with-pos-inline
+                             (mdview-parse-string variant))))
           (should (equal (cons (file-name-nondirectory file)
                                (mdview-parse-test--check-positions variant doc))
                          (list (file-name-nondirectory file)))))))))

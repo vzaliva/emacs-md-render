@@ -75,7 +75,7 @@ See `mdview-increase-width' and `mdview-decrease-width'."
 (defcustom mdview-edit-on-typing t
   "Non-nil means typing into a rendering edits the Markdown source.
 A self-inserting key pressed while a buffer is rendered switches the
-buffer to its source at the word at point and inserts the character
+buffer to its source at the character at point and inserts the typed one
 there (see `mdview-self-insert').  When nil, such a key only reports
 that the rendering is read-only."
   :type 'boolean
@@ -297,10 +297,10 @@ source, and a revert renders the reloaded text.
 
 The source is never edited by the rendering: it is kept in a hidden
 buffer while the buffer is rendered (see docs/DESIGN.md section 10).
-Typing a character while rendered switches to the source at the word
-at point and inserts it there (`mdview-edit-on-typing').  Indirect
-buffers, and buffers that have indirect buffers, cannot be rendered in
-place.
+Typing a character while rendered switches to the source at the
+character at point and inserts it there (`mdview-edit-on-typing').
+Indirect buffers, and buffers that have indirect buffers, cannot be
+rendered in place.
 
 \\{mdview-mode-map}"
   :lighter " mdview"
@@ -570,58 +570,56 @@ result is `point-max'."
       (mdview--source-line-position line)
     (mdview--line-start line)))
 
-(defun mdview--anchor (pos from)
-  "Describe the word at POS by its place among the words from FROM on.
-A word is a run of letters and digits, the one thing the source and the
-rendering share verbatim.  Return (WORD INDEX OFFSET): WORD is the word
-at POS, or the last one before it; INDEX counts the occurrences of WORD
-from FROM up to and including it; OFFSET is the distance of POS from
-its start, at most its length.  Return nil when no word lies between
-FROM and POS."
-  (when (<= from pos)
-    (save-excursion
-      (goto-char (min (1+ pos) (point-max)))
-      (when (re-search-backward "[[:alnum:]]" from t)
-        (skip-chars-backward "[:alnum:]" from)
-        (let* ((start (point))
-               (end (progn (skip-chars-forward "[:alnum:]") (point)))
-               (word (buffer-substring-no-properties start end))
-               (case-fold-search nil)
-               (index 1))
-          (goto-char from)
-          (while (re-search-forward "[[:alnum:]]+" start t)
-            (when (equal (match-string-no-properties 0) word)
-              (setq index (1+ index))))
-          (list word index (min (- pos start) (- end start))))))))
+(defun mdview--source-offset-at (pos)
+  "Return the source offset that POS of the rendering stands for, or nil.
+Offsets count from the start of the accessible portion of the source
+\(docs/DESIGN.md section 3).  A character copied from the source has its
+own offset (`mdview-ast-pos-at'); any other character stands for the
+end of the nearest copied run before it in its block or, before the
+first run of the block, for the block's own start (`mdview-source-pos').
+Nil before the first block, or when the rendering carries no positions."
+  (or (mdview-ast-pos-at pos)
+      (let ((block (mdview--block-at pos)))
+        (when block
+          (let* ((start (cdr block))
+                 ;; The last copied character before POS: the one just
+                 ;; before it, or else the one before the stretch of
+                 ;; uncopied characters POS is in.
+                 (before (and (> pos start) (mdview-ast-pos-at (1- pos))))
+                 (change (and (not before)
+                              (previous-single-property-change
+                               pos 'mdview-pos nil start))))
+            (when (and change (> change start))
+              (setq before (mdview-ast-pos-at (1- change))))
+            (if before
+                (1+ before)
+              (get-text-property start 'mdview-source-pos)))))))
 
-(defun mdview--anchor-position (anchor from to)
-  "Return the position ANCHOR names among the words between FROM and TO.
-ANCHOR comes from `mdview--anchor'; the result is nil when the
-occurrence of its word that it names is not there."
-  (pcase-let ((`(,word ,index ,offset) anchor))
-    (let ((case-fold-search nil))
-      (when (<= from to)
-        (save-excursion
-          (goto-char from)
-          (catch 'found
-            (while (re-search-forward "[[:alnum:]]+" to t)
-              (when (and (equal (match-string-no-properties 0) word)
-                         (zerop (setq index (1- index))))
-                (throw 'found (+ (match-beginning 0) offset))))
-            nil))))))
-
-(defun mdview--block-range (pos)
-  "Return the block of the rendering at or before POS, with its extent.
-The value is (LINE START END NEXT-LINE): LINE and START as in
-`mdview--block-at', END the start of the following block (or
-`point-max') and NEXT-LINE that block's source line (or nil).  Nil
-before the first block."
-  (let ((block (mdview--block-at pos)))
-    (when block
-      (let ((next (text-property-not-all (1+ (cdr block)) (point-max)
-                                         'mdview-source-line nil)))
-        (list (car block) (cdr block) (or next (point-max))
-              (and next (get-text-property next 'mdview-source-line)))))))
+(defun mdview--rendered-position-of (offset start end)
+  "Return the position between START and END standing for source OFFSET.
+START and END delimit a block of the rendering.  The character copied
+from OFFSET wins; otherwise the result is the end of the run of copied
+characters with the greatest offset before OFFSET, unless OFFSET is at
+or past the start of the block that follows END (its `mdview-source-pos')
+or no run starts before OFFSET, in which case the result is nil."
+  (let ((limit (and (< end (point-max))
+                    (get-text-property end 'mdview-source-pos)))
+        (pos start)
+        (best nil)
+        (best-value nil))
+    (catch 'found
+      (while (< pos end)
+        (let ((value (get-text-property pos 'mdview-pos))
+              (next (or (next-single-property-change pos 'mdview-pos nil end)
+                        end)))
+          (when (and value (<= value offset))
+            (when (< offset (+ value (- next pos)))
+              (throw 'found (+ pos (- offset value))))
+            (when (or (null best-value) (> value best-value))
+              (setq best next
+                    best-value value)))
+          (setq pos next)))
+      (and best (not (and limit (>= offset limit))) best))))
 
 (defun mdview--block-span (line)
   "Return the extent in the rendering of the block containing source LINE.
@@ -636,35 +634,31 @@ START END), or nil when every block starts after LINE."
             (setq first (cdr entry)))
           (setq best entry-line
                 last (cdr entry)))))
-    (and first (list best first (nth 2 (mdview--block-range last))))))
+    (and first
+         (list best first
+               (or (text-property-not-all (1+ last) (point-max)
+                                          'mdview-source-line nil)
+                   (point-max))))))
 
 (defun mdview--matching-position (line point)
-  "Return where the word at POINT of the text swapped out is in this text.
+  "Return the position here that stands for POINT of the text swapped out.
 POINT belongs to the text now in the twin, where it stood for source
-LINE; the word at it (`mdview--anchor') is looked for in the block of
-LINE here.  Nil when there is no such word, when the block does not
-contain it, or when the twin is gone."
+LINE.  The mapping goes through the source offsets the characters carry
+\(`mdview-pos', docs/DESIGN.md section 10.1): from the rendering to the
+source, the offset of the character at POINT (`mdview--source-offset-at');
+from the source to the rendering, the character of the block of LINE
+rendered from the offset of POINT (`mdview--rendered-position-of').
+Nil when nothing maps, or when the twin is gone."
   (let ((twin mdview--twin))
     (when (buffer-live-p twin)
       (if mdview--rendered
-          (let ((span (mdview--block-span line)))
-            (when span
-              (let ((anchor (with-current-buffer twin
-                              (mdview--anchor point (mdview--line-start
-                                                     (nth 0 span))))))
-                (and anchor
-                     (mdview--anchor-position anchor (nth 1 span) (nth 2 span))))))
-        (pcase-let ((`(,block ,anchor)
-                     (with-current-buffer twin
-                       (let ((block (mdview--block-range point)))
-                         (list block
-                               (and block (mdview--anchor point (nth 1 block))))))))
-          (when anchor
-            (let ((next (nth 3 block)))
-              (mdview--anchor-position anchor (mdview--line-start (nth 0 block))
-                                       (if (and next (> next (nth 0 block)))
-                                           (mdview--line-start next)
-                                         (point-max))))))))))
+          (let ((span (mdview--block-span line))
+                (offset (with-current-buffer twin (- point (point-min)))))
+            (and span (>= offset 0)
+                 (mdview--rendered-position-of offset (nth 1 span) (nth 2 span))))
+        (let ((offset (with-current-buffer twin
+                        (mdview--source-offset-at point))))
+          (and offset (min (point-max) (+ (point-min) offset))))))))
 
 (defun mdview--window-row (window)
   "Return the screen row of WINDOW's point, counted from its start."
@@ -706,9 +700,9 @@ CAPTURE comes from `mdview--capture' before the swap.  MEMORY is the
 `mdview--memory' of the previous swap when the text now current is the
 text that swap put away, else nil: a window whose point did not move
 since then gets its old point and start back exactly.  Other windows get
-the position of the word their point was on (`mdview--matching-position'),
-or failing that the block of the same source line, at the same screen
-row.  Return the new memory."
+the position of the character their point was on
+\(`mdview--matching-position'), or failing that the block of the same
+source line, at the same screen row.  Return the new memory."
   (let ((new nil))
     (pcase-dolist (`(,window ,point ,start ,row ,line) capture)
       (let* ((remembered (assq window memory))
@@ -1159,18 +1153,16 @@ do so is reported but never prevents the kill."
 (defun mdview--render-into (buffer &optional line force-parse)
   "Render the rendered BUFFER again, keeping the position.
 Point ends up at the block rendered from source line LINE (an integer),
-or, when LINE is nil, on the word it was on before (at least on the
-same block); the windows showing BUFFER keep the block that was at
-their top.  The parsed document is reused unless FORCE-PARSE is
-non-nil.  The new rendering is built in a hidden buffer and swapped in,
-so an error, or `while-no-input' giving up, leaves the old rendering in
-place."
+or, when LINE is nil, on the character it was on before (at least on
+the same block, see `mdview--source-offset-at'); the windows showing
+BUFFER keep the block that was at their top.  The parsed document is
+reused unless FORCE-PARSE is non-nil.  The new rendering is built in a
+hidden buffer and swapped in, so an error, or `while-no-input' giving
+up, leaves the old rendering in place."
   (with-current-buffer buffer
     (let* ((document (mdview--source-document force-parse))
            (pos (mdview--view-point))
-           (anchor (unless line
-                     (let ((block (mdview--block-range pos)))
-                       (and block (mdview--anchor pos (nth 1 block))))))
+           (offset (unless line (mdview--source-offset-at pos)))
            (line (or line (mdview--source-line-at pos)))
            (starts (mdview--window-starts buffer))
            (width (mdview--content-width))
@@ -1194,9 +1186,9 @@ place."
       (goto-char (point-min))
       (when line
         (mdview--goto-source-line line)
-        (let* ((span (and anchor (mdview--block-span line)))
-               (target (and span (mdview--anchor-position
-                                  anchor (nth 1 span) (nth 2 span)))))
+        (let* ((span (and offset (mdview--block-span line)))
+               (target (and span (mdview--rendered-position-of
+                                  offset (nth 1 span) (nth 2 span)))))
           (when target (goto-char target))))
       (dolist (window (get-buffer-window-list buffer nil t))
         (set-window-point window (point)))
@@ -1238,7 +1230,7 @@ scale of the images both follow the text."
 
 (defun mdview--refit (buffer &optional line)
   "Render BUFFER again if its content width or the scale of its images changed.
-Point goes to the block of source LINE, or stays on the word it is on
+Point goes to the block of source LINE, or stays on the character it is on
 when LINE is nil (see `mdview--render-into').  The rendering is
 abandoned as soon as the user types and rescheduled for the next idle
 period, so a resize never locks Emacs up; a failure is reported in the
@@ -1692,7 +1684,7 @@ row; toggling twice without moving returns to the exact old position."
   "Switch to the Markdown source and type the key there.
 Every self-inserting key runs this while a buffer is rendered (the
 keymap remaps `self-insert-command'): the buffer goes back to its
-source at the word at point, as `mdview-toggle' does, and the key is
+source at the character at point, as `mdview-toggle' does, and the key is
 then handled as the source handles it, normally `self-insert-command'
 inserting it (repeatedly with a numeric prefix argument).  Typing into
 the rendering thus edits the document without an explicit switch.  When

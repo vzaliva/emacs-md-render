@@ -538,12 +538,14 @@ window, and BODY runs with it current; it is killed afterwards."
             (should (= (point) vpoint))
             (should (= (window-start window) vstart))))))))
 
-(ert-deftest mdview-test-toggle-keeps-word ()
-  ;; Point goes to the word it was on, in both directions, even inside
-  ;; a block, among repeated words, and in a nested block.
+(ert-deftest mdview-test-toggle-keeps-character ()
+  ;; Point goes to the same character in both directions: inside a
+  ;; word, inside emphasis (whose markup the rendering does not show),
+  ;; among repeated words, in a nested block; a bullet stands for the
+  ;; item's marker and the padding after a line for the end of its text.
   (mdview-test-with-source
       (source (concat "# Title\n\nAlpha beta *gamma* delta\nepsilon zeta eta\n"
-                      "\n> one two one two\n\n- item one\n- item two theta\n"))
+                      "\n> one two one two\n\n- item one\n- item **two** theta\n"))
     (with-current-buffer source
       (goto-char (point-min))
       (search-forward "zeta")
@@ -552,29 +554,34 @@ window, and BODY runs with it current; it is killed afterwards."
       (should mdview--rendered)
       (should (looking-at "ta eta"))
       (should (= (mdview--source-line-at (point)) 3))
-      ;; The second "one" of the quote, from the rendering to the source.
+      (goto-char (point-min))
+      (search-forward "gam")
+      (mdview-toggle)
+      (should-not mdview--rendered)
+      (should (looking-at "ma\\* delta"))
+      (mdview-toggle)
       (goto-char (point-min))
       (search-forward "two one")
       (mdview-toggle)
-      (should-not mdview--rendered)
       (should (= (line-number-at-pos) 6))
       (should (looking-back "> one two one" (line-beginning-position)))
-      ;; A word of the second list item, from the source to the rendering.
       (goto-char (point-min))
-      (search-forward "theta")
-      (backward-char 1)
+      (search-forward "**tw")
       (mdview-toggle)
       (should mdview--rendered)
-      (should (looking-at "a\\b"))
-      (should (looking-back "item two thet" (line-beginning-position)))
+      (should (looking-at "o theta"))
+      (should (looking-back "item tw" (line-beginning-position)))
       (should (= (mdview--source-line-at (point)) 9))
-      ;; Without a word before point in the block: the block's start.
-      (goto-char (point-min))
-      (search-forward "Alpha")
       (beginning-of-line)
       (mdview-toggle)
-      (should (= (line-number-at-pos) 3))
-      (should (bolp)))))
+      (should (= (line-number-at-pos) 9))
+      (should (looking-at "\\(- \\)?item"))
+      (mdview-toggle)
+      (end-of-line)
+      (mdview-toggle)
+      (should (= (line-number-at-pos) 9))
+      (should (looking-back "theta" (line-beginning-position)))
+      (should (eolp)))))
 
 (ert-deftest mdview-test-toggle-reuses-rendering ()
   ;; Toggling back to an unchanged source swaps the kept rendering in;
@@ -632,21 +639,21 @@ window, and BODY runs with it current; it is killed afterwards."
   ;; A self-inserting key switches to the source at the word at point
   ;; and inserts there, as the key would in the source; a prefix
   ;; argument repeats it; with the option off the rendering is read-only.
-  (mdview-test-with-source (source "First\n\nSecond block here\n\nThird\n")
+  (mdview-test-with-source (source "First\n\nSecond **block** here\n\nThird\n")
     (with-current-buffer source
       (mdview-mode 1)
       (goto-char (point-min))
-      (search-forward "block")
+      (search-forward "blo")
       (mdview-test-quietly (execute-kbd-macro (kbd "X")))
       (should-not mdview--rendered)
       (should-not mdview-mode)
-      (should (equal (buffer-string) "First\n\nSecond blockX here\n\nThird\n"))
-      (should (= (point) (+ (point-min) (length "First\n\nSecond blockX"))))
+      (should (equal (buffer-string) "First\n\nSecond **bloXck** here\n\nThird\n"))
+      (should (= (point) (+ (point-min) (length "First\n\nSecond **bloX"))))
       (mdview-mode 1)
       (goto-char (point-min))
       (search-forward "Third")
       (mdview-test-quietly (execute-kbd-macro (kbd "C-u 3 !")))
-      (should (equal (buffer-string) "First\n\nSecond blockX here\n\nThird!!!\n"))
+      (should (equal (buffer-string) "First\n\nSecond **bloXck** here\n\nThird!!!\n"))
       (mdview-mode 1)
       (let ((mdview-edit-on-typing nil))
         (should-error (execute-kbd-macro (kbd "Y")) :type 'buffer-read-only))
@@ -670,8 +677,8 @@ window, and BODY runs with it current; it is killed afterwards."
       (should (= (mdview--source-line-at (point)) 5))
       (should-not (buffer-modified-p)))))
 
-(ert-deftest mdview-test-refresh-keeps-word ()
-  ;; Rendering again at another width keeps point on the same word.
+(ert-deftest mdview-test-refresh-keeps-character ()
+  ;; Rendering again at another width keeps point on the same character.
   (mdview-test-with-source
       (source (concat "Intro\n\n"
                       (mapconcat (lambda (i) (format "word%d" i))
@@ -690,6 +697,58 @@ window, and BODY runs with it current; it is killed afterwards."
         (should (looking-at "7\\b"))
         (should (looking-back "word2" (line-beginning-position)))
         (should (= (window-point (selected-window)) (point)))))))
+
+(defun mdview-test--check-run (source offset text where)
+  "Fail unless TEXT, a run rendered at WHERE, matches SOURCE from OFFSET on.
+The comparison stops at a source character the renderer is allowed to
+change: a backslash (an escape), an ampersand (an entity), a tab (it is
+expanded) or a line ending (a space in a code span).  A space may be
+rendered as the indentation guide glyph of code blocks."
+  (let ((i 0) (n (length text)) (len (length source)) (stop nil)
+        (guide (mdview-glyph 'guide)))
+    (while (and (< i n) (not stop))
+      (let ((at (+ offset i)))
+        (unless (< at len)
+          (ert-fail (format "%s: run %S at offset %d runs past the source"
+                            where text offset)))
+        (let ((sc (aref source at)))
+          (if (memq sc '(?\\ ?& ?\t ?\n ?\r))
+              (setq stop t)
+            (unless (or (eq sc (aref text i))
+                        (and (eq sc ?\s) (equal (string (aref text i)) guide)))
+              (ert-fail (format "%s: rendered %S but the source at %d reads %S"
+                                where text offset
+                                (substring source offset
+                                           (min len (+ offset n)))))))))
+      (setq i (1+ i)))))
+
+(ert-deftest mdview-test-source-positions-oracle ()
+  ;; Every run of characters copied from the source maps back to those
+  ;; characters, in every fixture, at two widths (docs/DESIGN.md
+  ;; section 3, `mdview-pos').
+  (dolist (name '("showcase.md" "extras.md" "minimal.md"))
+    (let ((source (with-temp-buffer
+                    (insert-file-contents
+                     (expand-file-name (concat "fixtures/" name) mdview-test-dir))
+                    (buffer-string))))
+      (dolist (width '(80 40))
+        (with-temp-buffer
+          (let ((mdview-display-images nil))
+            (mdview-render-document (mdview-parse-string source) :width width))
+          (let ((pos (point-min)) (runs 0))
+            (while (< pos (point-max))
+              (let ((value (get-text-property pos 'mdview-pos))
+                    (next (or (next-single-property-change pos 'mdview-pos)
+                              (point-max))))
+                (when value
+                  (setq runs (1+ runs))
+                  (mdview-test--check-run
+                   source value (buffer-substring-no-properties pos next)
+                   (format "%s at %d, position %d" name width pos)))
+                (setq pos next)))
+            ;; Decorations, image placeholders and stripped HTML carry
+            ;; no positions, but most of the text must.
+            (should (> runs (if (equal name "showcase.md") 100 10)))))))))
 
 ;;;; Saving, reverting, auto-revert, major modes, killing
 
