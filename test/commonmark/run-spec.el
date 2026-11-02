@@ -25,11 +25,14 @@
 (require 'json)
 (require 'mdview-parse)
 
-(defconst mdview-commonmark-directory
-  (file-name-directory (or load-file-name buffer-file-name default-directory))
-  "The directory holding this file, spec.json and the baseline.")
-
-(add-to-list 'load-path mdview-commonmark-directory)
+(eval-and-compile
+  (defconst mdview-commonmark-directory
+    (file-name-directory (or load-file-name buffer-file-name default-directory))
+    "The directory holding this file, spec.json and the baseline.")
+  ;; Also at compile time, so that byte-compiling this file (as
+  ;; `package-vc-install' does for every file in the checkout) finds the
+  ;; serializer next to it.
+  (add-to-list 'load-path mdview-commonmark-directory))
 (require 'mdview-html)
 
 (defvar mdview-commonmark-spec-file
