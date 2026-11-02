@@ -27,11 +27,17 @@
 
 (eval-and-compile
   (defconst mdview-commonmark-directory
-    (file-name-directory (or load-file-name buffer-file-name default-directory))
+    (file-name-directory
+     (expand-file-name
+      (or (let ((file (bound-and-true-p byte-compile-current-file)))
+            (and (stringp file) file)) ; a buffer when compiling a buffer
+          load-file-name buffer-file-name default-directory)))
     "The directory holding this file, spec.json and the baseline.")
   ;; Also at compile time, so that byte-compiling this file (as
   ;; `package-vc-install' does for every file in the checkout) finds the
-  ;; serializer next to it.
+  ;; serializer next to it.  The file being compiled wins over
+  ;; `load-file-name': `package-vc-install' called from an init file
+  ;; compiles while that init file is being loaded.
   (add-to-list 'load-path mdview-commonmark-directory))
 (require 'mdview-html)
 
