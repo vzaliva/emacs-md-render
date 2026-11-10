@@ -1567,8 +1567,10 @@ rendered as the indentation guide glyph of code blocks."
             (should (string-match-p "(add-hook 'find-file-hook #'mdview--find-file-hook 90)"
                                     text))
             (should (string-match-p "(defvar mdview-initial-view 'edit" text))
-            (should (string-match-p "\"mdview\" '(mdview--initial-view)\\|mdview--initial-view \"mdview\""
-                                    text))))
+            ;; The stub loads mdview itself: the private function it
+            ;; calls is not autoloaded.
+            (should (string-match-p "(require 'mdview) (mdview--initial-view)" text))
+            (should-not (string-match-p "mdview--initial-view \"mdview\"" text))))
       (delete-directory dir t))))
 
 ;;;; Robustness, performance and UX of the rendering

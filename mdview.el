@@ -1,11 +1,14 @@
 ;;; mdview.el --- Render Markdown in the style of Frogmouth  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026  Vadim Zaliva
+
 ;; Author: Vadim Zaliva
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: text, docs, markdown
 ;; URL: https://github.com/vzaliva/emacs-md-render
+;; SPDX-License-Identifier: MIT
+
 ;; This file is part of mdview, distributed under the MIT license; see
 ;; LICENSE in the repository root.
 
@@ -2028,7 +2031,6 @@ the init file before those modes are available."
           (define-key (symbol-value map) key #'mdview-toggle))))))
 
 
-;;;###autoload
 (defun mdview--initial-view ()
   "Render the newly visited current buffer when it is a Markdown file.
 Called from `find-file-hook' (via `mdview--find-file-hook') when
@@ -2047,7 +2049,7 @@ alone; a failure is reported and leaves the source shown."
 ;; The two forms below are also copied into the autoloads file, so that
 ;; files open rendered without mdview being loaded beforehand, while a
 ;; visit costs nothing as long as the option is `edit'.
-;;;###autoload (defun mdview--find-file-hook () "Apply `mdview-initial-view' to the visited file." (when (eq mdview-initial-view 'view) (mdview--initial-view)))
+;;;###autoload (defun mdview--find-file-hook () "Apply `mdview-initial-view' to the visited file." (when (eq mdview-initial-view 'view) (require 'mdview) (mdview--initial-view)))
 ;;;###autoload (add-hook 'find-file-hook #'mdview--find-file-hook 90)
 
 (defun mdview--find-file-hook ()

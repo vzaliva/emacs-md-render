@@ -3,8 +3,8 @@
 ;; Copyright (C) 2026  Vadim Zaliva
 
 ;; Author: Vadim Zaliva
+;; SPDX-License-Identifier: MIT
 ;; Keywords: text, docs
-;; Package-Requires: ((emacs "29.1"))
 
 ;; This file is part of mdview, distributed under the MIT license; see
 ;; LICENSE in the repository root.
